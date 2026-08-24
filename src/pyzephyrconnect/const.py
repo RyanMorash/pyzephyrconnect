@@ -28,12 +28,15 @@ CLIENT_ID_SUFFIX = "-ha"
 REFRESH_MARGIN_SECONDS = 600
 
 # Fields the probe CLI is permitted to write. Everything else in the shadow
-# is a counter, an alarm, or device-reported telemetry.
+# is a counter, an alarm, or device-reported telemetry. Note: delaytimer is
+# both device-reported (counts down) and writable (the app sets it when arming
+# the timer), so it appears here despite also being a status field.
 WRITABLE_FIELDS = frozenset({
     "power",
     "light",
     "fan",
     "setdelaytimer",
+    "delaytimer",
     "setcleanairfunction",
     "setrecirculating",
     "resetgreasefilter",
