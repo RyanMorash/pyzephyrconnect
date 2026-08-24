@@ -99,11 +99,16 @@ jobs:
         with:
           name: coverage-cobertura
 
+      # Coverage reporting is not a correctness signal for this package, so
+      # an upload failure - a transient API error, or Code Quality not being
+      # enabled on the repo - is surfaced as an ::error:: annotation in the
+      # log instead of failing the job and blocking a merge.
       - uses: actions/upload-code-coverage@v1
         with:
           file: coverage.xml
           language: Python
           label: code-coverage/pytest
+          fail-on-error: false
 
   build:
     name: build + validate distributions
