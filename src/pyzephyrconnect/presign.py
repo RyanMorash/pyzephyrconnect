@@ -16,10 +16,11 @@ import hmac
 from datetime import datetime
 from urllib.parse import quote
 
+from .const import IOT_SERVICE as SERVICE
+
 ALGORITHM = "AWS4-HMAC-SHA256"
 CANONICAL_URI = "/mqtt"
 SIGNED_HEADERS = "host"
-SERVICE = "iotdevicegateway"
 # SHA-256 of the empty string; a presigned GET has no body.
 EMPTY_PAYLOAD_HASH = (
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
@@ -40,10 +41,14 @@ def _signing_key(secret_key: str, datestamp: str, region: str, service: str = SE
     return _hmac(k_service, "aws4_request")
 
 
+def _credential_scope(datestamp: str, region: str) -> str:
+    return f"{datestamp}/{region}/{SERVICE}/aws4_request"
+
+
 def _query_params(access_key: str, region: str, now: datetime) -> dict[str, str]:
     amz_date = now.strftime("%Y%m%dT%H%M%SZ")
     datestamp = now.strftime("%Y%m%d")
-    scope = f"{datestamp}/{region}/{SERVICE}/aws4_request"
+    scope = _credential_scope(datestamp, region)
     return {
         "X-Amz-Algorithm": ALGORITHM,
         "X-Amz-Credential": f"{access_key}/{scope}",
@@ -87,7 +92,7 @@ def build_presigned_url(
     """Return a `wss://` URL authorising an MQTT connection to AWS IoT."""
     datestamp = now.strftime("%Y%m%d")
     amz_date = now.strftime("%Y%m%dT%H%M%SZ")
-    scope = f"{datestamp}/{region}/{SERVICE}/aws4_request"
+    scope = _credential_scope(datestamp, region)
 
     params = _query_params(access_key, region, now)
     query = _canonical_query(params)
