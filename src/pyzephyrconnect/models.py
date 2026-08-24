@@ -98,7 +98,7 @@ class HoodState:
     alarm_fault_code: int = 0
     alarm_grease_filter: int = 0
     is_online: bool = False
-    fault_codes: list[Any] = field(default_factory=list)
+    fault_codes: tuple[Any, ...] = ()
     raw: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -129,7 +129,7 @@ class HoodState:
             alarm_fault_code=as_int("alarmfaultcode"),
             alarm_grease_filter=as_int("alarmgreasefilter"),
             is_online=bool(as_int("isOnline")),
-            fault_codes=list(reported.get("faultCode") or []),
+            fault_codes=tuple(reported.get("faultCode") or ()),
             raw=dict(reported),
         )
 

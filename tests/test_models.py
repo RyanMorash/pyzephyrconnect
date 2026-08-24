@@ -53,7 +53,7 @@ def test_state_parses_reported_block(shadow):
     assert state.act == "Disabled"
     assert state.use_grease_filter_time == 642
     assert state.is_online is True
-    assert state.fault_codes == []
+    assert state.fault_codes == ()
 
 
 def test_state_merge_applies_a_partial_delta(shadow):
