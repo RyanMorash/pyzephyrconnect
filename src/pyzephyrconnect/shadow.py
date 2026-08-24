@@ -95,6 +95,9 @@ class ShadowClient:
         self._client: mqtt.Client | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._connected = asyncio.Event()
+        self._subscribed = asyncio.Event()
+        self._subscribe_error: ZephyrPolicyError | None = None
+        self._pending_subscribes = 0
 
     # -- paho callbacks (background thread) ---------------------------
 
@@ -106,30 +109,55 @@ class ShadowClient:
         if reason_code != 0:
             _LOGGER.warning("MQTT connect refused: %s", reason_code)
             return
-        for topic in self.topics.subscriptions:
+        topics = self.topics.subscriptions
+        self._dispatch(self._reset_subscription_state, len(topics))
+        for topic in topics:
             client.subscribe(topic, qos=1)
         self._dispatch(self._connected.set)
         self._dispatch(self._on_connection_cb, True)
+
+    def _reset_subscription_state(self, expected: int) -> None:
+        self._pending_subscribes = expected
+        self._subscribe_error = None
+        self._subscribed.clear()
+        if expected == 0:
+            self._subscribed.set()
 
     def _on_disconnect(self, client, userdata, flags, reason_code, properties=None):
         self._dispatch(self._connected.clear)
         self._dispatch(self._on_connection_cb, False)
 
     def _on_subscribe(self, client, userdata, mid, reason_code_list, properties):
-        """Validate the GRANTED QoS.
+        """Record the GRANTED QoS for connect() to observe.
 
         paho resolves the subscribe even when the broker refused the topic.
         Granted QoS 128 means denied, and the cause is almost always a
         missing IoT policy on the Cognito identity.
+
+        This callback runs on paho's background network thread and must
+        NEVER raise: paho's on_subscribe dispatch re-raises callback
+        exceptions by default, and the thread runner has no handler for
+        them, so an exception here silently kills the network thread. The
+        result is dispatched onto the event loop instead, where connect()
+        can observe and raise it safely.
         """
-        for code in reason_code_list:
-            if getattr(code, "is_failure", False):
-                raise ZephyrPolicyError(
+        denied = any(getattr(code, "is_failure", False) for code in reason_code_list)
+        self._dispatch(self._record_subscribe_result, denied)
+
+    def _record_subscribe_result(self, denied: bool) -> None:
+        if denied:
+            if self._subscribe_error is None:
+                self._subscribe_error = ZephyrPolicyError(
                     "AWS IoT denied a shadow subscription (granted QoS 128). "
                     f"Confirm {const.POLICY_NAME} is attached to this identity "
                     "with attach_policy() BEFORE connecting - an open "
                     "connection does not pick up new permissions."
                 )
+            self._subscribed.set()
+            return
+        self._pending_subscribes = max(0, self._pending_subscribes - 1)
+        if self._pending_subscribes == 0:
+            self._subscribed.set()
 
     def _on_message(self, client, userdata, message):
         try:
@@ -185,6 +213,19 @@ class ShadowClient:
             raise ZephyrTransportError(
                 f"MQTT connection to {const.IOT_ENDPOINT} timed out"
             ) from err
+
+        try:
+            await asyncio.wait_for(self._subscribed.wait(), timeout)
+        except TimeoutError as err:
+            await self.disconnect()
+            raise ZephyrTransportError(
+                "MQTT connected but shadow subscriptions did not complete in time"
+            ) from err
+
+        if self._subscribe_error is not None:
+            error, self._subscribe_error = self._subscribe_error, None
+            await self.disconnect()
+            raise error
 
     async def disconnect(self) -> None:
         if self._client is None:

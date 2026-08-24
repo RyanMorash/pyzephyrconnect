@@ -1,6 +1,5 @@
 import asyncio
 import json
-from contextlib import nullcontext
 from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
@@ -42,6 +41,13 @@ def fake_paho(monkeypatch):
         # arrives. Without this the mock never fires it, connect() blocks on
         # its event and every connect test fails on a 15s timeout.
         client.on_connect(client, None, {}, 0, None)
+        # _on_connect subscribes to all 6 shadow topics. Grant them all by
+        # default so tests that don't care about subscription behavior still
+        # connect successfully instead of hanging on _subscribed.wait().
+        granted = MagicMock()
+        granted.is_failure = False
+        for _ in range(len(ShadowTopics(THING).subscriptions)):
+            client.on_subscribe(client, None, 1, [granted], None)
 
     client.connect_async.side_effect = fire_connack
     monkeypatch.setattr(
@@ -78,23 +84,37 @@ async def test_connect_targets_port_443(fake_paho):
     assert args[1] == 443
 
 
-@pytest.mark.parametrize(
-    ("is_failure", "expectation"),
-    [
-        (True, pytest.raises(ZephyrPolicyError, match="attach")),
-        (False, nullcontext()),
-    ],
-    ids=["denied", "granted"],
-)
-def test_subscribe_grant_is_validated(fake_paho, is_failure, expectation):
-    """paho reports success for a subscribe the broker refused. Granted QoS
-    128 means denied, and the usual cause is a missing IoT policy. Without
-    this check it presents as a working connection that receives nothing."""
-    sc = _make()
-    code = MagicMock()
-    code.is_failure = is_failure
-    with expectation:
-        sc._on_subscribe(fake_paho, None, 1, [code], None)
+async def test_denied_subscribe_surfaces_as_a_policy_error_from_connect(fake_paho):
+    """The denial must reach the caller through connect() - not by raising
+    inside paho's callback, which would silently kill the network thread
+    instead. See the module docstring and _on_subscribe's docstring."""
+    denied = MagicMock()
+    denied.is_failure = True
+
+    def fire_connack_then_deny_subscribe(*args, **kwargs):
+        fake_paho.on_connect(fake_paho, None, {}, 0, None)
+        # _on_connect subscribes to 6 topics; deny all of them.
+        for _ in range(6):
+            fake_paho.on_subscribe(fake_paho, None, 1, [denied], None)
+
+    fake_paho.connect_async.side_effect = fire_connack_then_deny_subscribe
+
+    with pytest.raises(ZephyrPolicyError, match="attach"):
+        await _make().connect(CREDS)
+
+
+async def test_granted_subscribes_let_connect_succeed(fake_paho):
+    granted = MagicMock()
+    granted.is_failure = False
+
+    def fire_connack_then_grant_subscribes(*args, **kwargs):
+        fake_paho.on_connect(fake_paho, None, {}, 0, None)
+        for _ in range(6):
+            fake_paho.on_subscribe(fake_paho, None, 1, [granted], None)
+
+    fake_paho.connect_async.side_effect = fire_connack_then_grant_subscribes
+
+    await _make().connect(CREDS)  # must not raise
 
 
 async def test_request_state_publishes_an_empty_get(fake_paho):
