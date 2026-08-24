@@ -7,7 +7,13 @@ modify the library. It exists to show WHICH component boundary fails.
   python shadow_trace.py --watch 60          # observe the vendor app
   python shadow_trace.py --write light=1     # observe our own write
 """
-import argparse, asyncio, getpass, json, os, sys, time
+import argparse
+import asyncio
+import getpass
+import json
+import os
+import sys
+import time
 from datetime import UTC, datetime
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
@@ -131,7 +137,8 @@ async def main() -> int:
             print(f"  {n:3d} x {topic}")
     else:
         print("  NO MESSAGES RECEIVED AT ALL")
-    client.loop_stop(); client.disconnect()
+    client.loop_stop()
+    client.disconnect()
     return 0
 
 if __name__ == "__main__":

@@ -1,11 +1,46 @@
-# To get started with Dependabot version updates, you'll need to specify which
-# package ecosystems to update and where the package manifests are located.
-# Please see the documentation for all configuration options:
 # https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
 
 version: 2
 updates:
-  - package-ecosystem: "pip" # See documentation for possible values
-    directory: "/" # Location of package manifests
+  # Runtime and dev dependencies from pyproject.toml. Dependabot reads
+  # pyproject.toml under the pip ecosystem when it follows PEP 621, which
+  # this project does.
+  #
+  # Expect few PRs here, by design. Every constraint is an open lower bound
+  # (aiohttp>=3.9) and this is a library, so Dependabot's library default -
+  # widen the range - has nothing to widen: a new release already satisfies
+  # the constraint. PRs show up when a release actually falls outside a
+  # range, or when a security advisory forces a floor up. Pinning tighter
+  # would just fight with whatever resolves alongside this package in Home
+  # Assistant or any other consumer.
+  #
+  # Deliberately ungrouped: with three runtime dependencies, one PR per
+  # dependency keeps a bad bump trivially bisectable.
+  - package-ecosystem: "pip"
+    directory: "/"
     schedule:
       interval: "weekly"
+      day: "monday"
+    commit-message:
+      prefix: "build" # matches the repo's conventional-commit history
+      include: "scope" # build(deps): ... / build(deps-dev): ...
+
+  # Actions referenced by .github/workflows/*.yml.
+  #
+  # This tracks `uses:` refs only. The ruff version pinned in ci.yml via
+  # `with: version:` is invisible to Dependabot and has to be bumped by hand
+  # alongside the version you run locally.
+  - package-ecosystem: "github-actions"
+    directory: "/" # not a literal path - this scans .github/workflows
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    commit-message:
+      prefix: "ci"
+      include: "scope"
+    groups:
+      # One PR for all action bumps rather than five that each re-run the
+      # same CI. Grouped updates cover version updates only; a security
+      # advisory for an action still opens its own PR.
+      actions:
+        patterns: ["*"]

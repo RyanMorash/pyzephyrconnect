@@ -1,0 +1,143 @@
+name: Release
+
+# Tagging `v0.1.0` publishes 0.1.0 to PyPI and opens a GitHub Release for it.
+# The tag must match the version in pyproject.toml - the build job refuses to
+# continue otherwise, before anything is uploaded anywhere.
+#
+# Manual runs publish to TestPyPI instead, so a release can be rehearsed
+# end to end without burning a version number on PyPI (a filename can never
+# be reused there, even after a delete).
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build + verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Verify tag matches the declared version
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os
+          import pathlib
+          import tomllib
+
+          tag = os.environ["TAG"].removeprefix("v")
+          declared = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"]
+          init = pathlib.Path("src/pyzephyrconnect/__init__.py").read_text()
+          dunder = next(
+              line.split('"')[1] for line in init.splitlines() if line.startswith("__version__")
+          )
+          problems = []
+          if tag != declared:
+              problems.append(f"tag {tag!r} != pyproject.toml version {declared!r}")
+          if dunder != declared:
+              problems.append(f"__init__.py version {dunder!r} != pyproject.toml version {declared!r}")
+          if problems:
+              raise SystemExit("version mismatch:\n  " + "\n  ".join(problems))
+          print(f"ok: releasing {declared}")
+          PY
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+
+      - name: Check distribution metadata
+        run: twine check --strict dist/*
+
+      - name: Assert cert bundle is in the wheel
+        run: |
+          python - <<'PY'
+          import glob
+          import zipfile
+
+          wheel, = glob.glob("dist/*.whl")
+          names = zipfile.ZipFile(wheel).namelist()
+          cert = "pyzephyrconnect/certs/twca.pem"
+          assert names.count(cert) == 1, f"{cert} appears {names.count(cert)}x in {wheel}: {names}"
+          print(f"ok: {cert} present exactly once in {wheel}")
+          PY
+
+      - name: Run the test suite against the built wheel
+        run: |
+          python -m venv /tmp/relcheck
+          /tmp/relcheck/bin/pip install --quiet dist/*.whl pytest pytest-asyncio
+          /tmp/relcheck/bin/python -m pytest -q
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+
+  publish-testpypi:
+    name: publish to TestPyPI
+    if: github.event_name == 'workflow_dispatch'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/pyzephyrconnect
+    permissions:
+      id-token: write # trusted publishing (OIDC); no API token stored anywhere
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  publish-pypi:
+    name: publish to PyPI
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/pyzephyrconnect
+    permissions:
+      id-token: write # trusted publishing (OIDC); no API token stored anywhere
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    name: GitHub Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: publish-pypi
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+      - name: Create release with the published artifacts attached
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" dist/* \
+            --title "${{ github.ref_name }}" \
+            --generate-notes \
+            --verify-tag

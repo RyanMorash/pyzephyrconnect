@@ -1,0 +1,170 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # The matrix entry whose coverage report is uploaded to GitHub. One report
+  # per commit - the other versions still run with coverage, their numbers
+  # just are not the ones GitHub annotates the diff with.
+  COVERAGE_PYTHON_VERSION: "3.12"
+
+jobs:
+  lint:
+    name: ruff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Pinned so a new ruff release cannot turn a green branch red on its
+      # own. Bump deliberately, alongside the version you run locally.
+      - uses: astral-sh/ruff-action@v4.1.0
+        with:
+          version: "0.14.14"
+          args: check --output-format=github
+
+  test:
+    name: pytest (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install package and test deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      # No test in this suite touches the network (tests/conftest.py fakes
+      # aiohttp), so a failure here is a real failure, never a flaky one.
+      - name: Run tests
+        run: |
+          pytest -q \
+            --cov=pyzephyrconnect \
+            --cov-report=term-missing \
+            --cov-report=xml
+
+      # Cobertura paths land repo-relative (src/pyzephyrconnect/...) because
+      # the package is installed editable, which is what GitHub needs to map
+      # coverage back onto files in the diff.
+      - name: Upload coverage report artifact
+        if: matrix.python-version == env.COVERAGE_PYTHON_VERSION
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-cobertura
+          path: coverage.xml
+          if-no-files-found: error
+
+  coverage:
+    name: upload coverage to GitHub
+    needs: test
+    # Fork PRs cannot write to the base repo, and merge queue runs are
+    # redundant with the PR and main runs. The action exits gracefully in
+    # both cases; skipping the job avoids booting a runner to find that out.
+    #
+    # Dependabot PRs are skipped too: a dependency bump does not change the
+    # source being measured, and Dependabot-triggered runs have their own
+    # token and secret rules. A skipped job counts as passing, so this stays
+    # safe to mark as a required check.
+    if: >-
+      github.event_name != 'merge_group' &&
+      github.actor != 'dependabot[bot]' &&
+      (github.event_name != 'pull_request' ||
+       github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      code-quality: write # required by upload-code-coverage
+      pull-requests: read # push events look up the branch's open PR
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: coverage-cobertura
+
+      # Coverage reporting is not a correctness signal for this package, so
+      # an upload failure - a transient API error, or Code Quality not being
+      # enabled on the repo - is surfaced as an ::error:: annotation in the
+      # log instead of failing the job and blocking a merge.
+      - uses: actions/upload-code-coverage@v1
+        with:
+          file: coverage.xml
+          language: Python
+          label: code-coverage/pytest
+          fail-on-error: false
+
+  build:
+    name: build + validate distributions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+
+      - name: Check distribution metadata
+        run: twine check --strict dist/*
+
+      # The cert bundle ships inside the package. A packaging change that
+      # drops it (or duplicates it) breaks TLS at runtime, not at build
+      # time - see the note in pyproject.toml - so assert it is in there.
+      - name: Assert cert bundle is in the wheel
+        run: |
+          python - <<'PY'
+          import glob
+          import zipfile
+
+          wheel, = glob.glob("dist/*.whl")
+          names = zipfile.ZipFile(wheel).namelist()
+          cert = "pyzephyrconnect/certs/twca.pem"
+          assert names.count(cert) == 1, f"{cert} appears {names.count(cert)}x in {wheel}: {names}"
+          print(f"ok: {cert} present exactly once in {wheel}")
+          PY
+
+      - name: Install the wheel and import it
+        run: |
+          python -m venv /tmp/smoke
+          /tmp/smoke/bin/pip install --quiet dist/*.whl
+          /tmp/smoke/bin/python - <<'PY'
+          import importlib.resources
+          import pathlib
+          import tomllib
+
+          import pyzephyrconnect
+
+          declared = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"]
+          assert pyzephyrconnect.__version__ == declared, (
+              f"__init__.py says {pyzephyrconnect.__version__}, pyproject.toml says {declared}"
+          )
+          cert = importlib.resources.files("pyzephyrconnect") / "certs" / "twca.pem"
+          assert cert.is_file(), f"missing {cert}"
+          print(f"ok: wheel imports, version {declared} agrees, cert bundle present")
+          PY
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
