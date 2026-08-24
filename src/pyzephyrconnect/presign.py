@@ -33,10 +33,10 @@ def _hmac(key: bytes, msg: str) -> bytes:
     return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
 
 
-def _signing_key(secret_key: str, datestamp: str, region: str) -> bytes:
+def _signing_key(secret_key: str, datestamp: str, region: str, service: str = SERVICE) -> bytes:
     k_date = _hmac(f"AWS4{secret_key}".encode("utf-8"), datestamp)
     k_region = _hmac(k_date, region)
-    k_service = _hmac(k_region, SERVICE)
+    k_service = _hmac(k_region, service)
     return _hmac(k_service, "aws4_request")
 
 

@@ -12,7 +12,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
-from pyzephyrconnect.presign import build_presigned_url, canonical_request
+from pyzephyrconnect.presign import _signing_key, build_presigned_url, canonical_request
 
 ENDPOINT = "a1nqxu0hki9zw3-ats.iot.us-west-2.amazonaws.com"
 NOW = datetime(2026, 8, 23, 12, 0, 0, tzinfo=UTC)
@@ -109,3 +109,22 @@ def test_query_string_is_sorted():
     qs = cr.split("\n")[2]
     keys = [p.split("=")[0] for p in qs.split("&")]
     assert keys == sorted(keys)
+
+
+def test_signing_key_matches_the_published_aws_vector():
+    """AWS documents the intermediate signing key for this exact input in
+    "Examples of how to derive a signing key for Signature Version 4".
+
+    There is no published vector for iotdevicegateway WebSocket presigning,
+    so this pins the HMAC derivation chain — the part most likely to be
+    silently wrong — against an authority outside this codebase.
+    """
+    derived = _signing_key(
+        "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+        "20150830",
+        "us-east-1",
+        service="iam",
+    )
+    assert derived.hex() == (
+        "c4afb1cc5771d871763a393e44b703571b55cc28424d1a5e86da6ed3c154a4b9"
+    )
