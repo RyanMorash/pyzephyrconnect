@@ -11,7 +11,6 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
 
 import boto3
 from botocore import UNSIGNED
@@ -148,11 +147,11 @@ class ZephyrAuth:
     async def authenticate(self) -> None:
         try:
             self._user = await asyncio.to_thread(self._srp_login)
+            self._identity_id, self._credentials = await asyncio.to_thread(
+                self._exchange
+            )
         except Exception as err:  # noqa: BLE001
             raise ZephyrAuthError(f"Cognito authentication failed: {err}") from err
-        self._identity_id, self._credentials = await asyncio.to_thread(
-            self._exchange
-        )
         _LOGGER.debug("authenticated; credentials expire %s",
                       self._credentials.expiration)
 
@@ -162,11 +161,11 @@ class ZephyrAuth:
             raise ZephyrAuthError("authenticate() has not been called")
         try:
             await asyncio.to_thread(self._user.renew_access_token)
+            self._identity_id, self._credentials = await asyncio.to_thread(
+                self._exchange
+            )
         except Exception as err:  # noqa: BLE001
             raise ZephyrAuthError(f"Token renewal failed: {err}") from err
-        self._identity_id, self._credentials = await asyncio.to_thread(
-            self._exchange
-        )
 
     async def attach_policy(self) -> None:
         """Bind the IoT policy to this identity.

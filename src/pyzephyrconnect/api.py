@@ -16,7 +16,7 @@ from typing import Any
 import aiohttp
 
 from . import const
-from .exceptions import ZephyrCertificateError, ZephyrError
+from .exceptions import ZephyrAuthError, ZephyrCertificateError, ZephyrError
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -78,7 +78,7 @@ class ZephyrApi:
                 url, headers=self._headers(id_token), ssl=self._ssl, **kwargs
             ) as response:
                 if response.status == 403:
-                    raise ZephyrError(
+                    raise ZephyrAuthError(
                         f"{url} returned 403 - the ID token is rejected or expired"
                     )
                 if response.status >= 400:

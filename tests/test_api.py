@@ -7,7 +7,7 @@ import pytest
 from conftest import FakeResponse, FakeSession
 from pyzephyrconnect import const
 from pyzephyrconnect.api import CERT_BUNDLE, ZephyrApi, build_ssl_context
-from pyzephyrconnect.exceptions import ZephyrCertificateError
+from pyzephyrconnect.exceptions import ZephyrAuthError, ZephyrCertificateError, ZephyrError
 
 TOKEN = "id-token-value"
 THING = "aaaaaaaabbbbbbbbccccccccddddddddeeeeeeee"
@@ -121,3 +121,21 @@ async def test_certificate_failure_raises_an_actionable_error():
 async def test_missing_devices_key_returns_empty_list():
     session = FakeSession(FakeResponse({"message": "Success"}))
     assert await ZephyrApi(session).get_own_devices(TOKEN) == []
+
+
+async def test_403_response_raises_zephyr_auth_error():
+    """A 403 means the ID token is rejected or expired, which is an
+    auth-class failure. The HA integration routes on exception TYPE to
+    decide reauth vs. transient retry, so this must be ZephyrAuthError
+    specifically (a ZephyrError subclass), not the generic base."""
+    session = FakeSession(FakeResponse({}, status=403))
+    with pytest.raises(ZephyrAuthError) as excinfo:
+        await ZephyrApi(session).get_own_devices(TOKEN)
+    assert isinstance(excinfo.value, ZephyrError)
+
+
+async def test_other_4xx_response_raises_generic_zephyr_error():
+    session = FakeSession(FakeResponse({}, status=400))
+    with pytest.raises(ZephyrError) as excinfo:
+        await ZephyrApi(session).get_own_devices(TOKEN)
+    assert not isinstance(excinfo.value, ZephyrAuthError)

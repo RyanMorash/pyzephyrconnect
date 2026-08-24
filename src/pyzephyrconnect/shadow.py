@@ -102,8 +102,15 @@ class ShadowClient:
     # -- paho callbacks (background thread) ---------------------------
 
     def _dispatch(self, fn: Callable[..., None], *args: Any) -> None:
-        if self._loop is not None:
+        if self._loop is None or self._loop.is_closed():
+            return
+        try:
             self._loop.call_soon_threadsafe(fn, *args)
+        except RuntimeError:
+            # The loop closed between the check above and this call (e.g.
+            # during shutdown). A closed loop is not an error worth
+            # propagating into paho's network thread - see module docstring.
+            return
 
     def _on_connect(self, client, userdata, flags, reason_code, properties=None):
         if reason_code != 0:
@@ -163,7 +170,12 @@ class ShadowClient:
         try:
             payload = json.loads(message.payload)
         except (ValueError, TypeError):
-            _LOGGER.warning("Discarding malformed payload on %s", message.topic)
+            # Log only the topic leaf (e.g. "accepted"/"delta"/"rejected") -
+            # the full topic contains the thing name, which is personal data.
+            _LOGGER.warning(
+                "Discarding malformed payload on %s",
+                message.topic.rsplit("/", 1)[-1],
+            )
             return
         self._dispatch(self._on_message_cb, message.topic, payload)
 
@@ -240,7 +252,12 @@ class ShadowClient:
             raise ZephyrTransportError("not connected")
         info = self._client.publish(topic, json.dumps(payload), qos=1)
         if info.rc != mqtt.MQTT_ERR_SUCCESS:
-            raise ZephyrTransportError(f"publish to {topic} failed: rc={info.rc}")
+            # Name the operation (get/update), not the full topic - the full
+            # topic contains the thing name, which is personal data.
+            operation = topic.rsplit("/shadow/", 1)[-1]
+            raise ZephyrTransportError(
+                f"publish to shadow/{operation} failed: rc={info.rc}"
+            )
 
     async def request_state(self) -> None:
         """Ask for the full shadow. The reply lands on get/accepted."""

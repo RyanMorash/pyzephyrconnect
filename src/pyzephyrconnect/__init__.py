@@ -8,6 +8,7 @@ from .exceptions import (
     ZephyrPolicyError,
     ZephyrTransportError,
 )
+from .models import HoodCapabilities, HoodState
 
 __version__ = "0.1.0"
 
@@ -18,5 +19,7 @@ __all__ = [
     "ZephyrCertificateError",
     "ZephyrPolicyError",
     "ZephyrTransportError",
+    "HoodCapabilities",
+    "HoodState",
     "__version__",
 ]

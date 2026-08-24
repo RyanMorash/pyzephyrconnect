@@ -186,3 +186,47 @@ async def test_malformed_payload_is_dropped_without_dispatching(fake_paho):
     await asyncio.sleep(0)
 
     assert received == []
+
+
+async def test_malformed_payload_warning_omits_the_thing_name(fake_paho, caplog):
+    """The full topic ($aws/things/<thingName>/shadow/...) contains personal
+    data. Only the topic leaf (accepted/delta/rejected) may be logged."""
+    sc = _make()
+    await sc.connect(CREDS)
+
+    msg = MagicMock()
+    msg.topic = f"$aws/things/{THING}/shadow/get/accepted"
+    msg.payload = b"not json"
+    with caplog.at_level("WARNING"):
+        sc._on_message(fake_paho, None, msg)
+
+    assert THING not in caplog.text
+    assert "accepted" in caplog.text
+
+
+async def test_publish_failure_raises_transport_error_without_the_thing_name(
+    fake_paho,
+):
+    """A failed publish must not leak the full thing-bearing topic into the
+    exception message."""
+    fake_paho.publish.return_value = MagicMock(rc=1)
+    sc = _make()
+    await sc.connect(CREDS)
+
+    with pytest.raises(shadow_module.ZephyrTransportError) as excinfo:
+        await sc.request_state()
+
+    assert THING not in str(excinfo.value)
+    assert "get" in str(excinfo.value)
+
+
+def test_dispatch_on_a_closed_loop_returns_without_raising():
+    """paho's network thread must never see a RuntimeError from a
+    torn-down/closed event loop - that would kill the thread just like an
+    uncaught exception in a callback would."""
+    sc = _make()
+    loop = asyncio.new_event_loop()
+    loop.close()
+    sc._loop = loop
+
+    sc._dispatch(MagicMock())  # must not raise

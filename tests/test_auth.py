@@ -119,6 +119,30 @@ async def test_authentication_failure_is_wrapped(fake_aws):
         await ZephyrAuth("u", "bad").authenticate()
 
 
+async def test_exchange_failure_during_authenticate_is_wrapped(fake_aws):
+    """The identity exchange (get_id/get_credentials_for_identity) runs
+    after SRP login succeeds. A botocore ClientError from it (e.g. an
+    invalid/expired token) must surface as ZephyrAuthError, not raw
+    botocore - the HA integration routes on exception TYPE for reauth."""
+    fake_aws["identity"].get_credentials_for_identity.side_effect = Exception(
+        "ClientError: NotAuthorizedException"
+    )
+    with pytest.raises(ZephyrAuthError):
+        await ZephyrAuth("u", "p").authenticate()
+
+
+async def test_exchange_failure_during_refresh_is_wrapped(fake_aws):
+    """refresh() shares _exchange with authenticate() and must wrap its
+    failures the same way."""
+    a = ZephyrAuth("u", "p")
+    await a.authenticate()
+    fake_aws["identity"].get_credentials_for_identity.side_effect = Exception(
+        "ClientError: NotAuthorizedException"
+    )
+    with pytest.raises(ZephyrAuthError):
+        await a.refresh()
+
+
 def test_credentials_expire_early_by_the_refresh_margin():
     """Reporting 'valid' until the last second guarantees a mid-flight
     expiry, because rebuilding the socket is not instant."""
