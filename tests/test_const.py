@@ -26,7 +26,7 @@ def test_writable_fields_cover_the_validation_sequence():
                   "setcleanairfunction", "setrecirculating",
                   "resetgreasefilter"):
         assert field in const.WRITABLE_FIELDS
-    # delaytimer is writable: the vendor app writes both setdelaytimer and
-    # delaytimer together when arming the timer (observed values 300 for 5 min,
-    # 600 for 10 min; units are seconds).
-    assert "delaytimer" in const.WRITABLE_FIELDS
+    # delaytimer is device-managed: writing setdelaytimer=300 alone caused the
+    # device to set delaytimer to 300 and count it down in 60-second intervals,
+    # so delaytimer must not be in the write allowlist.
+    assert "delaytimer" not in const.WRITABLE_FIELDS
