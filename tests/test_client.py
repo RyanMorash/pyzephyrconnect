@@ -39,7 +39,7 @@ def wired(monkeypatch):
     shadow.connect = AsyncMock(side_effect=lambda *a, **k: order.append("connect"))
     shadow.disconnect = AsyncMock()
     shadow.request_state = AsyncMock()
-    shadow.publish_desired = AsyncMock()
+    shadow.publish_state = AsyncMock()
 
     monkeypatch.setattr(client_module, "ZephyrAuth", MagicMock(return_value=auth))
     monkeypatch.setattr(client_module, "ZephyrApi", MagicMock(return_value=api))
@@ -94,21 +94,64 @@ async def test_get_accepted_populates_state_and_notifies(wired):
     assert seen[-1].power == 1
 
 
-async def test_delta_merges_without_clearing_untouched_fields(wired):
+async def test_update_delta_does_not_change_state_or_notify_listeners(wired):
+    """A shadow delta is desired-vs-reported difference - a wish, not device
+    state. This vendor never writes state.desired, so any delta can only
+    come from stale or foreign desired writes and never reflects what the
+    hardware actually did. Folding it into the cache previously made the
+    probe print a change (e.g. "light: 0 -> 1") for a request the device
+    had not yet - or ever - fulfilled, which disguised the real root-cause
+    bug (writing state.desired instead of state.reported) for a full
+    debugging cycle. Payload shape captured from the real device."""
     c = _client()
     await c.async_setup()
     await c.async_start(THING)
     c._handle_message(
         THING,
         f"$aws/things/{THING}/shadow/get/accepted",
-        {"state": {"reported": {"fan": 0, "usegreasefiltertime": 642}}},
+        {"state": {"reported": {"fan": 0, "light": 0, "usegreasefiltertime": 642}}},
     )
+    before = c.state(THING)
+
+    seen = []
+    c.add_listener(THING, lambda state: seen.append(state))
     c._handle_message(
-        THING, f"$aws/things/{THING}/shadow/update/delta", {"state": {"fan": 3}}
+        THING,
+        f"$aws/things/{THING}/shadow/update/delta",
+        {"state": {"light": 1, "power": 1}, "version": 302688},
     )
 
-    assert c.state(THING).fan == 3
+    assert c.state(THING) is before
+    assert c.state(THING).light == 0
+    assert seen == []
+
+
+async def test_update_accepted_merges_reported_fields(wired):
+    """update/accepted carries only the fields that changed and must still
+    be merged into the cache - unlike update/delta. Payload shape captured
+    from the real device, including the top-level "version" key that the
+    handler must simply ignore."""
+    c = _client()
+    await c.async_setup()
+    await c.async_start(THING)
+    c._handle_message(
+        THING,
+        f"$aws/things/{THING}/shadow/get/accepted",
+        {"state": {"reported": {"fan": 0, "light": 0, "usegreasefiltertime": 642}}},
+    )
+
+    seen = []
+    c.add_listener(THING, lambda state: seen.append(state))
+    c._handle_message(
+        THING,
+        f"$aws/things/{THING}/shadow/update/accepted",
+        {"state": {"reported": {"light": 1, "power": 1}}, "version": 302691},
+    )
+
+    assert c.state(THING).light == 1
+    assert c.state(THING).power == 1
     assert c.state(THING).use_grease_filter_time == 642
+    assert seen[-1].light == 1
 
 
 async def test_listener_can_be_removed(wired):
@@ -160,19 +203,19 @@ async def test_expiring_credentials_trigger_refresh_and_reconnect(wired):
     assert wired["shadow"].connect.await_count == 2
 
 
-async def test_publish_desired_requires_a_started_connection(wired):
+async def test_set_state_requires_a_started_connection(wired):
     c = _client()
     await c.async_setup()
     with pytest.raises(RuntimeError, match="async_start"):
-        await c.async_publish_desired(THING, {"light": 1})
+        await c.async_set_state(THING, {"light": 1})
 
 
-async def test_publish_desired_delegates_to_the_shadow(wired):
+async def test_set_state_delegates_to_the_shadow(wired):
     c = _client()
     await c.async_setup()
     await c.async_start(THING)
-    await c.async_publish_desired(THING, {"light": 1})
-    wired["shadow"].publish_desired.assert_awaited_once_with({"light": 1})
+    await c.async_set_state(THING, {"light": 1})
+    wired["shadow"].publish_state.assert_awaited_once_with({"light": 1})
 
 
 async def test_poll_falls_back_to_https(wired):

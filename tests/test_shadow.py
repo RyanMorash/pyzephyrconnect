@@ -127,21 +127,26 @@ async def test_request_state_publishes_an_empty_get(fake_paho):
     assert json.loads(payload) == {}
 
 
-async def test_publish_desired_wraps_fields_in_state_desired(fake_paho):
+async def test_publish_state_wraps_fields_in_state_reported(fake_paho):
+    """This device only acts on state.reported - see the module-level note
+    in shadow.py. Publishing state.desired is accepted by AWS and silently
+    ignored by the hardware, which was the root cause of a real bug; the
+    absence of "desired" anywhere in the payload is the regression guard."""
     sc = _make()
     await sc.connect(CREDS)
-    await sc.publish_desired({"light": 1})
+    await sc.publish_state({"light": 1})
 
     topic, payload = fake_paho.publish.call_args.args[:2]
     assert topic == f"$aws/things/{THING}/shadow/update"
-    assert json.loads(payload) == {"state": {"desired": {"light": 1}}}
+    assert json.loads(payload) == {"state": {"reported": {"light": 1}}}
+    assert "desired" not in payload
 
 
-async def test_publish_desired_rejects_an_empty_payload(fake_paho):
+async def test_publish_state_rejects_an_empty_payload(fake_paho):
     sc = _make()
     await sc.connect(CREDS)
     with pytest.raises(ValueError):
-        await sc.publish_desired({})
+        await sc.publish_state({})
 
 
 async def test_reconnect_uses_capped_exponential_backoff(fake_paho):

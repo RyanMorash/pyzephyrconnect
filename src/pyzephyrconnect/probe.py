@@ -154,7 +154,7 @@ async def main(argv: list[str] | None = None) -> int:
                 return 0
 
             print(f"\nWRITING {field}={value} to a physical appliance.")
-            await client.async_publish_desired(caps.thing_name, {field: value})
+            await client.async_set_state(caps.thing_name, {field: value})
 
             await asyncio.sleep(5)
             after = dict(client.state(caps.thing_name).raw)

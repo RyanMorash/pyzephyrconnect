@@ -130,10 +130,15 @@ class ZephyrClient:
             await shadow.request_state()
         return True
 
-    async def async_publish_desired(
+    async def async_set_state(
         self, thing_name: str, fields: dict[str, Any]
     ) -> None:
         """WRITE PATH - actuates hardware.
+
+        Writes state.reported, not state.desired: that is what the vendor
+        app does and what this device acts on. Writing state.desired is
+        accepted by AWS IoT but silently ignored by the hardware - see
+        ShadowClient.publish_state for the full explanation.
 
         Callers must allowlist fields themselves. Until the validation gate
         in the plan is complete, the probe CLI is the only permitted caller.
@@ -141,7 +146,7 @@ class ZephyrClient:
         shadow = self._shadows.get(thing_name)
         if shadow is None:
             raise RuntimeError(f"async_start() has not been called for {thing_name}")
-        await shadow.publish_desired(fields)
+        await shadow.publish_state(fields)
 
     def add_listener(
         self, thing_name: str, callback: StateListener
@@ -166,9 +171,10 @@ class ZephyrClient:
     ) -> None:
         """Fold an incoming shadow message into the cached state.
 
-        get/accepted carries a full document; update/accepted and
-        update/delta carry only what changed, so both are merged rather than
-        replacing the cache.
+        get/accepted carries a full document; update/accepted carries only
+        what changed, so it is merged rather than replacing the cache.
+        update/delta is deliberately NOT merged - see the comment on that
+        branch below.
 
         Runs on the asyncio loop: ShadowClient._dispatch schedules this via
         loop.call_soon_threadsafe. Nothing here may raise - an escaped
@@ -211,13 +217,21 @@ class ZephyrClient:
                     else HoodState.from_reported(reported)
                 )
             elif topic.endswith("/update/delta"):
-                # delta carries the changed keys directly under "state".
-                current = self._states.get(thing_name)
-                new_state = (
-                    current.merge(state_block)
-                    if current
-                    else HoodState.from_reported(state_block)
+                # A shadow delta is desired-vs-reported difference - a wish,
+                # not confirmed device state. This vendor never writes
+                # state.desired (see ShadowClient.publish_state), so any
+                # delta observed here can only originate from a stale or
+                # foreign desired write and never represents what the
+                # hardware actually did. Folding it into the cache
+                # previously made the probe report a "change" the device
+                # had not - and might never - make, which is exactly what
+                # disguised the state.desired/state.reported root-cause bug.
+                # Deliberately a no-op: log at DEBUG and drop it.
+                _LOGGER.debug(
+                    "ignoring shadow delta on %s (never device-authored)",
+                    topic.rsplit("/", 1)[-1],
                 )
+                return
             else:
                 return
 

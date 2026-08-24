@@ -263,12 +263,22 @@ class ShadowClient:
         """Ask for the full shadow. The reply lands on get/accepted."""
         self._publish(self.topics.get, {})
 
-    async def publish_desired(self, fields: dict[str, Any]) -> None:
+    async def publish_state(self, fields: dict[str, Any]) -> None:
         """WRITE PATH - actuates hardware.
+
+        Publishes to state.reported, not state.desired. That is backwards
+        from the usual AWS IoT shadow convention (reported is normally
+        device-authored), but it is demonstrably how this product works:
+        the vendor iOS app's own MQTT traffic writes state.reported when
+        the user taps a control, and a direct experiment confirmed that
+        publishing state.reported physically actuates the hood. Writing
+        state.desired instead is accepted by AWS - the publish succeeds and
+        nothing complains - but the device silently ignores it, which was
+        the original form of this bug.
 
         Callers are responsible for allowlisting fields. Only the probe CLI
         should reach this until the write path has been validated.
         """
         if not fields:
-            raise ValueError("refusing to publish an empty desired state")
-        self._publish(self.topics.update, {"state": {"desired": fields}})
+            raise ValueError("refusing to publish an empty reported state")
+        self._publish(self.topics.update, {"state": {"reported": fields}})
