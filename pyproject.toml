@@ -23,11 +23,15 @@ dev = ["pytest>=8", "pytest-asyncio>=0.23", "pytest-cov"]
 Homepage = "https://github.com/RyanMorash/pyzephyrconnect"
 
 [tool.hatch.build.targets.wheel]
+# packages already walks the whole src/pyzephyrconnect tree, including
+# certs/twca.pem - a force-include entry for the same path was here
+# previously and made hatchling try to add that file to the wheel twice,
+# which is a hard build error ("A second file is being added to the wheel
+# archive at the same path"). Removed; verified below that the cert bundle
+# still lands in the built wheel without it.
 packages = ["src/pyzephyrconnect"]
-
-[tool.hatch.build.targets.wheel.force-include]
-"src/pyzephyrconnect/certs" = "pyzephyrconnect/certs"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+pythonpath = ["tests"]
