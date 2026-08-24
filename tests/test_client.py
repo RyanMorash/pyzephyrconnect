@@ -8,6 +8,7 @@ import pytest
 from pyzephyrconnect import client as client_module
 from pyzephyrconnect.auth import Credentials
 from pyzephyrconnect.client import ZephyrClient
+from pyzephyrconnect.exceptions import ZephyrAuthError
 from pyzephyrconnect.models import HoodState
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -266,3 +267,17 @@ async def test_setup_capabilities_still_carry_identifiers(wired):
     assert caps[0].thing_name == THING
     assert caps[0].serial == "1234567XYZ"
     assert caps[0].mac == "00:00:5e:00:53:00"
+
+
+async def test_identity_id_returns_auth_value(wired):
+    """After async_setup(), client.identity_id returns the auth layer value."""
+    c = _client()
+    await c.async_setup()
+    assert c.identity_id == "us-west-2:abc"
+
+
+def test_identity_id_raises_before_async_setup():
+    """Before async_setup(), accessing identity_id propagates the auth error."""
+    c = ZephyrClient("u", "p", MagicMock())
+    with pytest.raises(ZephyrAuthError, match="authenticate"):
+        _ = c.identity_id

@@ -51,6 +51,18 @@ class ZephyrClient:
     def connected(self) -> bool:
         return self._connected
 
+    @property
+    def identity_id(self) -> str:
+        """Cognito identity ID for this account.
+
+        Stable across sessions and unique per account, which makes it the
+        natural key for a consumer that needs to identify this account (for
+        example a Home Assistant config entry's unique ID).
+
+        Raises ZephyrAuthError if async_setup() has not run yet.
+        """
+        return self._auth.identity_id
+
     def capabilities(self, thing_name: str) -> HoodCapabilities | None:
         return self._capabilities.get(thing_name)
 
