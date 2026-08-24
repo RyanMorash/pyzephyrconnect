@@ -7,7 +7,7 @@ from pyzephyrconnect import auth as auth_module
 from pyzephyrconnect.auth import Credentials, ZephyrAuth
 from pyzephyrconnect.exceptions import ZephyrAuthError
 
-IDENTITY = "us-west-2:7adabfa4-1111-2222-3333-444455556666"
+IDENTITY = "us-west-2:00000000-1111-2222-3333-444455556666"
 
 
 def _creds_response(expires_in_seconds=3600):
