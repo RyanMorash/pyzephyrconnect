@@ -1,8 +1,9 @@
 """Vendor REST endpoints.
 
 The session is injected rather than owned, so Home Assistant can pass its
-shared client session. The pinned SSL context is applied per request, which
-means a shared session needs no special construction.
+shared client session. The SSL context (system trust plus the TWCA
+workaround anchors) is applied per request, which means a shared session
+needs no special construction.
 """
 
 from __future__ import annotations
@@ -20,29 +21,35 @@ from .exceptions import ZephyrCertificateError, ZephyrError
 _LOGGER = logging.getLogger(__name__)
 
 CERT_BUNDLE = "twca.pem"
-# Validity of the bundled CA set; surfaced in the error message so an
-# operator hitting this in 2030 knows immediately what expired.
+# Validity of the bundled TWCA anchors. With additive trust (system store
+# plus these anchors) this is no longer load-bearing for verification - it's
+# tracked here for reference and exercised by the test suite, not used as
+# the sole diagnosis in the error path below.
 CERT_BUNDLE_EXPIRY = "2030"
 
 
 def build_ssl_context() -> ssl.SSLContext:
-    """SSL context trusting the bundled TWCA CA set.
+    """System trust store, plus the bundled TWCA CAs as extra anchors.
 
-    The vendor's intermediate omits the Subject Key Identifier extension and
-    is rejected by OpenSSL 3.x under system trust. Loading the CAs as trust
-    anchors satisfies verification without weakening it - verify_mode stays
-    CERT_REQUIRED and hostname checking stays on.
+    The vendor's HTTPS host presents a chain whose intermediate omits the
+    Subject Key Identifier extension, which OpenSSL 3.x rejects under normal
+    system trust. This works around that specific defect by adding the TWCA
+    certificates as supplementary trust anchors on top of - not instead of -
+    the system trust store. verify_mode stays CERT_REQUIRED and hostname
+    checking stays on.
+
+    This is deliberately NOT certificate pinning. Pinning would replace the
+    system trust store with only the bundled CAs, which breaks every other
+    host outright and breaks the vendor host itself the day it rotates to a
+    mainstream CA. Adding the TWCA anchors alongside the system store fixes
+    the SKI defect for this vendor while leaving normal trust intact
+    everywhere else, and survives a future CA rotation.
     """
-    # Passing cafile directly to create_default_context() is deliberate: it
-    # makes the context skip ssl.SSLContext.load_default_certs() entirely.
-    # Creating the context first and calling load_verify_locations()
-    # afterward would instead ADD the bundle on top of the system trust
-    # store, defeating the pin (and failing on any machine with extra
-    # locally-installed CAs, e.g. a mkcert dev root).
+    ctx = ssl.create_default_context()
     with resources.as_file(
         resources.files("pyzephyrconnect.certs").joinpath(CERT_BUNDLE)
     ) as path:
-        ctx = ssl.create_default_context(cafile=str(path))
+        ctx.load_verify_locations(cafile=str(path))
     return ctx
 
 
@@ -80,10 +87,12 @@ class ZephyrApi:
                 return await response.json(content_type=None)
         except aiohttp.ClientConnectorCertificateError as err:
             raise ZephyrCertificateError(
-                f"TLS verification failed for {url}. The bundled CA set "
-                f"({CERT_BUNDLE}, valid to {CERT_BUNDLE_EXPIRY}) does not "
-                "cover the presented chain - the vendor likely rotated CAs. "
-                "Recapture the chain; do not disable verification."
+                f"TLS verification failed for {url}. The presented chain is "
+                f"trusted by neither the system CA store nor the bundled "
+                f"TWCA anchors ({CERT_BUNDLE}) added to work around the "
+                "vendor's SKI-less intermediate. The vendor likely changed "
+                "its certificate chain again - recapture it and update the "
+                "TWCA bundle if needed. Do not disable verification."
             ) from err
 
     async def get_own_devices(self, id_token: str) -> list[dict[str, Any]]:

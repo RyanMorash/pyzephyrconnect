@@ -15,11 +15,14 @@ class ZephyrAuthError(ZephyrError):
 
 
 class ZephyrCertificateError(ZephyrError):
-    """TLS verification failed against the bundled TWCA CA set.
+    """TLS verification failed against system trust plus the TWCA anchors.
 
     The vendor's intermediate omits the Subject Key Identifier extension, so
-    system trust stores reject it. The library ships its own CA bundle. If
-    this fires, the vendor rotated to a chain the bundle does not cover.
+    plain system trust rejects it. The library adds its own TWCA CA bundle
+    as supplementary trust anchors on top of the system store - this is not
+    certificate pinning. If this fires, the chain is untrusted by both the
+    system CAs and the TWCA additions, which usually means the vendor
+    changed its certificate chain again.
     """
 
 
