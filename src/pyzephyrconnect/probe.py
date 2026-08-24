@@ -134,33 +134,34 @@ async def main(argv: list[str] | None = None) -> int:
         print(f"device: {caps.model} (fan 0-{caps.max_fan_speed}, "
               f"light 0-{caps.max_light_level})")
 
-        await client.async_start(caps.thing_name)
-        await asyncio.sleep(2)
+        try:
+            await client.async_start(caps.thing_name)
+            await asyncio.sleep(2)
 
-        before = dict(client.state(caps.thing_name).raw)
-        print("current state:")
-        print(json.dumps(_redacted(before), indent=2, sort_keys=True))
+            before = dict(client.state(caps.thing_name).raw)
+            print("current state:")
+            print(json.dumps(_redacted(before), indent=2, sort_keys=True))
 
-        if field is None:
-            if args.watch:
-                print(f"watching for {args.seconds}s (ctrl-c to stop)")
-                try:
-                    await asyncio.sleep(args.seconds)
-                except asyncio.CancelledError:
-                    pass
-                after = dict(client.state(caps.thing_name).raw)
-                _report(diff_states(before, after))
-            await client.async_stop()
+            if field is None:
+                if args.watch:
+                    print(f"watching for {args.seconds}s (ctrl-c to stop)")
+                    try:
+                        await asyncio.sleep(args.seconds)
+                    except asyncio.CancelledError:
+                        pass
+                    after = dict(client.state(caps.thing_name).raw)
+                    _report(diff_states(_redacted(before), _redacted(after)))
+                return 0
+
+            print(f"\nWRITING {field}={value} to a physical appliance.")
+            await client.async_publish_desired(caps.thing_name, {field: value})
+
+            await asyncio.sleep(5)
+            after = dict(client.state(caps.thing_name).raw)
+            _report(diff_states(_redacted(before), _redacted(after)))
             return 0
-
-        print(f"\nWRITING {field}={value} to a physical appliance.")
-        await client.async_publish_desired(caps.thing_name, {field: value})
-
-        await asyncio.sleep(5)
-        after = dict(client.state(caps.thing_name).raw)
-        _report(diff_states(before, after))
-        await client.async_stop()
-        return 0
+        finally:
+            await client.async_stop()
 
 
 def _report(changes: dict[str, tuple[Any, Any]]) -> None:

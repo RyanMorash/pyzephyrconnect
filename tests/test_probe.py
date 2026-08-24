@@ -1,8 +1,15 @@
+import json
 from contextlib import nullcontext
 
 import pytest
 
-from pyzephyrconnect.probe import diff_states, parse_assignment, validate_write
+from pyzephyrconnect.probe import (
+    _REDACT,
+    _redacted,
+    diff_states,
+    parse_assignment,
+    validate_write,
+)
 
 
 @pytest.mark.parametrize(
@@ -74,3 +81,98 @@ def test_diff_reports_newly_appearing_keys():
 
 def test_diff_of_identical_states_is_empty():
     assert diff_states({"fan": 1}, {"fan": 1}) == {}
+
+
+def test_redacted_diff_never_exposes_an_identifier_that_starts_reporting():
+    """Every print path must run diff_states on redacted snapshots. When a
+    _REDACT key (e.g. location) goes from absent to present - the shape
+    diff_states can actually express as a "change" once both snapshots are
+    pre-redacted - the reported old/new must be None / the redaction
+    placeholder, never the real coordinates."""
+    before = {"fan": 1}
+    after = {"location": "41.0,-106.0", "fan": 1}
+
+    changes = diff_states(_redacted(before), _redacted(after))
+
+    assert changes == {"location": (None, "<redacted>")}
+    assert "41.0" not in repr(changes) and "-106.0" not in repr(changes)
+
+
+def test_redacted_diff_drops_a_changed_identifier_present_on_both_sides():
+    """When a _REDACT key is present before and after but its value
+    changes, redacting before diffing collapses both sides to the same
+    placeholder, so diff_states (equality-based) treats it as unchanged and
+    the key drops out entirely - the strongest form of "never leaks",
+    since nothing about the key's real value is reported at all."""
+    before = {"location": "40.0,-105.0", "fan": 1}
+    after = {"location": "41.0,-106.0", "fan": 1}
+
+    changes = diff_states(_redacted(before), _redacted(after))
+
+    assert "location" not in changes
+    assert "40.0" not in repr(changes) and "41.0" not in repr(changes)
+    assert "-105.0" not in repr(changes) and "-106.0" not in repr(changes)
+
+
+def test_redacted_diff_still_shows_real_values_for_ordinary_keys():
+    """Redaction must not over-blank: a change in a non-_REDACT key still
+    reports its real before/after values through the same redacted-diff
+    path used by watch mode and post-write reporting."""
+    before = {"location": "40.0,-105.0", "fan": 0}
+    after = {"location": "40.0,-105.0", "fan": 3}
+
+    changes = diff_states(_redacted(before), _redacted(after))
+
+    assert changes == {"fan": (0, 3)}
+    assert "location" not in _REDACT or "location" not in changes
+
+
+async def test_async_stop_runs_even_when_a_post_start_step_raises(monkeypatch):
+    """main() must disconnect the shadow client on every path once
+    async_start() has begun, not only on happy-path returns. Here
+    shadow.request_state() (invoked inside client.async_start()) raises,
+    so the failure surfaces before probe ever prints state - this also
+    covers the harder case where the shadow was already registered on
+    the client before the exception, not just a clean failure to start."""
+    from datetime import UTC, datetime, timedelta
+    from pathlib import Path
+    from unittest.mock import AsyncMock, MagicMock
+
+    from pyzephyrconnect import client as client_module
+    from pyzephyrconnect import probe
+    from pyzephyrconnect.auth import Credentials
+
+    fixtures = Path(__file__).parent / "fixtures"
+    discover = json.loads((fixtures / "discoverdevice.json").read_text())
+    thing = discover["thingName"]
+
+    auth = MagicMock()
+    auth.authenticate = AsyncMock()
+    auth.attach_policy = AsyncMock()
+    auth.id_token = "ID"
+    auth.mqtt_client_id = "client-id"
+    auth.credentials = Credentials(
+        "k", "s", "t", datetime.now(UTC) + timedelta(hours=1)
+    )
+
+    api = MagicMock()
+    api.get_own_devices = AsyncMock(return_value=[{"thingName": thing}])
+    api.discover_device = AsyncMock(return_value=discover)
+
+    shadow = MagicMock()
+    shadow.connect = AsyncMock()
+    shadow.disconnect = AsyncMock()
+    shadow.request_state = AsyncMock(side_effect=RuntimeError("boom"))
+
+    monkeypatch.setattr(client_module, "ZephyrAuth", MagicMock(return_value=auth))
+    monkeypatch.setattr(client_module, "ZephyrApi", MagicMock(return_value=api))
+    monkeypatch.setattr(
+        client_module, "ShadowClient", MagicMock(return_value=shadow)
+    )
+    monkeypatch.setenv("ZEPHYR_USER", "user@example.com")
+    monkeypatch.setenv("ZEPHYR_PASS", "hunter2")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await probe.main([])
+
+    shadow.disconnect.assert_awaited_once()
