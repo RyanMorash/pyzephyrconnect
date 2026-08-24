@@ -1,0 +1,18 @@
+{
+  "state": {
+    "reported": {
+      "power": 0, "act": "Disabled", "light": 0, "fan": 0,
+      "delaytimer": 0, "fanwarning": 0,
+      "cleangreasefilters": 0, "cleancharcoalfilters": 0,
+      "setrecirculating": 0, "setcleanairfunction": 0,
+      "usegreasefiltertime": 642, "usecharcoalfiltertime": 0,
+      "faultCode": [], "alarmfaultcode": 0,
+      "setdelaytimer": 0, "alarmfan": 0,
+      "resetgreasefilter": 0, "alarmgreasefilter": 0,
+      "uselighttime": 2833, "usefantime": 1979, "isOnline": 1
+    }
+  },
+  "metadata": { "reported": {} },
+  "version": 302664,
+  "timestamp": 1787540497
+}
