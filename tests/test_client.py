@@ -183,3 +183,43 @@ async def test_poll_falls_back_to_https(wired):
     assert isinstance(state, HoodState)
     assert state.use_grease_filter_time == 642
     assert c.state(THING) is not None
+
+
+async def test_non_dict_shadow_payload_is_ignored(wired):
+    """A payload that is valid JSON but not an object (e.g. the literal
+    `null`, which json.loads returns as None) must not raise, must not
+    change cached state, and must not notify listeners."""
+    c = _client()
+    await c.async_setup()
+    await c.async_start(THING)
+
+    before = c.state(THING)
+    seen = []
+    c.add_listener(THING, lambda state: seen.append(state))
+
+    c._handle_message(
+        THING, f"$aws/things/{THING}/shadow/get/accepted", None
+    )
+
+    assert c.state(THING) is before
+    assert seen == []
+
+
+async def test_setup_strips_personal_data_from_cached_state(wired):
+    """discoverdevice mixes state with device identifiers; those must never
+    land in HoodState.raw."""
+    c = _client()
+    await c.async_setup()
+    state = c.state(THING)
+    assert state is not None
+    for key in ("thingName", "SN", "MAC", "location"):
+        assert key not in state.raw
+
+
+async def test_setup_capabilities_still_carry_identifiers(wired):
+    """The PII filter applies only to the state path - capabilities must
+    still be built from the unfiltered payload."""
+    caps = await _client().async_setup()
+    assert caps[0].thing_name == THING
+    assert caps[0].serial == "1234567XYZ"
+    assert caps[0].mac == "00:00:5e:00:53:00"

@@ -23,6 +23,15 @@ _LOGGER = logging.getLogger(__name__)
 
 StateListener = Callable[[HoodState], None]
 
+# discoverdevice responses are a flat dict mixing shadow-state fields with
+# device identifiers. These must never enter HoodState.raw (its default
+# dataclass repr, and hence any careless log of a cached state, would carry
+# them). Shadow messages over MQTT carry a clean state.reported block with
+# none of these keys - see tests/fixtures/shadow_get_accepted.json versus
+# tests/fixtures/discoverdevice.json - so only discoverdevice-derived state
+# construction needs filtering; HoodCapabilities legitimately keeps them.
+_PERSONAL_DATA_KEYS = ("thingName", "SN", "MAC", "location")
+
 
 class ZephyrClient:
     """One authenticated account and the hoods under it."""
@@ -59,7 +68,10 @@ class ZephyrClient:
             )
             caps = HoodCapabilities.from_discover(payload)
             self._capabilities[thing_name] = caps
-            self._states[thing_name] = HoodState.from_reported(payload)
+            state_payload = {
+                k: v for k, v in payload.items() if k not in _PERSONAL_DATA_KEYS
+            }
+            self._states[thing_name] = HoodState.from_reported(state_payload)
         return list(self._capabilities.values())
 
     async def async_start(self, thing_name: str) -> None:
@@ -92,7 +104,10 @@ class ZephyrClient:
     async def async_poll(self, thing_name: str) -> HoodState:
         """Read current state over HTTPS. Used at setup and while degraded."""
         payload = await self._api.discover_device(self._auth.id_token, thing_name)
-        state = HoodState.from_reported(payload)
+        state_payload = {
+            k: v for k, v in payload.items() if k not in _PERSONAL_DATA_KEYS
+        }
+        state = HoodState.from_reported(state_payload)
         self._states[thing_name] = state
         self._notify(thing_name, state)
         return state
@@ -154,36 +169,68 @@ class ZephyrClient:
         get/accepted carries a full document; update/accepted and
         update/delta carry only what changed, so both are merged rather than
         replacing the cache.
+
+        Runs on the asyncio loop: ShadowClient._dispatch schedules this via
+        loop.call_soon_threadsafe. Nothing here may raise - an escaped
+        exception hits asyncio's default exception handler, which logs the
+        callback and its arguments (the topic, which embeds the thing name,
+        and the raw payload) at ERROR. _on_message only catches JSON *parse*
+        errors, so valid-but-wrong-shaped JSON (e.g. the literal `null`, or
+        an array) still reaches here - hence the explicit shape guard below
+        in addition to the try/except backstop. Diagnostics are limited to
+        the topic's leaf segment (accepted/delta/rejected), which carries no
+        identifiers.
         """
-        if topic.endswith("/rejected"):
-            _LOGGER.warning("shadow operation rejected: %s", payload)
+        if not isinstance(payload, dict):
+            _LOGGER.warning(
+                "shadow message on %s had an unexpected shape (not an "
+                "object); ignoring",
+                topic.rsplit("/", 1)[-1],
+            )
             return
 
-        state_block = payload.get("state") or {}
-        if topic.endswith("/get/accepted"):
-            reported = state_block.get("reported") or {}
-            new_state = HoodState.from_reported(reported)
-        elif topic.endswith("/update/accepted"):
-            reported = state_block.get("reported") or {}
-            current = self._states.get(thing_name)
-            new_state = (
-                current.merge(reported)
-                if current
-                else HoodState.from_reported(reported)
-            )
-        elif topic.endswith("/update/delta"):
-            # delta carries the changed keys directly under "state".
-            current = self._states.get(thing_name)
-            new_state = (
-                current.merge(state_block)
-                if current
-                else HoodState.from_reported(state_block)
-            )
-        else:
-            return
+        try:
+            if topic.endswith("/rejected"):
+                # Do not log the payload: a rejection can echo back the
+                # desired/reported fields it rejected, including identifiers.
+                _LOGGER.warning(
+                    "shadow operation rejected on %s", topic.rsplit("/", 1)[-1]
+                )
+                return
 
-        self._states[thing_name] = new_state
-        self._notify(thing_name, new_state)
+            state_block = payload.get("state") or {}
+            if topic.endswith("/get/accepted"):
+                reported = state_block.get("reported") or {}
+                new_state = HoodState.from_reported(reported)
+            elif topic.endswith("/update/accepted"):
+                reported = state_block.get("reported") or {}
+                current = self._states.get(thing_name)
+                new_state = (
+                    current.merge(reported)
+                    if current
+                    else HoodState.from_reported(reported)
+                )
+            elif topic.endswith("/update/delta"):
+                # delta carries the changed keys directly under "state".
+                current = self._states.get(thing_name)
+                new_state = (
+                    current.merge(state_block)
+                    if current
+                    else HoodState.from_reported(state_block)
+                )
+            else:
+                return
+
+            self._states[thing_name] = new_state
+            self._notify(thing_name, new_state)
+        except Exception:  # noqa: BLE001
+            # Mirrors _notify: one malformed message must not escape onto
+            # the event loop. Log leaf-only - never the thing name, full
+            # topic, or payload.
+            _LOGGER.exception(
+                "unhandled error processing shadow message on %s",
+                topic.rsplit("/", 1)[-1],
+            )
 
     def _notify(self, thing_name: str, state: HoodState) -> None:
         for callback in list(self._listeners.get(thing_name, [])):
