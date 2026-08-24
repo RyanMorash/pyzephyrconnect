@@ -7,8 +7,13 @@ evidence needed to characterise them later.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+import logging
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any
+
+_LOGGER = logging.getLogger(__name__)
 
 _URL_KEYS = (
     "CharcoalFilterVideoURL",
@@ -45,11 +50,18 @@ class HoodCapabilities:
     max_charcoal_filter_hours: int
     labor_warranty: str
     parts_warranty: str
-    urls: dict[str, str] = field(default_factory=dict)
-    raw: dict[str, Any] = field(default_factory=dict)
+    urls: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
+    raw: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
 
     @classmethod
     def from_discover(cls, payload: dict[str, Any]) -> HoodCapabilities:
+        """Build capabilities from the discoverdevice payload.
+
+        Uses bare int()/bool() deliberately: capabilities are fetched once at
+        setup, so a malformed field should fail loudly rather than silently
+        producing a wrong capability set. Contrast with HoodState.from_reported,
+        which must degrade gracefully because state arrives continuously.
+        """
         return cls(
             thing_name=str(payload.get("thingName", "")),
             serial=str(payload.get("SN", "")),
@@ -66,8 +78,10 @@ class HoodCapabilities:
             ),
             labor_warranty=str(payload.get("laborWarranty", "")),
             parts_warranty=str(payload.get("partsWarranty", "")),
-            urls={k: payload[k] for k in _URL_KEYS if payload.get(k)},
-            raw=dict(payload),
+            urls=MappingProxyType(
+                {k: payload[k] for k in _URL_KEYS if payload.get(k)}
+            ),
+            raw=MappingProxyType(dict(payload)),
         )
 
 
@@ -99,14 +113,30 @@ class HoodState:
     alarm_grease_filter: int = 0
     is_online: bool = False
     fault_codes: tuple[Any, ...] = ()
-    raw: dict[str, Any] = field(default_factory=dict)
+    raw: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
 
     @classmethod
     def from_reported(cls, reported: dict[str, Any]) -> HoodState:
+        """Build state from a shadow `reported` block.
+
+        Coercion is deliberately lenient: state arrives continuously from the
+        device, so a malformed field must degrade to a safe default (0)
+        rather than crash the integration. Contrast with
+        HoodCapabilities.from_discover, which fails loudly because it only
+        runs once at setup. Coercion failures are still logged so a bad
+        payload doesn't silently read as "no fault".
+        """
+
         def as_int(key: str) -> int:
+            value = reported.get(key, 0) or 0
             try:
-                return int(reported.get(key, 0) or 0)
+                return int(value)
             except (TypeError, ValueError):
+                _LOGGER.warning(
+                    "Could not coerce %r value %r to int; defaulting to 0",
+                    key,
+                    value,
+                )
                 return 0
 
         return cls(
@@ -130,7 +160,7 @@ class HoodState:
             alarm_grease_filter=as_int("alarmgreasefilter"),
             is_online=bool(as_int("isOnline")),
             fault_codes=tuple(reported.get("faultCode") or ()),
-            raw=dict(reported),
+            raw=MappingProxyType(dict(reported)),
         )
 
     def merge(self, delta: dict[str, Any]) -> HoodState:
@@ -141,4 +171,4 @@ class HoodState:
         device did not mention.
         """
         merged_raw = {**self.raw, **delta}
-        return replace(HoodState.from_reported(merged_raw))
+        return HoodState.from_reported(merged_raw)

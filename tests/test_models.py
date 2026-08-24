@@ -73,3 +73,42 @@ def test_state_keeps_unknown_keys_in_raw(shadow):
     reported["somethingNew"] = 42
     state = HoodState.from_reported(reported)
     assert state.raw["somethingNew"] == 42
+
+
+def test_state_logs_a_warning_on_malformed_int_field(shadow, caplog):
+    """A malformed alarm value must not silently read as 'no fault' - the
+    coercion failure must be surfaced via a WARNING log naming the key."""
+    reported = dict(shadow["state"]["reported"])
+    reported["alarmfaultcode"] = "not-a-number"
+    with caplog.at_level("WARNING"):
+        state = HoodState.from_reported(reported)
+    assert state.alarm_fault_code == 0
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert "alarmfaultcode" in warnings[0].message
+    assert "not-a-number" in warnings[0].message
+
+
+def test_state_raw_rejects_in_place_mutation(shadow):
+    """`raw` must be read-only so a cached HoodState handed to multiple
+    listeners cannot be corrupted by one of them mutating it."""
+    state = HoodState.from_reported(shadow["state"]["reported"])
+    with pytest.raises(TypeError):
+        state.raw["fan"] = 99
+
+
+def test_capabilities_urls_rejects_in_place_mutation(discover):
+    """`urls` must be read-only for the same reason as HoodState.raw."""
+    caps = HoodCapabilities.from_discover(discover)
+    with pytest.raises(TypeError):
+        caps.urls["FAQURL"] = "https://example.com"
+
+
+def test_state_merge_works_with_read_only_raw(shadow):
+    """merge() must keep working now that `raw` is a Mapping rather than a
+    plain dict: a partial delta applies and unchanged keys survive."""
+    state = HoodState.from_reported(shadow["state"]["reported"])
+    merged = state.merge({"fan": 5})
+    assert merged.fan == 5
+    assert merged.use_grease_filter_time == 642, "unchanged keys must survive"
+    assert merged.raw["fan"] == 5
