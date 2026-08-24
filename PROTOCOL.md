@@ -223,17 +223,37 @@ Base: `$aws/things/<thingName>/shadow`
 | `.../get/rejected` | sub | errors (404 = no shadow exists) |
 | `.../update/accepted` | sub | confirmed state changes |
 | `.../update/rejected` | sub | rejected writes |
-| `.../update/delta` | sub | desired ≠ reported |
+| `.../update/delta` | sub | `desired` ≠ `reported` — subscribed but ignored, see below |
 | `.../update/documents` | sub | before/after pairs |
 | `.../update` | pub | **WRITE PATH — actuates hardware** |
 
 Read flow: subscribe first, then publish `{}` to `.../get`. The document
 arrives on `get/accepted` within a second.
 
-Control (not yet implemented): publish
-`{"state":{"desired":{...}}}` to `.../update`. The device applies it and
-echoes back on `update/accepted` with `state.reported` updated. **Field
-semantics are not yet mapped** — see §7.
+Control (implemented): publish `{"state":{"reported":{...}}}` to
+`.../update`. The device applies it and echoes back on
+`update/accepted` with `state.reported` updated.
+
+Writing `reported` is backwards from the usual AWS IoT shadow
+convention — `reported` is normally device-authored and clients write
+`desired` — but it is demonstrably how this product works. Live MQTT
+captures of the vendor iOS app's own traffic show it publishing
+`state.reported` when the user taps a control, and a direct experiment
+confirmed a `state.reported` write physically actuates the hood.
+Writing `state.desired` instead is accepted by AWS IoT — the publish
+succeeds and nothing complains — but this device silently ignores it.
+
+Consequently `update/delta` never carries device state. It is still
+subscribed, but its payload is deliberately ignored (debug-logged
+only): a delta is a `desired`-vs-`reported` difference, and since
+nothing in this system ever writes `desired`, any delta arriving here
+can only come from a stale or foreign `desired` write. Merging one
+into cached state produces a phantom "change" — that exact bug
+disguised the desired/reported root cause for a full debugging cycle.
+
+The write path is covered by `tests/test_shadow.py` and
+`tests/test_client.py`. **Field semantics are only partly mapped** —
+see §7.
 
 ### Client ID collision
 
@@ -272,12 +292,16 @@ distinct suffix for the HA integration.
 ## 7. Open items for the integration
 
 1. **Map shadow fields to functions.** Toggle each control in the app
-   while subscribed to `update/accepted` and `update/delta`; record which
-   keys change. Needed before any write support.
-2. **Write path is untested.** Nothing has been published to
-   `.../update`. This is a range hood — a wrong payload actuates a fan
-   and possibly heat/light. Validate field names against observed
-   `reported` values before writing, and test with the device attended.
+   while subscribed to `update/accepted`; record which keys change.
+   (Not `update/delta` — it never reflects device state here, see §5.)
+   Needed before exposing writes beyond the probe CLI.
+2. **Write path is implemented; individual fields still need
+   validating.** The mechanism is settled and tested — publish
+   `{"state":{"reported":{...}}}` to `.../update` (§5). What remains
+   unproven is the effect of most individual fields. This is a range
+   hood — a wrong payload actuates a fan and possibly heat/light.
+   Validate field names against observed `reported` values before
+   writing, and test with the device attended.
 3. **Credential refresh loop.** Tokens and AWS credentials both expire
    at 1 hour. HA needs a scheduled refresh (`renew_access_token()` →
    re-exchange → rebuild the MQTT connection), or an
