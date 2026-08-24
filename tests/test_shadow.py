@@ -1,0 +1,168 @@
+import asyncio
+import json
+from contextlib import nullcontext
+from datetime import UTC, datetime
+from unittest.mock import MagicMock
+
+import pytest
+
+from pyzephyrconnect import shadow as shadow_module
+from pyzephyrconnect.auth import Credentials
+from pyzephyrconnect.exceptions import ZephyrPolicyError
+from pyzephyrconnect.shadow import ShadowClient, ShadowTopics
+
+THING = "aaaaaaaabbbbbbbbccccccccddddddddeeeeeeee"
+CREDS = Credentials("AKIA", "SECRET", "TOKEN", datetime(2030, 1, 1, tzinfo=UTC))
+
+
+def test_topics_are_built_from_the_thing_name():
+    t = ShadowTopics(THING)
+    assert t.get == f"$aws/things/{THING}/shadow/get"
+    assert t.update == f"$aws/things/{THING}/shadow/update"
+    assert t.update_delta == f"$aws/things/{THING}/shadow/update/delta"
+
+
+def test_subscription_set_covers_reads_and_rejections():
+    subs = ShadowTopics(THING).subscriptions
+    assert f"$aws/things/{THING}/shadow/get/accepted" in subs
+    assert f"$aws/things/{THING}/shadow/update/delta" in subs
+    assert f"$aws/things/{THING}/shadow/update/rejected" in subs
+    # The write topic itself is published to, never subscribed.
+    assert f"$aws/things/{THING}/shadow/update" not in subs
+
+
+@pytest.fixture
+def fake_paho(monkeypatch):
+    client = MagicMock()
+    client.subscribe.return_value = (0, 1)
+    client.publish.return_value = MagicMock(rc=0)
+
+    def fire_connack(*args, **kwargs):
+        # Real paho invokes on_connect from its network thread once CONNACK
+        # arrives. Without this the mock never fires it, connect() blocks on
+        # its event and every connect test fails on a 15s timeout.
+        client.on_connect(client, None, {}, 0, None)
+
+    client.connect_async.side_effect = fire_connack
+    monkeypatch.setattr(
+        shadow_module.mqtt, "Client", MagicMock(return_value=client)
+    )
+    return client
+
+
+def _make(on_message=None):
+    return ShadowClient(
+        THING, f"{THING}-ha", on_message or MagicMock(), MagicMock()
+    )
+
+
+async def test_connect_uses_a_presigned_websocket_path(fake_paho):
+    sc = _make()
+    await sc.connect(CREDS)
+
+    path = fake_paho.ws_set_options.call_args.kwargs["path"]
+    assert path.startswith("/mqtt?X-Amz-Algorithm=AWS4-HMAC-SHA256")
+    assert "X-Amz-Signature=" in path
+    assert "X-Amz-Security-Token=" in path
+    fake_paho.tls_set.assert_called_once()
+
+
+async def test_connect_uses_the_suffixed_client_id(fake_paho):
+    await _make().connect(CREDS)
+    assert shadow_module.mqtt.Client.call_args.kwargs["client_id"] == f"{THING}-ha"
+
+
+async def test_connect_targets_port_443(fake_paho):
+    await _make().connect(CREDS)
+    args = fake_paho.connect_async.call_args.args
+    assert args[1] == 443
+
+
+@pytest.mark.parametrize(
+    ("is_failure", "expectation"),
+    [
+        (True, pytest.raises(ZephyrPolicyError, match="attach")),
+        (False, nullcontext()),
+    ],
+    ids=["denied", "granted"],
+)
+def test_subscribe_grant_is_validated(fake_paho, is_failure, expectation):
+    """paho reports success for a subscribe the broker refused. Granted QoS
+    128 means denied, and the usual cause is a missing IoT policy. Without
+    this check it presents as a working connection that receives nothing."""
+    sc = _make()
+    code = MagicMock()
+    code.is_failure = is_failure
+    with expectation:
+        sc._on_subscribe(fake_paho, None, 1, [code], None)
+
+
+async def test_request_state_publishes_an_empty_get(fake_paho):
+    sc = _make()
+    await sc.connect(CREDS)
+    await sc.request_state()
+
+    topic, payload = fake_paho.publish.call_args.args[:2]
+    assert topic == f"$aws/things/{THING}/shadow/get"
+    assert json.loads(payload) == {}
+
+
+async def test_publish_desired_wraps_fields_in_state_desired(fake_paho):
+    sc = _make()
+    await sc.connect(CREDS)
+    await sc.publish_desired({"light": 1})
+
+    topic, payload = fake_paho.publish.call_args.args[:2]
+    assert topic == f"$aws/things/{THING}/shadow/update"
+    assert json.loads(payload) == {"state": {"desired": {"light": 1}}}
+
+
+async def test_publish_desired_rejects_an_empty_payload(fake_paho):
+    sc = _make()
+    await sc.connect(CREDS)
+    with pytest.raises(ValueError):
+        await sc.publish_desired({})
+
+
+async def test_reconnect_uses_capped_exponential_backoff(fake_paho):
+    """paho retries indefinitely at a fixed short interval by default. An
+    expired credential would otherwise become a hot reconnect loop against
+    AWS IoT."""
+    await _make().connect(CREDS)
+    kwargs = fake_paho.reconnect_delay_set.call_args.kwargs
+    assert kwargs["min_delay"] >= 1
+    assert kwargs["max_delay"] <= 300
+
+
+async def test_incoming_message_is_dispatched_with_parsed_json(fake_paho):
+    """Callbacks arrive on paho's thread and are marshalled onto the loop
+    with call_soon_threadsafe, so the dispatch needs a loop tick to land."""
+    received = []
+    sc = _make(on_message=lambda topic, payload: received.append((topic, payload)))
+    await sc.connect(CREDS)
+
+    msg = MagicMock()
+    msg.topic = f"$aws/things/{THING}/shadow/get/accepted"
+    msg.payload = json.dumps({"state": {"reported": {"fan": 2}}}).encode()
+    sc._on_message(fake_paho, None, msg)
+    await asyncio.sleep(0)
+
+    assert received[0][0].endswith("get/accepted")
+    assert received[0][1]["state"]["reported"]["fan"] == 2
+
+
+async def test_malformed_payload_is_dropped_without_dispatching(fake_paho):
+    """A parse error inside a paho callback thread would kill the network
+    loop and silently stop all updates. The payload must be dropped, and the
+    consumer must not be handed anything."""
+    received = []
+    sc = _make(on_message=lambda topic, payload: received.append((topic, payload)))
+    await sc.connect(CREDS)
+
+    msg = MagicMock()
+    msg.topic = f"$aws/things/{THING}/shadow/get/accepted"
+    msg.payload = b"not json"
+    sc._on_message(fake_paho, None, msg)
+    await asyncio.sleep(0)
+
+    assert received == []
