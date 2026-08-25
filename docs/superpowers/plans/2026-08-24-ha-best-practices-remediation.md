@@ -18,7 +18,7 @@
 - Ruff 0.14.14 must pass: `ruff check`. Line length and import style follow the existing files.
 - The vendor REST API takes a **bare ID token** in `Authorization` — no `Bearer ` prefix. Never add one.
 - `getowndevices` is POSTed with a **zero-length body** (`data=b""`), not `{}`.
-- The MQTT client ID is `identity_id + "-ha"`. The `us-west-2:` region prefix is **never** stripped.
+- Every MQTT client ID starts with the full Cognito identity ID (`us-west-2:` region prefix **never** stripped) followed by `"-ha"`. Each hood's connection appends a per-device suffix on top — AWS IoT treats two live connections with the SAME client ID as one session and evicts one for the other, so N hoods sharing one ID flap forever. PROTOCOL.md §5 establishes the policy's client-ID constraint is absent-or-prefix-match, so identity-prefixed suffixes stay authorised.
 - Shadow writes go to `state.reported`, never `state.desired`. The device silently ignores `desired`.
 - `update/delta` messages stay ignored (debug-logged only).
 - `HoodState.raw` and `HoodCapabilities.raw` keep their current shape and contents. Do not change them.
@@ -216,7 +216,21 @@ Expected: FAIL with `ImportError: cannot import name 'ZephyrDataError'`
 
 - [ ] **Step 3: Add the exceptions**
 
-Append to `src/pyzephyrconnect/exceptions.py`:
+Widen the existing `ZephyrTransportError` docstring - it becomes the class
+for every *retryable* infrastructure failure, not just MQTT:
+
+```python
+class ZephyrTransportError(ZephyrError):
+    """A network, timeout or throttling failure. Retryable.
+
+    Deliberately distinct from ZephyrAuthError: the supervisor treats auth
+    errors as terminal (they need the user), while transport errors are
+    retried on the next tick. Wrapping a DNS blip in ZephyrAuthError turns
+    a Wi-Fi hiccup into a reauth prompt.
+    """
+```
+
+Then append to `src/pyzephyrconnect/exceptions.py`:
 
 ```python
 class ZephyrNotConnectedError(ZephyrError):
@@ -581,6 +595,12 @@ Import `ZephyrDataError` at the top of `models.py`.
 Run: `pytest tests/test_models.py -v`
 Expected: PASS
 
+**Reconcile the existing tests in `tests/test_models.py` first**: any test
+asserting the old zero-defaults for absent fields (e.g. an absent `power`
+reading as `0`, or absent capability numerics reading as `0`) now asserts the
+wrong behaviour. Update those assertions to `is None`; keep tests asserting
+present values unchanged.
+
 Run: `pytest -q`
 Expected: failures in `tests/test_client.py` only, from `HoodState` fields that are now `None`. Those are fixed in Task 10. Note which ones; do not fix them here.
 
@@ -661,9 +681,21 @@ def test_abstract_auth_cannot_be_instantiated():
 ```
 
 Also append to `tests/test_auth.py` (it has the `fake_aws` fixture the
-concrete AWS members need):
+concrete AWS members need). Add `AbstractAuth` and `ZephyrTokens` to its
+pyzephyrconnect.auth import line, and define the shared helper HERE, once -
+Task 6's tests reuse it with this exact default:
 
 ```python
+def _stored_tokens(expires_in=-1):
+    return ZephyrTokens(
+        username="user@example.com",
+        id_token="OLD-ID",
+        refresh_token="REFRESH",
+        identity_id=IDENTITY,
+        expires_at=time.time() + expires_in,
+    )
+
+
 class _StaticAuth(AbstractAuth):
     """The documented consumer path: implement one method, nothing else."""
 
@@ -691,8 +723,7 @@ async def test_a_minimal_subclass_satisfies_the_whole_client_contract(fake_aws):
     fake_aws["iot"].attach_policy.assert_called_once()
 ```
 
-(`_stored_tokens` is the four-line helper Task 6 adds to this file; if Task 5
-runs first, add it now with `expires_in` defaulting to 3600.)
+(`import time` is needed at the top of the file if not already present.)
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -710,8 +741,15 @@ from collections.abc import Mapping
 from typing import Any
 
 import aiohttp
+from botocore.exceptions import ClientError
 
 from .const import DEFAULT_ENDPOINTS, Endpoints
+from .exceptions import ZephyrTransportError
+
+# The module's dataclasses import must become:
+#   from dataclasses import dataclass, field, replace
+# - `field` for the repr=False declarations below, `replace` for the
+# identity write-back in Task 6.
 
 
 The existing `Credentials` dataclass gets the same treatment in this task —
@@ -876,9 +914,18 @@ class AbstractAuth(ABC):
                 assert self._credentials is not None
                 return self._credentials
             stored_identity = self._identity_override or tokens.identity_id
-            identity_id, credentials = await asyncio.to_thread(
-                self._exchange, tokens.id_token, stored_identity
-            )
+            try:
+                identity_id, credentials = await asyncio.to_thread(
+                    self._exchange, tokens.id_token, stored_identity
+                )
+            except ZephyrError:
+                raise
+            except Exception as err:  # noqa: BLE001
+                # This is the path a restart with persisted tokens takes, so
+                # a raw botocore exception here escapes the "consumers catch
+                # ZephyrError" contract exactly at boot. Classify: rejection
+                # is terminal, a network blip is retryable.
+                raise self._classify(err) from err
             if identity_id != stored_identity:
                 # The stored identity was stale and _exchange refetched it.
                 # This MUST take effect: mqtt_client_id derives from it, and
@@ -903,8 +950,31 @@ class AbstractAuth(ABC):
         """Hook: a stored identity_id was stale and has been replaced.
 
         Default no-op. CredentialsAuth overrides it to write the corrected
-        value back into its persisted tokens.
+        value back into its persisted tokens. ZephyrClient also re-attaches
+        the IoT policy for the new identity - see _ensure_policy.
         """
+
+    @staticmethod
+    def _classify(err: Exception) -> ZephyrError:
+        """Terminal credential rejection, or retryable infrastructure noise?
+
+        The supervisor keys terminal-vs-retry on the exception TYPE, so
+        wrapping everything in ZephyrAuthError turns a DNS blip or a Cognito
+        TooManyRequestsException at the hourly refresh into a permanent stop
+        and a reauth prompt. Only genuine rejections may become auth errors.
+        """
+        code = ""
+        if isinstance(err, ClientError):
+            code = err.response.get("Error", {}).get("Code", "")
+        if code in {
+            "NotAuthorizedException",
+            "UserNotFoundException",
+            "UserNotConfirmedException",
+            "PasswordResetRequiredException",
+            "AccessDeniedException",
+        }:
+            return ZephyrAuthError(f"credentials rejected: {code}")
+        return ZephyrTransportError(f"cloud request failed: {err}")
 
     # -- blocking bodies, run in a worker thread ----------------------
 
@@ -973,8 +1043,11 @@ class AbstractAuth(ABC):
                 policyName=const.POLICY_NAME, target=identity_id
             )
         except Exception as err:  # noqa: BLE001
+            # No identity ID in the message: it is a stable account
+            # identifier, and exception text reaches ERROR logs users paste
+            # into public issues.
             raise ZephyrPolicyError(
-                f"Could not attach {const.POLICY_NAME} to {identity_id}. "
+                f"Could not attach {const.POLICY_NAME} to this identity. "
                 "Without it the MQTT connection succeeds but every message is "
                 "silently dropped."
             ) from err
@@ -1003,6 +1076,7 @@ git commit -m "feat: add ZephyrTokens and the AbstractAuth surface"
 
 **Files:**
 - Modify: `src/pyzephyrconnect/auth.py`
+- Modify: `src/pyzephyrconnect/__init__.py` (export `CredentialsAuth` - the design presents it as the public built-in implementation)
 - Test: `tests/test_auth.py`
 
 **Interfaces:**
@@ -1040,14 +1114,8 @@ def _not_authorized():
     )
 
 
-def _stored_tokens(expires_in=-1):
-    return ZephyrTokens(
-        username="user@example.com",
-        id_token="OLD-ID",
-        refresh_token="REFRESH",
-        identity_id=IDENTITY,
-        expires_at=time.time() + expires_in,
-    )
+# _stored_tokens(expires_in=-1) is already defined in this file by Task 5 -
+# reuse it, do not redefine it.
 
 
 async def test_srp_runs_when_no_tokens_are_supplied(fake_aws):
@@ -1286,9 +1354,10 @@ class CredentialsAuth(AbstractAuth):
             try:
                 user = await asyncio.to_thread(self._srp_login)
             except Exception as err:  # noqa: BLE001
-                raise ZephyrAuthError(
-                    f"Cognito authentication failed: {err}"
-                ) from err
+                # Classify - a DNS failure or pool throttling here must NOT
+                # become ZephyrAuthError, which the supervisor treats as
+                # terminal and the consumer maps to a reauth prompt.
+                raise self._classify(err) from err
 
         self._user = user
         try:
@@ -1297,8 +1366,10 @@ class CredentialsAuth(AbstractAuth):
                 user.id_token,
                 stored.identity_id if stored is not None else None,
             )
+        except ZephyrError:
+            raise
         except Exception as err:  # noqa: BLE001
-            raise ZephyrAuthError(f"Identity exchange failed: {err}") from err
+            raise self._classify(err) from err
 
         self._credentials = credentials
         self._tokens = ZephyrTokens(
@@ -1321,7 +1392,16 @@ Add `from collections.abc import Callable````
 
 Add `from collections.abc import Callable`, `from dataclasses import replace` and `import asyncio` to the imports. Delete the old `ZephyrAuth` class entirely.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [ ] **Step 4: Reconcile the existing ZephyrAuth tests, then run**
+
+`tests/test_auth.py` currently imports `ZephyrAuth` at the top and holds ~10
+tests exercising it; this task deletes that class, which makes the import a
+collection-time `ImportError` taking down the NEW tests too. Remove
+`ZephyrAuth` from the import line and port or delete each old test:
+behaviours worth keeping (explicit `user_pool_region`, `SecretKey`-not-
+`SecretAccessKey`, policy attach raising `ZephyrPolicyError`, the accessor
+raising before authentication) map directly onto `CredentialsAuth`/
+`AbstractAuth` equivalents; the rest duplicate the new coverage and go.
 
 Run: `pytest tests/test_auth.py tests/test_tokens.py -v`
 Expected: PASS
@@ -1384,18 +1464,6 @@ async def test_every_request_asks_auth_for_a_current_token():
     assert auth.async_get_tokens.await_count == 2
 
 
-async def test_an_endpoint_override_reaches_mqtt_too():
-    """Overriding endpoints must not silently apply to REST only - the MQTT
-    host is a separate wiring path and failing to thread it there leaves the
-    override half-applied with nothing complaining."""
-    endpoints = Endpoints(iot_endpoint="staging-ats.iot.us-west-2.amazonaws.com")
-    client = ZephyrClient(_auth_double(endpoints=endpoints))
-    hoods = await client.async_setup()
-    shadow = client._make_shadow(hoods[0])
-
-    assert shadow._endpoints.iot_endpoint.startswith("staging-ats")
-
-
 async def test_endpoint_override_reaches_the_url_requested():
     session = FakeSession(FakeResponse({"devices": []}))
     auth = _fake_auth(
@@ -1409,6 +1477,7 @@ async def test_endpoint_override_reaches_the_url_requested():
 Add this helper near the top of `tests/test_api.py`:
 
 ```python
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 from pyzephyrconnect.auth import ZephyrTokens
@@ -1498,6 +1567,8 @@ class ZephyrApi:
                 # The API sends text/plain for some responses.
                 return await response.json(content_type=None)
         except aiohttp.ClientConnectorCertificateError as err:
+            # Must stay ABOVE the ClientError clause - it is a subclass, and
+            # the certificate diagnosis is the valuable one.
             raise ZephyrCertificateError(
                 f"TLS verification failed for {url}. The presented chain is "
                 f"trusted by neither the system CA store nor the bundled "
@@ -1505,6 +1576,13 @@ class ZephyrApi:
                 "vendor's SKI-less intermediate. The vendor likely changed "
                 "its certificate chain again - recapture it and update the "
                 "TWCA bundle if needed. Do not disable verification."
+            ) from err
+        except (aiohttp.ClientError, TimeoutError) as err:
+            # DNS failure, connection reset, timeout: retryable transport
+            # noise. Left unwrapped it escapes the "consumers catch
+            # ZephyrError" contract from async_setup() and async_poll().
+            raise ZephyrTransportError(
+                f"request to {url} failed: {err}"
             ) from err
 
     async def get_own_devices(self) -> list[dict[str, Any]]:
@@ -1527,9 +1605,15 @@ class ZephyrApi:
         )
 ```
 
-Import `AbstractAuth` from `.auth`, and add `import asyncio` to the module imports.
+Import `AbstractAuth` from `.auth`, `ZephyrTransportError` from `.exceptions`, and add `import asyncio` to the module imports.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [ ] **Step 4: Reconcile the existing ZephyrApi tests, then run**
+
+The existing tests in `tests/test_api.py` construct `ZephyrApi(session)` and
+pass `id_token` arguments that no longer exist. Port them onto the
+`_fake_auth` helper and the no-argument method signatures - their assertions
+(bare token, empty body, 403 mapping, certificate error text) are all still
+the right assertions; only the plumbing changes.
 
 Run: `pytest tests/test_api.py -v`
 Expected: PASS
@@ -1556,6 +1640,49 @@ git commit -m "refactor: drive ZephyrApi from AbstractAuth instead of a token ar
 This is the change that keeps push alive past one hour. The presigned URL embeds a SigV4 signature over credentials that expire; AWS IoT drops the session at expiry, and paho's automatic reconnect would otherwise retry the same dead URL forever.
 
 - [ ] **Step 1: Write the failing tests**
+
+`tests/test_shadow.py` builds clients via a `_make()` helper and a
+`fake_paho` fixture that replaces `mqtt.Client`. Define these two helpers on
+top of them (adjust `_make`'s actual signature as found in the file), and
+make sure every new test requests `fake_paho` so no real paho client or
+network thread is ever constructed:
+
+```python
+CREDS = Credentials("k", "s", "t", datetime.now(UTC) + timedelta(hours=1))
+
+
+async def _default_provider():
+    return CREDS
+
+
+def _shadow(credentials_provider=_default_provider, **kwargs):
+    """A ShadowClient on the new 5-argument constructor."""
+    return ShadowClient(
+        THING,
+        "us-west-2:abc-ha",
+        lambda topic, payload: None,
+        lambda connected: None,
+        credentials_provider,
+        **kwargs,
+    )
+
+
+async def _connect(shadow):
+    """Drive connect() to completion against the fake paho client."""
+    task = asyncio.create_task(shadow.connect(timeout=1))
+    await asyncio.sleep(0)
+    shadow._client.simulate_connect()      # fake_paho: fires on_connect + SUBACKs
+    await task
+```
+
+(`simulate_connect` names whatever mechanism the existing `fake_paho`
+fixture uses to fire the connect/subscribe callbacks - reuse it, do not
+invent a parallel fake.)
+
+**Then reconcile the existing tests**: every current test constructs the
+4-argument `ShadowClient` and passes `Credentials` into `connect()`. Move
+them onto `_shadow()`/`_connect()` - the assertions stand, only construction
+changes. Add `timedelta` to the file's datetime import.
 
 Append to `tests/test_shadow.py`:
 
@@ -1587,6 +1714,11 @@ async def test_tls_context_is_not_built_on_the_event_loop():
     client = shadow._client
     client.tls_set.assert_not_called()
     client.tls_set_context.assert_called_once()
+    ctx = client.tls_set_context.call_args.args[0]
+    # Design Risks 10-11: a default context - CERT_REQUIRED, hostname
+    # checking on, and NOT the TWCA-augmented REST context.
+    assert ctx.verify_mode is ssl.VERIFY_DEFAULT or ctx.verify_mode.name == "CERT_REQUIRED"
+    assert ctx.check_hostname is True
 
 
 async def test_publish_empty_state_raises_a_library_error():
@@ -1676,6 +1808,44 @@ Also replace the `client.tls_set()` call further down the method:
 `ssl.create_default_context()` gives `CERT_REQUIRED` plus hostname checking,
 matching what `tls_set()` produced.
 
+Make everything after `loop_start()` cancellation-safe. The current code
+cleans up only on `TimeoutError`; a `CancelledError` while awaiting the
+connected/subscribed events abandons a paho client whose network thread is
+already running and that no reference can ever reach again - and Hood only
+assigns `self._shadow` after `connect()` returns. Restructure the tail of
+`connect()`:
+
+```python
+        client.connect_async(self._endpoints.iot_endpoint, 443, keepalive=30)
+        client.loop_start()
+        self._client = client
+
+        try:
+            try:
+                await asyncio.wait_for(self._connected.wait(), timeout)
+            except TimeoutError as err:
+                raise ZephyrTransportError(
+                    f"MQTT connection to {self._endpoints.iot_endpoint} timed out"
+                ) from err
+            try:
+                await asyncio.wait_for(self._subscribed.wait(), timeout)
+            except TimeoutError as err:
+                raise ZephyrTransportError(
+                    "MQTT connected but shadow subscriptions did not "
+                    "complete in time"
+                ) from err
+            if self._subscribe_error is not None:
+                error, self._subscribe_error = self._subscribe_error, None
+                raise error
+        except BaseException:
+            # Covers the ZephyrTransportError raises above, ZephyrPolicyError,
+            # AND CancelledError: whatever interrupts the handshake, the paho
+            # client and its network thread must be torn down before the
+            # exception leaves - nothing outside holds a reference yet.
+            await self.disconnect()
+            raise
+```
+
 Fix the disconnect ordering, which now runs on a ~50-minute reconnect cycle
 rather than once at shutdown:
 
@@ -1683,14 +1853,23 @@ rather than once at shutdown:
     async def disconnect(self) -> None:
         if self._client is None:
             return
+        client, self._client = self._client, None
+        # Off the loop: loop_stop() JOINS paho's network thread (see
+        # paho/mqtt/client.py), and that thread is frequently inside a
+        # synchronous socket recv. A thread join on the event loop was
+        # tolerable once at shutdown; this now runs on every ~50-minute
+        # supervisor rebuild, per hood.
+        await asyncio.to_thread(self._teardown, client)
+        self._connected.clear()
+        self._subscribed.clear()
+
+    @staticmethod
+    def _teardown(client: mqtt.Client) -> None:
         # disconnect() BEFORE loop_stop(). The network thread is what writes
         # the DISCONNECT packet; stopping it first means the packet is queued
         # and never sent, and the broker only notices via keepalive timeout.
-        self._client.disconnect()
-        self._client.loop_stop()
-        self._client = None
-        self._connected.clear()
-        self._subscribed.clear()
+        client.disconnect()
+        client.loop_stop()
 ```
 
 In `publish_state`, change the guard:
@@ -1762,7 +1941,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from pyzephyrconnect.exceptions import ZephyrNotConnectedError, ZephyrWriteError
+from pyzephyrconnect.exceptions import (
+    ZephyrNotConnectedError,
+    ZephyrTransportError,
+    ZephyrWriteError,
+)
 from pyzephyrconnect.hood import Hood
 from pyzephyrconnect.models import HoodCapabilities, HoodState
 
@@ -1786,6 +1969,7 @@ def _hood(caps=None):
         caps or _caps(),
         shadow_factory=lambda _hood: shadow,
         poll=AsyncMock(return_value=HoodState.from_reported({"power": 1})),
+        prepare=AsyncMock(),
     )
     return hood, shadow
 
@@ -1888,6 +2072,33 @@ async def test_starting_twice_does_not_orphan_a_client():
     assert len(made) == 1
 
 
+async def test_ensure_running_recovers_a_hood_whose_rebuild_failed():
+    """A transient connect failure during a supervisor rebuild leaves the
+    hood with no socket but with consumer intent intact. It must come back
+    on a later tick, not stay dead until a reload."""
+    made = []
+
+    def factory(_h):
+        shadow = MagicMock()
+        shadow.connect = AsyncMock(
+            side_effect=ZephyrTransportError("boom") if len(made) == 1 else None
+        )
+        shadow.request_state = AsyncMock()
+        shadow.disconnect = AsyncMock()
+        made.append(shadow)
+        return shadow
+
+    hood = Hood(_caps(), factory, AsyncMock(), AsyncMock())
+    await hood.async_start()                      # made[0] connects
+
+    with pytest.raises(ZephyrTransportError):
+        await hood.async_reconnect()              # made[1] fails; _shadow None
+
+    await hood.async_ensure_running()             # made[2] recovers
+    assert len(made) == 3
+    made[2].request_state.assert_awaited()
+
+
 async def test_reconnect_does_not_start_a_hood_that_was_never_started():
     """The supervisor reconnects every hood it knows about. Discovering two
     hoods and starting one must not mean the other quietly comes up on the
@@ -1957,9 +2168,9 @@ allowlist structural: only these methods exist.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable
-from typing import Any
 
 from . import const
 from .exceptions import ZephyrNotConnectedError, ZephyrWriteError
@@ -1990,6 +2201,11 @@ class Hood:
         self._state: HoodState | None = None
         self._listeners: list[StateListener] = []
         self._connected = False
+        # Consumer intent: True between async_start() and async_stop().
+        # Distinct from having a socket - a failed supervisor rebuild leaves
+        # _shadow None while the hood SHOULD still be running, and keying
+        # recovery on _shadow alone demotes it to "never started" forever.
+        self._should_run = False
         # Serialises start/stop/reconnect against writes.
         self._lock = asyncio.Lock()
 
@@ -2024,10 +2240,12 @@ class Hood:
     async def async_start(self) -> None:
         """Open this hood's shadow connection and request current state."""
         async with self._lock:
+            self._should_run = True
             await self._start()
 
     async def async_stop(self) -> None:
         async with self._lock:
+            self._should_run = False
             await self._stop()
 
     async def async_reconnect(self) -> None:
@@ -2040,13 +2258,25 @@ class Hood:
         waits rather than failing with a spurious ZephyrNotConnectedError.
         """
         async with self._lock:
-            if self._shadow is None:
+            if not self._should_run:
                 # Never started, or deliberately stopped. The supervisor
                 # calls this for every hood on the account; it must not
                 # bring up MQTT for hoods the consumer chose not to start.
                 return
             await self._stop()
             await self._start()
+
+    async def async_ensure_running(self) -> None:
+        """Reopen the socket if the consumer wants this hood up and it is not.
+
+        The recovery path for a transient failure during a supervisor
+        rebuild: _start raised, _shadow stayed None, and without this the
+        hood would be indistinguishable from one never started - push dead
+        forever with no error surfaced. Called by the supervisor every tick.
+        """
+        async with self._lock:
+            if self._should_run and self._shadow is None:
+                await self._start()
 
     # Lock-free bodies. Callers above hold self._lock; asyncio.Lock is not
     # reentrant, so async_reconnect cannot call the public methods.
@@ -2139,8 +2369,10 @@ class Hood:
 
     async def _publish(self, fields: dict[str, int]) -> None:
         if self._shadow is None:
+            # No thing name in the message: it identifies a home, and
+            # exception text ends up in logs users paste publicly.
             raise ZephyrNotConnectedError(
-                f"async_start() has not been called for {self.thing_name}"
+                "async_start() has not been called for this hood"
             )
         if not fields:
             raise ZephyrWriteError("refusing to publish an empty reported state")
@@ -2171,14 +2403,19 @@ class Hood:
     async def async_set_clean_air(self, on: bool) -> None:
         await self.async_set_fields({"setcleanairfunction": int(bool(on))})
 
-    async def async_set_delay_timer(self, seconds: int) -> None:
-        """Arm the delay-off timer. Non-zero values start the fan.
+    async def async_set_delay_timer(self, value: int) -> None:
+        """Arm the delay-off timer.
+
+        UNITS UNESTABLISHED: VALIDATION.md question 2 - whether this is
+        seconds or minutes, and whether it snaps to presets, is exactly what
+        the hardware runbook exists to answer. Do not document units as fact
+        anywhere until step 6 of the runbook has run.
 
         The device derives and decrements `delaytimer` from this itself, so
         only `setdelaytimer` is written.
         """
-        self._check_range("delay timer", seconds, None)
-        await self.async_set_fields({"setdelaytimer": seconds})
+        self._check_range("delay timer", value, None)
+        await self.async_set_fields({"setdelaytimer": value})
 
     async def async_set_recirculating(self, on: bool) -> None:
         """DESTRUCTIVE: changes filter accounting for this hood."""
@@ -2214,7 +2451,7 @@ git commit -m "feat: add the Hood object and make the write allowlist structural
 **Interfaces:**
 - Consumes: everything from Tasks 3, 5, 6, 7, 8, 9.
 - Produces:
-  - `ZephyrClient(auth: AbstractAuth, *, endpoints=DEFAULT_ENDPOINTS)`
+  - `ZephyrClient(auth: AbstractAuth)` — endpoints are read from `auth.endpoints`, never a second argument
   - `ZephyrClient.from_credentials(username, password, session, *, tokens=None, token_updater=None, endpoints=DEFAULT_ENDPOINTS) -> ZephyrClient`
   - `async_setup() -> list[Hood]`
   - `async_stop() -> None`
@@ -2291,9 +2528,7 @@ async def test_supervisor_rebuilds_the_socket_before_credentials_expire(wired):
     hoods = await client.async_setup()
     await hoods[0].async_start()
 
-    wired["auth"].async_get_credentials = AsyncMock(
-        return_value=Credentials("k", "s", "t", datetime.now(UTC) + timedelta(seconds=1))
-    )
+    wired["auth"].credentials_expired = True
     await client._refresh_once()
 
     assert wired["shadow"].disconnect.await_count >= 1
@@ -2346,6 +2581,11 @@ async def test_supervisor_stops_on_a_policy_error(wired):
     client = _client()
     hoods = await client.async_setup()
     await hoods[0].async_start()
+    # Non-vacuous setup: mark the hood connected BEFORE the terminal error,
+    # so the final assertion proves the terminal branch's hood-stop actually
+    # flipped the derived property rather than it never having been True.
+    hoods[0].handle_connection_change(True)
+    assert client.connected is True
 
     async def denied():
         raise ZephyrPolicyError("denied")
@@ -2403,11 +2643,53 @@ This requires `_supervise()` to read `self._supervisor_interval` (defaulting
 to `const.SUPERVISOR_INTERVAL_SECONDS`) rather than the constant directly, so
 tests do not have to wait a real minute.
 
-Update the fixture: `wired["auth"]` is now a `CredentialsAuth` double with `async_get_tokens`, `async_get_credentials`, `async_attach_policy` as `AsyncMock`s and a `mqtt_client_id` attribute. `_client()` becomes:
+Replace the fixture with a fully specified double — every attribute below is
+consumed by some test in this file, and a bare `MagicMock` attribute is
+truthy, which silently satisfies (or breaks) the `credentials_expired` guard:
+
+```python
+def _auth_double(endpoints=DEFAULT_ENDPOINTS, order=None):
+    auth = MagicMock()
+    auth.endpoints = endpoints
+    auth.identity_id = "us-west-2:abc"
+    auth.mqtt_client_id = "us-west-2:abc-ha"
+    auth.credentials_expired = False          # explicit bool, never a Mock
+    auth.async_get_tokens = AsyncMock()
+    auth.async_get_credentials = AsyncMock(
+        return_value=Credentials(
+            "k", "s", "t", datetime.now(UTC) + timedelta(hours=1)
+        )
+    )
+    auth.async_attach_policy = AsyncMock(
+        side_effect=lambda: (order or []).append("attach_policy")
+    )
+    return auth
+```
+
+The `wired` fixture builds one `_auth_double(order=order)`, monkeypatches
+`client_module.ZephyrApi` and `client_module.ShadowClient` exactly as the
+current fixture does, and `_client()` becomes:
 
 ```python
 def _client():
     return ZephyrClient(_auth_double())
+```
+
+Add the endpoint-threading test here (it needs `_auth_double`, which is why
+it cannot live in Task 7):
+
+```python
+async def test_an_endpoint_override_reaches_mqtt_too(wired):
+    """Overriding endpoints must not silently apply to REST only - the MQTT
+    host is a separate wiring path, and failing to thread it through leaves
+    the override half-applied with nothing complaining."""
+    endpoints = Endpoints(iot_endpoint="staging-ats.iot.us-west-2.amazonaws.com")
+    client = ZephyrClient(_auth_double(endpoints=endpoints))
+    hoods = await client.async_setup()
+    client._make_shadow(hoods[0])
+
+    passed = client_module.ShadowClient.call_args.kwargs["endpoints"]
+    assert passed.iot_endpoint.startswith("staging-ats")
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -2432,12 +2714,18 @@ class ZephyrClient:
         self._endpoints = auth.endpoints
         self._api = ZephyrApi(auth)
         self._hoods: dict[str, Hood] = {}
-        self._connected = False
         self._supervisor: asyncio.Task | None = None
         self._supervisor_error: ZephyrError | None = None
-        # The IoT policy binding persists on the identity, so attach once per
-        # client rather than on every reconnect (PROTOCOL.md section 3.3).
-        self._policy_attached = False
+        # Attribute, not the bare constant: tests drive the supervisor with
+        # a zero interval instead of waiting a real minute.
+        self._supervisor_interval: float = const.SUPERVISOR_INTERVAL_SECONDS
+        # The IoT policy binding persists per identity. Keyed on WHICH
+        # identity it was attached for, not a bare bool: a mid-session
+        # identity refetch (AbstractAuth._identity_override) must trigger a
+        # re-attach for the new identity, or every message on the next
+        # reconnect is silently dropped - the exact failure the attach
+        # exists to prevent.
+        self._policy_attached_for: str | None = None
 
     @classmethod
     def from_credentials(
@@ -2485,6 +2773,11 @@ class ZephyrClient:
         # the unique ID" depends on it. Also exactly what the pre-refactor
         # authenticate() verified at setup.
         await self._auth.async_get_credentials()
+        if self._hoods:
+            # Re-running setup would replace started Hood objects while
+            # their sockets and the supervisor still reference the old ones.
+            # One client = one setup; build a new client to re-discover.
+            raise ZephyrError("async_setup() has already run on this client")
         devices = await self._api.get_own_devices()
         for device in devices:
             if not (thing_name := device.get("thingName")):
@@ -2528,10 +2821,11 @@ class ZephyrClient:
         Passed to each Hood as its `prepare` callable, so it always runs
         before the first connect and never on a reconnect.
         """
-        if self._policy_attached:
+        identity = self._auth.identity_id
+        if self._policy_attached_for == identity:
             return
         await self._auth.async_attach_policy()
-        self._policy_attached = True
+        self._policy_attached_for = identity
 ```
 
 `_make_shadow(hood)` builds the `ShadowClient`. Every argument matters, and the
@@ -2541,7 +2835,12 @@ last one is easy to omit:
     def _make_shadow(self, hood: Hood) -> ShadowClient:
         shadow = ShadowClient(
             hood.thing_name,
-            self._auth.mqtt_client_id,
+            # Per-CONNECTION client ID. AWS IoT treats two live connections
+            # with the same ID as one session and evicts one for the other,
+            # so N hoods sharing the bare mqtt_client_id would flap forever.
+            # Identity-prefixed, so the policy's prefix-match still covers
+            # it (PROTOCOL.md section 5).
+            f"{self._auth.mqtt_client_id}-{hood.thing_name[:8]}",
             lambda topic, payload: self._handle_message(hood, topic, payload),
             hood.handle_connection_change,
             self._auth.async_get_credentials,
@@ -2555,10 +2854,31 @@ last one is easy to omit:
 ```
 
 The message callback closes over `hood`, so a shadow message is folded into
-the right appliance's state. `_ensure_supervisor()` starts the supervisor if
-one is not already running and clears `_supervisor_error` as it does so —
-otherwise a stored error outlives the condition that caused it and every
-later poll raises.
+the right appliance's state. `_ensure_supervisor()` must be synchronous and must treat a COMPLETED task
+as not-running — the terminal branch exits via `return`, leaving
+`self._supervisor` holding a done task, and a naive `is not None` check
+would then never restart supervision after a reauth on the same client:
+
+```python
+    def _ensure_supervisor(self) -> None:
+        if self._supervisor is None or self._supervisor.done():
+            # A fresh supervisor supersedes any stored terminal error -
+            # otherwise the error outlives the condition that caused it and
+            # every later poll raises.
+            self._supervisor_error = None
+            self._supervisor = asyncio.create_task(self._supervise())
+```
+
+`Hood` needs the small internal used by the terminal branch — a stop that
+closes the socket but PRESERVES consumer intent, so `_should_run` survives
+for the recovery path:
+
+```python
+    async def _stop_for_supervisor(self) -> None:
+        """Close the socket without clearing consumer intent."""
+        async with self._lock:
+            await self._stop()
+```
 
 It does **not** attach the IoT policy: that is `_ensure_policy`, passed to each
 `Hood` as its `prepare` callable so it runs before the first connect and is
@@ -2598,7 +2918,7 @@ The supervisor:
             # because the consequence is not a logged error, it is push dying
             # silently an hour later.
             try:
-                await asyncio.sleep(const.SUPERVISOR_INTERVAL_SECONDS)
+                await asyncio.sleep(self._supervisor_interval)
                 await self._refresh_once()
             except asyncio.CancelledError:
                 raise
@@ -2609,29 +2929,59 @@ The supervisor:
                 # Stop, and leave the error where async_poll() will surface
                 # it - see _supervisor_error below.
                 self._supervisor_error = err
-                self._connected = False
-                _LOGGER.error("refresh supervisor stopping: %s", err)
+                # Stop the hoods: the derived `connected` property flips to
+                # False the moment their sockets close (a bare flag write
+                # here would be dead code - the property never reads one),
+                # and paho stops hammering presigned URLs that can no longer
+                # be renewed. Consumer intent (_should_run) survives, so a
+                # reauth that builds a new client is unaffected.
+                for hood in self._hoods.values():
+                    try:
+                        await hood._stop_for_supervisor()
+                    except Exception:  # noqa: BLE001
+                        _LOGGER.exception("stopping hood after terminal error")
+                # Log the TYPE, not the message - ZephyrPolicyError text may
+                # name the policy, and identifiers do not belong at ERROR.
+                _LOGGER.error(
+                    "refresh supervisor stopping: %s", type(err).__name__
+                )
                 return
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("refresh cycle failed; retrying next tick")
 
     async def _refresh_once(self) -> bool:
-        """Renew credentials and rebuild sockets if inside the margin.
+        """Renew credentials if inside the margin; keep wanted hoods up.
 
         Asks `credentials_expired` rather than calling
         async_get_credentials() first: that method renews as a side effect,
         so testing its result would always report "not expired" and the
         socket would never be rebuilt.
+
+        Per-hood try/except, terminal errors excepted: one hood's transient
+        connect failure must neither abort the loop (stranding later hoods
+        on expiring signatures) nor be swallowed as handled - the hood keeps
+        its consumer intent and async_ensure_running retries it every tick,
+        which is also how a hood whose rebuild failed LAST cycle recovers.
         """
-        if not self._auth.credentials_expired:
-            return False
-        _LOGGER.debug("credentials near expiry; refreshing and reconnecting")
-        # Renews the Cognito tokens and re-exchanges for AWS credentials.
-        await self._auth.async_get_credentials()
+        rebuilt = False
+        if self._auth.credentials_expired:
+            _LOGGER.debug("credentials near expiry; refreshing")
+            # Renews the Cognito tokens and re-exchanges for AWS credentials.
+            await self._auth.async_get_credentials()
+            rebuilt = True
         for hood in self._hoods.values():
-            # No-ops for never-started hoods - the guard is in Hood.
-            await hood.async_reconnect()
-        return True
+            try:
+                if rebuilt:
+                    # No-ops for never-started hoods - guard is in Hood.
+                    await hood.async_reconnect()
+                else:
+                    # Recovery: reopens a wanted hood whose socket is gone.
+                    await hood.async_ensure_running()
+            except (ZephyrPolicyError, ZephyrAuthError):
+                raise
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception("hood rebuild failed; retrying next tick")
+        return rebuilt
 ```
 
 Add `SUPERVISOR_INTERVAL_SECONDS = 60` to `const.py`, and `import contextlib`
@@ -2738,10 +3088,19 @@ In `src/pyzephyrconnect/probe.py`'s `main()`, replace the client block:
 
 `validate_write()` stays exactly as it is. The CLI's `--confirm`/`--force` gate is a *user-interaction* control and is separate from the library's allowlist; both should hold.
 
-- [ ] **Step 2: Run the probe's tests**
+- [ ] **Step 2: Reconcile and run the probe's tests**
+
+`tests/test_probe.py` monkeypatches `client_module.ZephyrAuth` and stubs the
+pre-refactor auth surface — both gone after Tasks 6 and 10, so the patch
+itself raises `AttributeError` at test time. Rework those tests: monkeypatch
+`client_module.CredentialsAuth` (or patch `ZephyrClient.from_credentials`
+directly), stub the AbstractAuth surface (`async_get_tokens`,
+`async_get_credentials`, `async_attach_policy`, `identity_id`,
+`mqtt_client_id`, `credentials_expired = False`), and update any assertion on
+`client.async_set_state` to `hood.async_set_fields`.
 
 Run: `pytest tests/test_probe.py -v`
-Expected: PASS. If a test asserts on `client.async_set_state`, update it to `hood.async_set_fields`.
+Expected: PASS
 
 - [ ] **Step 3: Update the README**
 
@@ -2757,8 +3116,12 @@ async with aiohttp.ClientSession() as session:
         print(hood.capabilities.model, hood.capabilities.max_fan_speed)
         await hood.async_start()
         print(hood.state)
-        await hood.async_set_light(1)
 ```
+
+Do NOT include a write call in this example: it sits under "Read state", it
+would actuate a physical appliance when copy-pasted, and VALIDATION.md gates
+the write path on hardware validation that has not run. Writes are documented
+by the probe CLI section, which carries the confirmation flags.
 
 Add a section after it:
 
@@ -2832,6 +3195,16 @@ The release workflow verifies the tag against `pyproject.toml` and `__init__.py`
 | §5 boto3, py.typed, PEP 639, issue templates | 1 |
 | §5 exception hierarchy | 2 |
 | Release | 11 |
+
+**Amendments from the verified-review fleet (final pass):** transient
+failures are classified (`AbstractAuth._classify`) so only genuine credential
+rejections and policy denials are terminal; each hood carries consumer intent
+(`_should_run`) and the supervisor's `async_ensure_running` recovers failed
+rebuilds; every MQTT connection gets a distinct identity-prefixed client ID
+(`mqtt_client_id + "-" + thing_name[:8]`) because AWS IoT evicts same-ID
+sessions; the policy latch is keyed per identity; paho teardown and the
+cancellation path in `connect()` are event-loop-safe; Tasks 4, 6, 7, 8 and 11
+carry explicit existing-test reconciliation steps.
 
 **Amendment against the spec:** the spec says `async_set_state` is removed outright. Task 9 keeps one raw entry point, `Hood.async_set_fields`, because the probe CLI writes arbitrary allowlisted fields to map unknown semantics and a fixed method surface cannot express that. It is allowlist-enforcing and is the chokepoint every typed method delegates through, so the spec's intent — no caller can write a non-writable field — holds.
 

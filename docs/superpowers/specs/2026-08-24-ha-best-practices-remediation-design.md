@@ -197,9 +197,20 @@ library therefore owns the transport lifecycle rather than delegating it:
   strand a hood halfway through a reconnect.
 - Its retry boundary is inside the loop, not around it. A transient failure
   must not end supervision, because the consequence is not a logged error but
-  push dying silently an hour later. Auth and policy errors are terminal, are
-  stored, and are re-raised from the next `async_poll()` so they can reach a
-  reauth flow.
+  push dying silently an hour later. Only genuine credential rejections and
+  policy denials are terminal: `AbstractAuth._classify` maps botocore
+  rejection codes (NotAuthorized, UserNotFound, ...) to `ZephyrAuthError` and
+  everything else — DNS failures, timeouts, Cognito throttling — to the
+  retryable `ZephyrTransportError`, so a Wi-Fi blip at the hourly refresh
+  cannot become a reauth prompt. Terminal errors are stored, the hoods are
+  stopped (flipping the derived `connected`), and the error re-raises from
+  the next `async_poll()` so it can reach a reauth flow.
+- Rebuild failures are isolated per hood and self-healing: each `Hood`
+  carries consumer intent (`_should_run`, set by `async_start`, cleared only
+  by `async_stop`), one hood's transient connect failure neither aborts the
+  others' rebuilds nor demotes it to "never started", and the supervisor's
+  per-tick `async_ensure_running()` reopens any wanted hood whose socket is
+  gone.
 - The supervisor distinguishes recoverable from terminal failures. A
   `ZephyrPolicyError` — a denied subscribe, meaning the IoT policy is not
   attached — is terminal: it is surfaced to the consumer and the supervisor
@@ -282,7 +293,8 @@ class Hood:
     async def async_set_light(self, level: int) -> None: ...
     async def async_set_fan(self, speed: int) -> None: ...
     async def async_set_clean_air(self, on: bool) -> None: ...
-    async def async_set_delay_timer(self, seconds: int) -> None: ...
+    async def async_set_delay_timer(self, value: int) -> None:
+        # units UNESTABLISHED - VALIDATION.md question 2
 
     # Destructive. Documented as such; logged at WARNING.
     async def async_set_recirculating(self, on: bool) -> None: ...
@@ -327,6 +339,17 @@ without it every message is silently dropped.
 
 `connected` is per-hood, derived rather than latched on the client. A single
 flag reported whichever shadow changed state last.
+
+Each hood's MQTT connection gets its own client ID:
+`mqtt_client_id + "-" + thing_name[:8]`. AWS IoT treats two live connections
+with the same client ID as one session and evicts one for the other, so N
+hoods sharing the bare `identity_id + "-ha"` would flap forever. The IoT
+policy's client-ID constraint is absent-or-prefix-match (`PROTOCOL.md` §5),
+so identity-prefixed suffixes stay authorised.
+
+The IoT-policy latch is keyed on the identity it was attached FOR, not a
+bare boolean: a mid-session identity refetch must trigger a re-attach for
+the new identity, or the next reconnect silently drops every message.
 
 `ZephyrClient.async_setup()` calls `async_get_credentials()`, not just
 `async_get_tokens()`: the identity exchange is what makes `identity_id`
@@ -455,10 +478,12 @@ respect.
    subscribes on that socket time out rather than failing individually. Any
    automatic reconnect must treat `ZephyrPolicyError` as terminal — this is
    why the supervisor stops on it.
-6. **The MQTT client ID must remain `identity_id + "-ha"`.** The policy pins
-   the client ID to the identity, and the suffix is what lets the library
-   coexist with the phone app instead of evicting it. The region prefix must
-   never be stripped.
+6. **Every MQTT client ID must start with the full `identity_id + "-ha"`.**
+   The policy pins client IDs to the identity by prefix, and the suffix is
+   what lets the library coexist with the phone app instead of evicting it.
+   The region prefix must never be stripped, and each hood's connection must
+   append a further per-device suffix — same-ID concurrent connections evict
+   each other.
 7. **The write path stays `state.reported`.** This is backwards from the AWS
    shadow convention but is what the hardware acts on; `state.desired` writes
    are accepted by AWS and silently ignored by the device. `Hood.async_set_*`
@@ -485,6 +510,17 @@ respect.
     is now concrete on the base class. The regression test is a minimal
     subclass implementing only `async_get_tokens()` driven through the
     whole credential/policy path.
-13. **Endpoint overrides do not weaken TLS.** The TWCA certificates are
+13. **`asyncio.to_thread` boundaries cover teardown and cancellation too.**
+    paho's `loop_stop()` joins the network thread (a blocking join) and now
+    runs on every supervisor rebuild — it executes in a worker thread. A
+    `CancelledError` during `connect()`'s handshake waits must tear the paho
+    client down before propagating, or its network thread leaks forever
+    (`Hood` only keeps a reference after `connect()` returns).
+14. **Exception classification is the supervisor's safety hinge.** Terminal
+    vs retryable is decided by exception type, so every wrap site must
+    classify (`_classify`) rather than defaulting to `ZephyrAuthError` — and
+    transient REST failures wrap to `ZephyrTransportError` so the
+    "consumers catch ZephyrError" contract holds on the setup and poll paths.
+15. **Endpoint overrides do not weaken TLS.** The TWCA certificates are
     supplementary anchors on top of the system store, so a redirected host
     verifies against normal system trust. `verify_mode` stays `CERT_REQUIRED`.

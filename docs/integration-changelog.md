@@ -168,8 +168,14 @@ Every method that took a `thing_name` is gone; the `Hood` knows its own.
 callback still receives a `HoodState` on the event loop (never from paho's
 network thread).
 
-Unchanged on `ZephyrClient`: `async_setup()`, `async_stop()`, `connected`,
-`identity_id`.
+New: `hood.connected` — whether **this** hood's push connection is up. Use it
+for per-device availability. `client.connected` still exists but is now
+derived: `True` while at least one hood's connection is up, so on a
+multi-hood account it is an aggregate, not a per-device signal.
+
+Unchanged on `ZephyrClient`: `async_setup()`, `async_stop()`, `identity_id`.
+(`connected` remains but with derived semantics — see above. `async_setup()`
+may only run once per client; build a new client to re-discover.)
 
 ---
 
@@ -190,7 +196,11 @@ code.
 | `async_set_state(thing, {"resetgreasefilter": 1})` | `await hood.async_reset_grease_filter()` |
 | `async_set_state(thing, {"setrecirculating": n})` | `await hood.async_set_recirculating(bool)` |
 
-`async_set_delay_timer` still takes **seconds**, as `setdelaytimer` always did.
+`async_set_delay_timer` passes its value straight through to `setdelaytimer`.
+**The field's units are not established** — whether the device reads seconds
+or minutes, and whether it snaps to presets, is an open hardware-validation
+question (the library's `VALIDATION.md`, question 2). Do not present a
+unit to users until that validation has run.
 
 ### New: range validation
 
@@ -231,10 +241,16 @@ other reasons — a safety-net re-read after push has been briefly unhealthy, or
 degraded HTTPS reads while MQTT is down — `hood.async_poll()` and
 `client.connected` both still exist for that.
 
-A terminal failure inside the supervisor (a revoked refresh token, or a
-missing IoT policy) stops it, flips `client.connected` to `False`, and is
-re-raised from the next `hood.async_poll()`. That is the intended path for it
-to reach a reauth flow, so a consumer that never polls will not learn about it.
+A terminal failure inside the supervisor stops it, disconnects the hoods
+(flipping `connected` to `False`), and re-raises from the next
+`hood.async_poll()` — the intended path to a reauth flow, so a consumer that
+never polls will not learn about it. **Only genuine credential rejections
+(`ZephyrAuthError`) and a missing IoT policy (`ZephyrPolicyError`) are
+terminal.** Transient failures — DNS, timeouts, Cognito throttling — surface
+as the retryable `ZephyrTransportError` and the supervisor keeps going, so
+mapping `ZephyrAuthError` to a reauth prompt is safe: it will not fire for a
+Wi-Fi blip. The supervisor also self-heals: a hood whose reconnect failed
+transiently is retried every tick until it comes back.
 
 ---
 
@@ -339,8 +355,10 @@ fails silently rather than loudly:
 - `update/delta` messages are ignored by the library. Nothing writes
   `desired`, so any delta is stale or foreign, and merging one produces a
   phantom state change.
-- The MQTT client ID is `identity_id + "-ha"`, region prefix included. It is
-  what lets this coexist with the vendor phone app instead of evicting it.
+- Every MQTT client ID starts with `identity_id + "-ha"` (region prefix
+  included) — that prefix is what lets this coexist with the vendor phone app
+  instead of evicting it — and each hood's connection appends a per-device
+  suffix, because AWS IoT evicts concurrent same-ID sessions.
 - The IoT policy is attached before connecting. An open connection does not
   pick up newly attached permissions; without it, connect/subscribe/publish
   all succeed and every message is silently dropped.
