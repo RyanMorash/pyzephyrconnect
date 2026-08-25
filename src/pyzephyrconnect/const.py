@@ -2,6 +2,7 @@
 
 All values reverse-engineered from the vendor iOS app. See PROTOCOL.md.
 """
+from dataclasses import dataclass
 
 REGION = "us-west-2"
 USER_POOL = "us-west-2_McuoKpkna"
@@ -19,6 +20,41 @@ POLICY_NAME = "RangeHoodPolicy"
 DEVICE_API_BASE = "https://zephyr-prod-app.gemteks.com/prod"
 DEVICE_API_LIST = f"{DEVICE_API_BASE}/getowndevices"
 DEVICE_API_DISCOVER = f"{DEVICE_API_BASE}/discoverdevice"
+
+
+@dataclass(frozen=True, slots=True)
+class Endpoints:
+    """Where the vendor cloud lives.
+
+    Defaults reproduce the production Zephyr/Gemtek deployment. They are
+    overridable so the library can be pointed at a staging host, exercised
+    in tests without monkeypatching module globals, and survive a vendor
+    host change without needing a release.
+    """
+
+    region: str = REGION
+    user_pool: str = USER_POOL
+    client_id: str = CLIENT_ID
+    client_secret: str = CLIENT_SECRET
+    identity_pool: str = IDENTITY_POOL
+    iot_endpoint: str = IOT_ENDPOINT
+    device_api_base: str = DEVICE_API_BASE
+
+    @property
+    def provider(self) -> str:
+        """Cognito login-provider key for the identity-pool exchange."""
+        return f"cognito-idp.{self.region}.amazonaws.com/{self.user_pool}"
+
+    @property
+    def device_api_list(self) -> str:
+        return f"{self.device_api_base}/getowndevices"
+
+    @property
+    def device_api_discover(self) -> str:
+        return f"{self.device_api_base}/discoverdevice"
+
+
+DEFAULT_ENDPOINTS = Endpoints()
 
 # Suffix appended to the Cognito identity ID to form the MQTT client ID, so
 # the library can coexist with the phone app instead of evicting it.

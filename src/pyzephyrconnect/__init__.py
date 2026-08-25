@@ -1,6 +1,7 @@
 """Python client for Zephyr/Gemtek range hoods."""
 
 from .client import ZephyrClient
+from .const import DEFAULT_ENDPOINTS, Endpoints
 from .exceptions import (
     ZephyrAuthError,
     ZephyrCertificateError,
@@ -16,6 +17,8 @@ from .models import HoodCapabilities, HoodState
 __version__ = "0.1.0"
 
 __all__ = [
+    "DEFAULT_ENDPOINTS",
+    "Endpoints",
     "ZephyrClient",
     "ZephyrError",
     "ZephyrAuthError",
