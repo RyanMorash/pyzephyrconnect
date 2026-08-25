@@ -1,15 +1,17 @@
 name: Release
 
-# Tagging `v0.1.0` publishes 0.1.0 to PyPI and opens a GitHub Release for it.
-# The tag must match the version in pyproject.toml - the build job refuses to
-# continue otherwise, before anything is uploaded anywhere.
+# Publishing a GitHub Release whose tag is `v0.1.0` publishes 0.1.0 to PyPI
+# and attaches the built distributions to that Release. Create the Release
+# (and its tag) in the GitHub UI; the tag must match the version in
+# pyproject.toml - the build job refuses to continue otherwise, before
+# anything is uploaded anywhere.
 #
 # Manual runs publish to TestPyPI instead, so a release can be rehearsed
 # end to end without burning a version number on PyPI (a filename can never
 # be reused there, even after a delete).
 on:
-  push:
-    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+  release:
+    types: [published]
   workflow_dispatch:
 
 permissions:
@@ -26,8 +28,10 @@ jobs:
         with:
           python-version: "3.12"
 
+      # On a release event github.ref is the release's tag, so ref_name is
+      # the tag name, exactly as it was under the old on-tag-push trigger.
       - name: Verify tag matches the declared version
-        if: startsWith(github.ref, 'refs/tags/')
+        if: github.event_name == 'release'
         env:
           TAG: ${{ github.ref_name }}
         run: |
@@ -105,7 +109,7 @@ jobs:
 
   publish-pypi:
     name: publish to PyPI
-    if: startsWith(github.ref, 'refs/tags/')
+    if: github.event_name == 'release'
     needs: build
     runs-on: ubuntu-latest
     environment:
@@ -120,24 +124,24 @@ jobs:
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
 
-  github-release:
-    name: GitHub Release
-    if: startsWith(github.ref, 'refs/tags/')
+  attach-artifacts:
+    name: attach artifacts to the GitHub Release
+    if: github.event_name == 'release'
     needs: publish-pypi
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist/
-      - name: Create release with the published artifacts attached
+      # The Release already exists - publishing it is what triggered this
+      # workflow - so upload the published distributions to it rather than
+      # creating one. --clobber makes a re-run of this job idempotent.
+      - name: Upload the published artifacts to the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release create "${{ github.ref_name }}" dist/* \
-            --title "${{ github.ref_name }}" \
-            --generate-notes \
-            --verify-tag
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: gh release upload "$TAG" dist/* --clobber
