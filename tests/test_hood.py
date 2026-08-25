@@ -1,4 +1,7 @@
+import asyncio
+import contextlib
 import json
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -209,3 +212,158 @@ async def test_listeners_are_notified_and_removable():
     hood.handle_state(HoodState.from_reported({"power": 0}))
 
     assert len(seen) == 1
+
+
+async def test_a_raising_listener_does_not_block_the_others(caplog):
+    """One bad consumer must not stop the others from updating, and the
+    failure must still be visible somewhere."""
+    hood, _ = _hood()
+    seen = []
+
+    def bad(_state):
+        raise RuntimeError("boom")
+
+    hood.add_listener(bad)
+    hood.add_listener(seen.append)
+
+    state = HoodState.from_reported({"power": 1})
+    with caplog.at_level(logging.ERROR):
+        hood.handle_state(state)
+
+    assert seen == [state]
+    assert any(record.levelno == logging.ERROR for record in caplog.records)
+
+
+async def test_not_connected_message_omits_the_thing_name():
+    """No thing name in the message: it identifies a home, and exception
+    text ends up in logs users paste publicly. The wording must also cover
+    every way a hood can end up without a shadow, not just 'never
+    started'."""
+    hood, _ = _hood()
+    with pytest.raises(ZephyrNotConnectedError, match="not connected") as excinfo:
+        await hood.async_set_light(1)
+
+    assert THING not in str(excinfo.value)
+
+
+async def test_destructive_write_is_pinned_and_logged(caplog):
+    """setrecirculating changes filter accounting for the hood. Pin both the
+    exact published payload and the warning so a future refactor cannot
+    silently drop either."""
+    hood, shadow = _hood()
+    await hood.async_start()
+
+    with caplog.at_level(logging.WARNING):
+        await hood.async_set_recirculating(True)
+
+    shadow.publish_state.assert_awaited_with({"setrecirculating": 1})
+    assert "setrecirculating" in caplog.text
+    assert any(record.levelno == logging.WARNING for record in caplog.records)
+
+
+async def test_intent_survives_a_failed_start():
+    """A failed async_start() must not demote consumer intent back to
+    'never started' - async_ensure_running is the sole recovery path and it
+    keys off _should_run, not off having a socket."""
+    made = []
+
+    def factory(_h):
+        shadow = MagicMock()
+        shadow.connect = AsyncMock(
+            side_effect=ZephyrTransportError("boom") if not made else None
+        )
+        shadow.request_state = AsyncMock()
+        shadow.disconnect = AsyncMock()
+        made.append(shadow)
+        return shadow
+
+    hood = Hood(_caps(), factory, AsyncMock(), AsyncMock())
+
+    with pytest.raises(ZephyrTransportError):
+        await hood.async_start()
+
+    assert hood._should_run is True
+
+    await hood.async_ensure_running()
+
+    assert len(made) == 2
+    made[1].connect.assert_awaited()
+    made[1].request_state.assert_awaited()
+
+
+async def test_async_stop_clears_intent_so_ensure_running_stays_off():
+    hood, shadow = _hood()
+    await hood.async_start()
+    await hood.async_stop()
+
+    assert hood._should_run is False
+    assert hood.connected is False
+
+    await hood.async_ensure_running()
+
+    shadow.connect.assert_awaited_once()  # no rebuild: intent was cleared
+
+
+async def test_empty_fields_payload_is_refused():
+    hood, shadow = _hood()
+    await hood.async_start()
+
+    with pytest.raises(ZephyrWriteError):
+        await hood.async_set_fields({})
+
+    shadow.publish_state.assert_not_awaited()
+
+
+async def test_poll_records_state_and_notifies_listeners():
+    hood, _ = _hood()
+    seen = []
+    hood.add_listener(seen.append)
+
+    state = await hood.async_poll()
+
+    assert hood.state is state
+    assert seen == [state]
+
+
+async def test_stop_swaps_the_shadow_reference_before_the_await():
+    """Regression for the cancellation-landing-on-await bug: _shadow must
+    already be None the instant the teardown await starts, not after it
+    returns. Otherwise a cancellation there leaves _shadow pointing at a
+    torn-down client while _should_run is still True, and
+    async_ensure_running declines to rebuild forever - a permanently dark
+    hood."""
+    hood, shadow = _hood()
+    await hood.async_start()
+
+    never_set = asyncio.Event()
+
+    async def hang() -> None:
+        await never_set.wait()
+
+    shadow.disconnect = AsyncMock(side_effect=hang)
+
+    task = asyncio.create_task(hood.async_stop())
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    assert hood._shadow is None  # swap already happened before the await
+
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    assert hood._should_run is False
+
+    await hood.async_ensure_running()
+    shadow.connect.assert_awaited_once()  # not revived
+
+
+async def test_typed_power_and_delay_timer_publish_shapes():
+    hood, shadow = _hood()
+    await hood.async_start()
+
+    await hood.async_set_power(True)
+    shadow.publish_state.assert_awaited_with({"power": 1})
+
+    await hood.async_set_delay_timer(300)
+    shadow.publish_state.assert_awaited_with({"setdelaytimer": 300})

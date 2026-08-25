@@ -139,8 +139,13 @@ class Hood:
 
     async def _stop(self) -> None:
         if self._shadow is not None:
-            await self._shadow.disconnect()
-            self._shadow = None
+            # Swap before the await: a cancellation landing on the await
+            # would otherwise leave _shadow pointing at a torn-down client
+            # with _should_run still True - and async_ensure_running would
+            # then decline to rebuild forever, a permanently dark hood.
+            # Mirrors ShadowClient.disconnect's clear-before-await.
+            shadow, self._shadow = self._shadow, None
+            await shadow.disconnect()
         self._connected = False
 
     async def async_poll(self) -> HoodState:
@@ -212,7 +217,8 @@ class Hood:
             # No thing name in the message: it identifies a home, and
             # exception text ends up in logs users paste publicly.
             raise ZephyrNotConnectedError(
-                "async_start() has not been called for this hood"
+                "hood is not connected (never started, stopped, or a "
+                "rebuild failed)"
             )
         if not fields:
             raise ZephyrWriteError("refusing to publish an empty reported state")
