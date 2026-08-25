@@ -29,7 +29,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-asyncio>=0.23", "pytest-cov"]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "pytest-cov",
+    # Exact-pinned to match the ruff-action pin in .github/workflows/ci.yml,
+    # so local runs and CI can never disagree. Bump both together.
+    "ruff==0.14.14",
+]
 
 [project.urls]
 Homepage = "https://github.com/RyanMorash/pyzephyrconnect"
@@ -48,3 +55,12 @@ packages = ["src/pyzephyrconnect"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["tests"]
+
+[tool.ruff.lint]
+# Docstrings follow the Google style guide, per Home Assistant's
+# recommendation for integration libraries. extend-select (not select) so
+# the D rules add to ruff's default E/F checks instead of replacing them.
+extend-select = ["D"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
