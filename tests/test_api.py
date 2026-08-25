@@ -11,7 +11,12 @@ from pyzephyrconnect import const
 from pyzephyrconnect.api import CERT_BUNDLE, ZephyrApi, build_ssl_context
 from pyzephyrconnect.auth import ZephyrTokens
 from pyzephyrconnect.const import DEFAULT_ENDPOINTS, Endpoints
-from pyzephyrconnect.exceptions import ZephyrAuthError, ZephyrCertificateError, ZephyrError
+from pyzephyrconnect.exceptions import (
+    ZephyrAuthError,
+    ZephyrCertificateError,
+    ZephyrError,
+    ZephyrTransportError,
+)
 
 THING = "aaaaaaaabbbbbbbbccccccccddddddddeeeeeeee"
 
@@ -202,3 +207,50 @@ async def test_endpoint_override_reaches_the_url_requested():
     await ZephyrApi(auth).get_own_devices()
 
     assert session.calls[0]["url"] == "https://staging.example/prod/getowndevices"
+
+
+class _RaisingSession:
+    def __init__(self, exc):
+        self._exc = exc
+
+    def post(self, url, **kwargs):
+        raise self._exc
+
+
+async def test_transient_network_failure_wraps_in_transport_error():
+    """New clause in _post: aiohttp.ClientError/TimeoutError must surface as
+    ZephyrTransportError so a consumer catching ZephyrError catches
+    everything on the setup and poll paths."""
+    api = ZephyrApi(_fake_auth(_RaisingSession(aiohttp.ClientConnectionError())))
+    with pytest.raises(ZephyrTransportError):
+        await api.get_own_devices()
+
+
+async def test_certificate_failure_still_wins_over_the_transport_clause():
+    """ClientConnectorCertificateError subclasses ClientError; the cert
+    clause is listed first and must keep winning - the diagnosis it carries
+    is the valuable one."""
+    exc = aiohttp.ClientConnectorCertificateError(
+        connection_key=MagicMock(), certificate_error=ssl.SSLError("boom")
+    )
+    api = ZephyrApi(_fake_auth(_RaisingSession(exc)))
+    with pytest.raises(ZephyrCertificateError):
+        await api.get_own_devices()
+
+
+async def test_ssl_context_is_built_once_and_cached(monkeypatch):
+    import pyzephyrconnect.api as api_module
+
+    calls = []
+    real = api_module.build_ssl_context
+    monkeypatch.setattr(
+        api_module, "build_ssl_context", lambda: calls.append(1) or real()
+    )
+    session = FakeSession(
+        FakeResponse({"devices": []}), FakeResponse({"devices": []})
+    )
+    api = ZephyrApi(_fake_auth(session))
+    await api.get_own_devices()
+    await api.get_own_devices()
+
+    assert len(calls) == 1
