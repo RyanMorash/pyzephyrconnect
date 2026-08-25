@@ -458,3 +458,95 @@ async def test_identity_override_resets_when_tokens_change_accounts(fake_aws):
         > exchanges_before
     ), "swapping to a new account's tokens must trigger a fresh exchange"
     assert auth.identity_id == other_account_identity
+
+
+# -- _acquire cache invariants and refresh-failure classification --------
+
+
+async def test_acquire_populates_the_credentials_cache_so_get_credentials_skips_reexchange(
+    fake_aws,
+):
+    """_acquire runs its own _exchange but, before this fix, never wrote
+    _credentials_for or cleared _identity_override - so async_get_credentials()'s
+    cache check (_credentials_for == current_identity) could never match and
+    every call performed a second, pointless exchange right after the first."""
+    auth = CredentialsAuth("user@example.com", "pw", MagicMock())
+    await auth.async_get_tokens()
+    calls_after_acquire = fake_aws["identity"].get_credentials_for_identity.call_count
+
+    await auth.async_get_credentials()
+
+    assert (
+        fake_aws["identity"].get_credentials_for_identity.call_count
+        == calls_after_acquire
+    )
+
+
+async def test_second_stale_identity_clears_a_leftover_override(fake_aws):
+    """A stale _identity_override left over from an earlier exchange must not
+    survive a later _acquire that resolves its own, different corrected
+    identity - otherwise identity_id/mqtt_client_id keep serving the OLDER
+    override forever while the tokens themselves move on, which is the
+    PROTOCOL.md section 3.3 silent-drop failure applied twice in a row."""
+    corrected = "us-west-2:corrected"
+    identity = fake_aws["identity"]
+    identity.get_credentials_for_identity.side_effect = [
+        _client_error("ResourceNotFoundException"),
+        _creds_response(),
+    ]
+    identity.get_id.return_value = {"IdentityId": corrected}
+    auth = CredentialsAuth(
+        "user@example.com", "pw", MagicMock(), tokens=_stored_tokens()
+    )
+    auth._identity_override = "us-west-2:old-override"
+
+    await auth.async_get_tokens()
+
+    assert auth.identity_id == corrected
+
+
+async def test_refresh_path_retains_stored_refresh_token_when_cognito_omits_one(
+    fake_aws,
+):
+    """renew_access_token does not necessarily rotate the refresh token, so
+    pycognito can leave Cognito.refresh_token unset after a refresh. The
+    previously stored refresh token must be carried forward, not dropped -
+    losing it silently breaks the NEXT refresh."""
+    fake_aws["cognito"].refresh_token = None
+    stored = _stored_tokens()
+    auth = CredentialsAuth("user@example.com", "pw", MagicMock(), tokens=stored)
+
+    tokens = await auth.async_get_tokens()
+
+    assert tokens.refresh_token == stored.refresh_token
+
+
+async def test_transient_refresh_failure_raises_instead_of_burning_an_srp_login(
+    fake_aws,
+):
+    """A DNS blip, timeout or throttling during renew_access_token is not
+    Cognito rejecting the refresh token - it must surface as a retryable
+    ZephyrTransportError, not silently fall back to a rate-limited SRP login
+    (PROTOCOL.md section 3.1) that also misreports the actual cause."""
+    fake_aws["cognito"].renew_access_token.side_effect = OSError("connection reset")
+    auth = CredentialsAuth(
+        "user@example.com", "pw", MagicMock(), tokens=_stored_tokens()
+    )
+
+    with pytest.raises(ZephyrTransportError):
+        await auth.async_get_tokens()
+
+    fake_aws["cognito"].authenticate.assert_not_called()
+
+
+async def test_refresh_path_replays_the_stored_identity_without_refetching(fake_aws):
+    """The refresh path passes stored.identity_id into _exchange, so a
+    healthy stored identity must be reused as-is - a get_id round trip here
+    would mean the refresh path is refetching identities it has no reason
+    to doubt."""
+    auth = CredentialsAuth(
+        "user@example.com", "pw", MagicMock(), tokens=_stored_tokens()
+    )
+    await auth.async_get_tokens()
+
+    assert fake_aws["identity"].get_id.call_count == 0

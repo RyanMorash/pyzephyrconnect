@@ -521,8 +521,17 @@ class CredentialsAuth(AbstractAuth):
                 user = await asyncio.to_thread(self._refresh, stored.refresh_token)
             except Exception as err:  # noqa: BLE001
                 # Refresh tokens expire (30 days by default) and can be
-                # revoked. Reauthenticate rather than surfacing an error.
-                _LOGGER.debug("refresh rejected (%s); falling back to SRP", err)
+                # revoked - that must reauthenticate rather than surface an
+                # error. But a DNS blip, timeout or throttling during the
+                # refresh call is not a rejection, and burning a rate-limited
+                # SRP login (PROTOCOL.md section 3.1) to paper over a
+                # transient failure both wastes it and misreports the cause
+                # to the caller. Classify first: only a genuine
+                # ZephyrAuthError falls through to SRP below.
+                _LOGGER.debug("refresh failed (%s)", err)
+                classified = self._classify(err)
+                if not isinstance(classified, ZephyrAuthError):
+                    raise classified from err
 
         if user is None:
             try:
@@ -546,6 +555,13 @@ class CredentialsAuth(AbstractAuth):
             raise self._classify(err) from err
 
         self._credentials = credentials
+        self._credentials_for = identity_id
+        # The tokens built two lines below carry the authoritative identity
+        # from THIS exchange, so any older override is stale. Keeping it
+        # lets identity_id/mqtt_client_id diverge from the tokens after two
+        # successive stale-identity events - the PROTOCOL.md section 3.3
+        # silent-drop failure.
+        self._identity_override = None
         self._tokens = ZephyrTokens(
             username=self._username,
             id_token=user.id_token,
