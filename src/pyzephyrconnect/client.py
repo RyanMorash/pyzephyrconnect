@@ -161,16 +161,36 @@ class ZephyrClient:
         return list(self._hoods.values())
 
     async def async_stop(self) -> None:
+        """Stop every hood and retire the supervisor.
+
+        Stopping a hood directly via `hood.async_stop()` does NOT retire the
+        supervisor - only THIS method does. The supervisor is scoped to the
+        client, not to any one hood, and keeps ticking (renewing credentials,
+        reconnecting whatever is still `_should_run`) until this cancels it.
+        """
         if self._supervisor is not None:
             self._supervisor.cancel()
             # Await it. Cancelling without awaiting can leave a hood halfway
             # through async_reconnect() with no socket and no supervisor, and
             # lets the task be collected with an unretrieved CancelledError.
-            with contextlib.suppress(asyncio.CancelledError):
+            # Suppress BaseException, not just CancelledError: a supervisor
+            # that died with some other exception would otherwise re-raise
+            # it here, which skips the hood-stopping loop below entirely -
+            # leaking a paho network thread per hood on every consumer
+            # reload - and leaves _supervisor set, so _ensure_supervisor's
+            # `is None or .done()` check never restarts it and every retry
+            # fails forever. The exception itself is not lost: _supervise's
+            # own except clauses already logged it before the task exited.
+            with contextlib.suppress(BaseException):
                 await self._supervisor
             self._supervisor = None
         for hood in self._hoods.values():
-            await hood.async_stop()
+            try:
+                await hood.async_stop()
+            except Exception:  # noqa: BLE001
+                # One hood's teardown failure must not strand the others -
+                # each hood owns its own socket and paho thread.
+                _LOGGER.exception("stopping a hood failed; continuing")
 
     # -- internals -----------------------------------------------------
 
@@ -194,7 +214,15 @@ class ZephyrClient:
             # so N hoods sharing the bare mqtt_client_id would flap forever.
             # Identity-prefixed, so the policy's prefix-match still covers
             # it (PROTOCOL.md section 5).
-            f"{self._auth.mqtt_client_id}-{hood.thing_name[:8]}",
+            #
+            # The FULL thing name, not a truncated 8-char prefix (deviation
+            # from the original design, controller-authorized): two things
+            # sharing an 8-char prefix got IDENTICAL client IDs under the
+            # truncated form, which is the exact same-ID eviction this
+            # suffix exists to prevent. identity (~50 chars) + "-" + a
+            # 40-hex thing name stays comfortably under AWS IoT's 128-char
+            # client-ID limit.
+            f"{self._auth.mqtt_client_id}-{hood.thing_name}",
             lambda topic, payload: self._handle_message(hood, topic, payload),
             hood.handle_connection_change,
             self._auth.async_get_credentials,
@@ -226,7 +254,14 @@ class ZephyrClient:
         not queue behind a reconnect that may itself be stuck.
         """
         if self._supervisor_error is not None:
-            raise self._supervisor_error
+            # A fresh instance, not the stored object: re-raising the SAME
+            # exception appends frames to its __traceback__ on every poll
+            # (this method, Hood.async_poll, the consumer's own frame) -
+            # unbounded while a consumer keeps polling through a terminal
+            # error that never clears. These exceptions carry only a
+            # message, so type(err)(*err.args) reconstructs one losslessly.
+            err = self._supervisor_error
+            raise type(err)(*err.args) from err
         payload = await self._api.discover_device(thing_name)
         return self._state_from_discover(payload)
 

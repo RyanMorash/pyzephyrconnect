@@ -271,6 +271,24 @@ def test_from_credentials_threads_tokens_and_endpoints_through():
     assert client.identity_id == "us-west-2:restored"
 
 
+def test_from_credentials_passes_token_updater_through(monkeypatch):
+    """token_updater persists refreshed tokens; dropping it on the way to
+    CredentialsAuth would make every consumer's persistence path a silent
+    no-op - tokens would look like they're being saved but never are."""
+    fake_auth_cls = MagicMock()
+    monkeypatch.setattr(client_module, "CredentialsAuth", fake_auth_cls)
+
+    sentinel = object()
+    tokens = object()
+    ZephyrClient.from_credentials(
+        "u", "p", MagicMock(), tokens=tokens, token_updater=sentinel
+    )
+
+    kwargs = fake_auth_cls.call_args.kwargs
+    assert kwargs["token_updater"] is sentinel
+    assert kwargs["tokens"] is tokens
+
+
 @pytest.mark.parametrize(
     "name",
     [
@@ -328,15 +346,51 @@ async def test_the_mqtt_client_id_is_per_connection(wired):
     """AWS IoT treats two live connections with the same client ID as one
     session and evicts one for the other, so N hoods sharing the bare
     mqtt_client_id would flap forever. Identity-prefixed so the policy's
-    prefix match still covers it."""
+    prefix match still covers it. The FULL thing name, not a truncated
+    8-char prefix - see test_two_hoods_sharing_an_8char_prefix_get_
+    different_client_ids for why the truncated form was actively unsafe."""
     client = _client()
     hoods = await client.async_setup()
     client._make_shadow(hoods[0])
 
     args = client_module.ShadowClient.call_args.args
     assert args[0] == THING
-    assert args[1] == f"us-west-2:abc-ha-{THING[:8]}"
+    assert args[1] == f"us-west-2:abc-ha-{THING}"
     assert args[1] != wired["auth"].mqtt_client_id
+
+
+async def test_two_hoods_sharing_an_8char_prefix_get_different_client_ids(wired):
+    """The old truncated-to-8-chars form gave two things sharing that
+    prefix IDENTICAL client IDs - AWS IoT evicts one same-ID session for
+    the other, the exact failure the per-connection suffix exists to
+    prevent. The full thing name must not collide the same way, and both
+    IDs must still carry the identity prefix the IoT policy matches on."""
+    similar = THING[:8] + "9" * (len(THING) - 8)
+    assert similar[:8] == THING[:8]  # the truncated form WOULD have collided
+    assert similar != THING
+
+    first = json.loads((FIXTURES / "discoverdevice.json").read_text())
+    second = json.loads((FIXTURES / "discoverdevice.json").read_text())
+    second["thingName"] = similar
+    wired["api"].get_own_devices = AsyncMock(
+        return_value=[{"thingName": THING}, {"thingName": similar}]
+    )
+    wired["api"].discover_device = AsyncMock(
+        side_effect=lambda thing: first if thing == THING else second
+    )
+
+    client = _client()
+    hoods = await client.async_setup()
+    assert len(hoods) == 2
+
+    client._make_shadow(hoods[0])
+    id_a = client_module.ShadowClient.call_args.args[1]
+    client._make_shadow(hoods[1])
+    id_b = client_module.ShadowClient.call_args.args[1]
+
+    assert id_a != id_b
+    assert id_a.startswith(wired["auth"].mqtt_client_id)
+    assert id_b.startswith(wired["auth"].mqtt_client_id)
 
 
 async def test_the_shadow_gets_the_credentials_provider_not_a_credential(wired):
@@ -382,6 +436,34 @@ async def test_connected_is_derived_from_the_hoods(wired):
 
     hoods[0].handle_connection_change(False)
     assert client.connected is False
+
+
+async def test_connection_change_wiring_is_pinned_per_hood(wired):
+    """args[3] must be THIS hood's own handle_connection_change - wiring one
+    hood's shadow to another's callback would make `connected` (and the
+    supervisor's terminal-stop flip) attribute the wrong hood's socket
+    state."""
+    first = json.loads((FIXTURES / "discoverdevice.json").read_text())
+    second = json.loads((FIXTURES / "discoverdevice.json").read_text())
+    second["thingName"] = OTHER
+    wired["api"].get_own_devices = AsyncMock(
+        return_value=[{"thingName": THING}, {"thingName": OTHER}]
+    )
+    wired["api"].discover_device = AsyncMock(
+        side_effect=lambda thing: first if thing == THING else second
+    )
+
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+    await hoods[1].async_start()
+
+    for i, hood in enumerate(hoods):
+        call_args = client_module.ShadowClient.call_args_list[i]
+        # `==`, not `is`: two separate attribute accesses of the SAME bound
+        # method are equal (same __self__, same __func__) but never
+        # identical - each access allocates a fresh bound-method object.
+        assert call_args.args[3] == hood.handle_connection_change
 
 
 # -- message handling -------------------------------------------------
@@ -475,7 +557,7 @@ async def test_a_delta_notifies_nobody_and_logs_no_identifier(wired, caplog):
     assert THING not in caplog.text
 
 
-async def test_a_non_dict_payload_is_ignored(wired):
+async def test_a_non_dict_payload_is_ignored(wired, caplog):
     """Valid JSON that is not an object (e.g. the literal `null`, which
     json.loads returns as None) must not raise, must not change state, and
     must not notify listeners. _on_message only catches parse errors, so
@@ -486,10 +568,17 @@ async def test_a_non_dict_payload_is_ignored(wired):
 
     seen = []
     hoods[0].add_listener(seen.append)
-    client._handle_message(hoods[0], f"$aws/things/{THING}/shadow/get/accepted", None)
+    with caplog.at_level(logging.WARNING, logger="pyzephyrconnect.client"):
+        client._handle_message(
+            hoods[0], f"$aws/things/{THING}/shadow/get/accepted", None
+        )
 
     assert hoods[0].state is before
     assert seen == []
+    # WARNING from the explicit shape guard specifically - not the broad
+    # ERROR backstop below, which would also leave state/listeners untouched
+    # and so could not be told apart from this guard without checking text.
+    assert "unexpected shape" in caplog.text
 
 
 async def test_a_rejection_never_logs_the_payload(wired, caplog):
@@ -509,6 +598,43 @@ async def test_a_rejection_never_logs_the_payload(wired, caplog):
     assert "40.0" not in caplog.text
     assert THING not in caplog.text
     assert "rejected" in caplog.text
+
+
+async def test_the_message_closure_is_pinned_to_its_own_hood(wired):
+    """_make_shadow's on_message closes over the SPECIFIC hood it was built
+    for. A lookup like `next(iter(self._hoods.values()))` instead of the
+    closed-over `hood` would happen to work with exactly one hood and then
+    silently misattribute every message once a second hood exists."""
+    first = json.loads((FIXTURES / "discoverdevice.json").read_text())
+    second = json.loads((FIXTURES / "discoverdevice.json").read_text())
+    second["thingName"] = OTHER
+    wired["api"].get_own_devices = AsyncMock(
+        return_value=[{"thingName": THING}, {"thingName": OTHER}]
+    )
+    wired["api"].discover_device = AsyncMock(
+        side_effect=lambda thing: first if thing == THING else second
+    )
+
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+    await hoods[1].async_start()
+
+    on_message_a = client_module.ShadowClient.call_args_list[0].args[2]
+
+    state_b_before = hoods[1].state
+    seen_b = []
+    hoods[1].add_listener(seen_b.append)
+
+    on_message_a(
+        f"$aws/things/{THING}/shadow/get/accepted",
+        {"state": {"reported": {"power": 1, "fan": 3}}},
+    )
+
+    assert hoods[0].state is not None
+    assert hoods[0].state.power == 1
+    assert hoods[1].state is state_b_before
+    assert seen_b == []
 
 
 async def test_a_malformed_message_does_not_escape_onto_the_loop(wired, caplog):
