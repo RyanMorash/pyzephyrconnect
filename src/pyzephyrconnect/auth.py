@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
@@ -84,14 +85,30 @@ class ZephyrTokens:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> ZephyrTokens:
+        """Rebuild from restored storage, validating rather than coercing.
+
+        str() coercion was worse than no validation: a corrupted None
+        became the literal "None", which is a perfectly usable string that
+        survives every check here and fails much later and far away - as a
+        SECRET_HASH Cognito rejects, or as an MQTT client ID whose messages
+        AWS IoT silently drops. Corruption has to fail here, at the
+        boundary the README tells consumers to call.
+        """
         try:
-            return cls(
-                username=str(data["username"]),
-                id_token=str(data["id_token"]),
-                refresh_token=str(data["refresh_token"]),
-                identity_id=str(data["identity_id"]),
-                expires_at=float(data["expires_at"]),
-            )
+            values: dict[str, str] = {}
+            for key in ("username", "id_token", "refresh_token", "identity_id"):
+                value = data[key]
+                if not isinstance(value, str) or not value:
+                    # The field NAME only - the value may be a token.
+                    raise ValueError(key)
+                values[key] = value
+            expires_at = float(data["expires_at"])
+            if not math.isfinite(expires_at):
+                # NaN compares False against everything, so `expired` would
+                # be permanently False and the tokens never refreshed -
+                # the socket then dies on credentials nothing renews.
+                raise ValueError("expires_at")
+            return cls(expires_at=expires_at, **values)
         except (KeyError, TypeError, ValueError) as err:
             raise ZephyrDataError("persisted tokens are malformed") from err
 
@@ -338,7 +355,9 @@ class AbstractAuth(ABC):
 
         A persisted identity_id is replayed when we have one, but it can be
         stale - and unlike an in-memory value, a bad one survives restarts.
-        On failure it is discarded and refetched once before giving up.
+        Only a failure that actually means "this identity is wrong"
+        discards it and refetches once; everything else propagates to
+        _classify.
         """
         client = self._identity_client()
         logins = {self.endpoints.provider: id_token}
@@ -363,6 +382,18 @@ class AbstractAuth(ABC):
                 # Cognito rejecting the stored identity. Refetching would
                 # not help and only spends a second round trip before the
                 # caller's own retry - propagate it as-is.
+                raise
+            if err.response.get("Error", {}).get("Code", "") not in {
+                # The only two codes that mean the STORED IDENTITY is the
+                # problem: it was deleted, or it is no longer bound to this
+                # login. Every other code is about the request, not the
+                # identity - and TooManyRequestsException is the one that
+                # made this actively harmful, because an immediate get_id
+                # DOUBLES the request count against the very throttle
+                # _classify deliberately treats as retryable.
+                "ResourceNotFoundException",
+                "NotAuthorizedException",
+            }:
                 raise
             _LOGGER.debug("stored identity ID rejected; refetching")
             resolved, raw = fetch(None)
@@ -475,12 +506,14 @@ class CredentialsAuth(AbstractAuth):
 
     # -- blocking bodies, run in a worker thread ----------------------
 
-    def _cognito(self, *, refresh_token: str | None = None) -> Cognito:
+    def _cognito(
+        self, *, username: str | None = None, refresh_token: str | None = None
+    ) -> Cognito:
         return Cognito(
             self.endpoints.user_pool,
             self.endpoints.client_id,
             client_secret=self.endpoints.client_secret,
-            username=self._username,
+            username=username or self._username,
             refresh_token=refresh_token,
             # Must be explicit; otherwise pycognito reads ambient AWS config
             # and raises a confusing ResourceNotFoundException.
@@ -492,8 +525,22 @@ class CredentialsAuth(AbstractAuth):
         user.authenticate(password=self._password)
         return user
 
-    def _refresh(self, refresh_token: str) -> Cognito:
-        user = self._cognito(refresh_token=refresh_token)
+    def _refresh(self, stored: ZephyrTokens) -> Cognito:
+        """Renew from a stored refresh token, under ITS username.
+
+        stored.username, not self._username: SECRET_HASH is
+        HMAC-SHA256(client_secret, username + client_id) and pycognito
+        recomputes it on every REFRESH_TOKEN_AUTH call, so it has to use
+        the username that MINTED this refresh token. That is the documented
+        reason ZephyrTokens carries a username at all - reading it from the
+        constructor argument instead makes the field decorative, and a
+        consumer that rebuilds this object with a differently spelled
+        username (a changed email, different casing) while restoring the
+        same tokens sends a hash Cognito rejects.
+        """
+        user = self._cognito(
+            username=stored.username, refresh_token=stored.refresh_token
+        )
         user.renew_access_token()
         return user
 
@@ -519,10 +566,16 @@ class CredentialsAuth(AbstractAuth):
         """Refresh or log in. Caller holds self._lock."""
         stored = self._tokens
         user: Cognito | None = None
+        # Which username the tokens minted below belong to. The REFRESH
+        # path keeps the stored one, because the refresh token it renewed
+        # is bound to that username through SECRET_HASH and the NEXT
+        # refresh has to reproduce the same hash. An SRP login mints fresh
+        # tokens under the username this object was constructed with.
+        token_username = self._username
 
         if stored is not None:
             try:
-                user = await asyncio.to_thread(self._refresh, stored.refresh_token)
+                user = await asyncio.to_thread(self._refresh, stored)
             except Exception as err:  # noqa: BLE001
                 # Refresh tokens expire (30 days by default) and can be
                 # revoked - that must reauthenticate rather than surface an
@@ -536,6 +589,8 @@ class CredentialsAuth(AbstractAuth):
                 classified = self._classify(err)
                 if not isinstance(classified, ZephyrAuthError):
                     raise classified from err
+            else:
+                token_username = stored.username
 
         if user is None:
             try:
@@ -567,7 +622,7 @@ class CredentialsAuth(AbstractAuth):
         # silent-drop failure.
         self._identity_override = None
         self._tokens = ZephyrTokens(
-            username=self._username,
+            username=token_username,
             id_token=user.id_token,
             refresh_token=user.refresh_token or (
                 stored.refresh_token if stored else ""

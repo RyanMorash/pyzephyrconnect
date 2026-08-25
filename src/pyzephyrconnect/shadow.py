@@ -303,8 +303,15 @@ class ShadowClient:
         # disconnect() BEFORE loop_stop(). The network thread is what writes
         # the DISCONNECT packet; stopping it first means the packet is queued
         # and never sent, and the broker only notices via keepalive timeout.
-        client.disconnect()
-        client.loop_stop()
+        try:
+            client.disconnect()
+        finally:
+            # In a finally, so a disconnect() that raises cannot skip it.
+            # loop_stop() is what JOINS paho's network thread - this
+            # function exists to stop that thread leaking, and letting a
+            # failed DISCONNECT packet cancel the join is exactly the leak
+            # it guards against. Ordering above is preserved.
+            client.loop_stop()
 
     def _publish(self, topic: str, payload: dict[str, Any]) -> None:
         if self._client is None:

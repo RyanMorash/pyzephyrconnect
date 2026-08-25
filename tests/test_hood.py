@@ -298,6 +298,41 @@ async def test_intent_survives_a_failed_start():
     made[1].request_state.assert_awaited()
 
 
+async def test_a_failed_initial_state_request_leaves_the_hood_recoverable():
+    """request_state() raising AFTER _shadow was set produced the worst
+    possible shape: the hood LOOKED healthy - async_start returns early and
+    async_ensure_running declines to rebuild while _shadow is not None - but
+    the initial state GET never happened and nothing ever retried it. _start
+    must put the hood back into the no-socket state the supervisor knows how
+    to recover from, and tear the half-built client down rather than leak
+    its paho network thread."""
+    made = []
+
+    def factory(_h):
+        shadow = MagicMock()
+        shadow.connect = AsyncMock()
+        shadow.disconnect = AsyncMock()
+        shadow.request_state = AsyncMock(
+            side_effect=ZephyrTransportError("boom") if not made else None
+        )
+        made.append(shadow)
+        return shadow
+
+    hood = Hood(_caps(), factory, AsyncMock(), AsyncMock())
+
+    with pytest.raises(ZephyrTransportError):
+        await hood.async_start()
+
+    assert hood._shadow is None          # not left looking connected
+    assert hood._should_run is True      # consumer intent survives
+    made[0].disconnect.assert_awaited_once()
+
+    await hood.async_ensure_running()    # the next supervisor tick
+
+    assert len(made) == 2
+    made[1].request_state.assert_awaited()
+
+
 async def test_async_stop_clears_intent_so_ensure_running_stays_off():
     hood, shadow = _hood()
     await hood.async_start()

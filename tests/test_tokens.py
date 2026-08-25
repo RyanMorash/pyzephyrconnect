@@ -57,3 +57,31 @@ def test_from_dict_with_an_unparseable_expiry_raises_zephyr_data_error():
     data["expires_at"] = "soon"
     with pytest.raises(ZephyrDataError):
         ZephyrTokens.from_dict(data)
+
+
+def test_from_dict_rejects_a_non_string_field_instead_of_coercing_it():
+    """str() coercion was worse than no validation at all: a corrupted None
+    became the literal "None", a perfectly usable string that passes every
+    later check and fails far away - as a SECRET_HASH Cognito rejects, or an
+    MQTT client ID whose messages AWS IoT silently drops."""
+    data = _tokens().as_dict()
+    data["username"] = None
+    with pytest.raises(ZephyrDataError):
+        ZephyrTokens.from_dict(data)
+
+
+def test_from_dict_rejects_an_empty_string_field():
+    data = _tokens().as_dict()
+    data["identity_id"] = ""
+    with pytest.raises(ZephyrDataError):
+        ZephyrTokens.from_dict(data)
+
+
+def test_from_dict_rejects_a_non_finite_expiry():
+    """float("nan") parses fine and then compares False against everything,
+    so `expired` would be permanently False - tokens that are never
+    refreshed and a socket that dies on credentials nothing renews."""
+    data = _tokens().as_dict()
+    data["expires_at"] = float("nan")
+    with pytest.raises(ZephyrDataError):
+        ZephyrTokens.from_dict(data)

@@ -64,6 +64,12 @@ class ZephyrClient:
         self._endpoints = auth.endpoints
         self._api = ZephyrApi(auth)
         self._hoods: dict[str, Hood] = {}
+        # The setup sentinel. NOT _hoods, which breaks both ways: an
+        # account with zero devices leaves it empty, so a second full setup
+        # was permitted, and a failure partway through the discovery loop
+        # left it partially filled, so the client looked initialized and
+        # the failed setup could never be retried.
+        self._setup_complete = False
         self._supervisor: asyncio.Task[None] | None = None
         self._supervisor_error: ZephyrError | None = None
         # Attribute, not the bare constant: tests drive the supervisor with
@@ -133,13 +139,19 @@ class ZephyrClient:
 
     async def async_setup(self) -> list[Hood]:
         """Authenticate and discover every hood on the account."""
-        if self._hoods:
+        if self._setup_complete:
             # Re-running setup would replace started Hood objects while
             # their sockets and the supervisor still reference the old ones.
             # One client = one setup; build a new client to re-discover.
             # Checked before the credential exchange below so a repeat call
             # fails fast instead of paying for a needless network round trip.
             raise ZephyrError("async_setup() has already run on this client")
+        # Start every (re)attempt from empty: a previous attempt that raised
+        # partway through the loop below left entries behind, and appending
+        # to them would return duplicate and stale hoods. Discarding them is
+        # safe precisely because nothing has started them - async_setup only
+        # builds Hood objects, so there is no socket or paho thread to leak.
+        self._hoods = {}
         # The full chain, not just tokens: this performs the identity
         # exchange, which is what makes auth.identity_id readable - the
         # config-flow ordering "async_setup(), then read identity_id for
@@ -172,6 +184,10 @@ class ZephyrClient:
             )
             hood.handle_state(self._state_from_discover(payload))
             self._hoods[thing_name] = hood
+        # Only once the loop has run to completion. Setting it earlier would
+        # latch a half-discovered account as done and make the failure
+        # unretryable.
+        self._setup_complete = True
         return list(self._hoods.values())
 
     async def async_stop(self) -> None:
@@ -198,13 +214,30 @@ class ZephyrClient:
             with contextlib.suppress(BaseException):
                 await self._supervisor
             self._supervisor = None
+        # A cancellation reaching this loop must not strand the hoods that
+        # have not been torn down yet, and must not be swallowed either.
+        # Note this is also where a CALLER's cancellation resurfaces: the
+        # suppress(BaseException) above swallows it at the supervisor await,
+        # and asyncio re-delivers a pending cancellation at the next await
+        # point - which is this loop - so both cases funnel through here.
+        cancelled = False
         for hood in self._hoods.values():
             try:
                 await hood.async_stop()
+            except asyncio.CancelledError:
+                # Caught apart from Exception below, and the loop CONTINUES:
+                # letting this propagate would leak a paho network thread
+                # per remaining hood on every consumer reload.
+                cancelled = True
             except Exception:  # noqa: BLE001
                 # One hood's teardown failure must not strand the others -
                 # each hood owns its own socket and paho thread.
                 _LOGGER.exception("stopping a hood failed; continuing")
+        if cancelled:
+            # Every hood is down now, so the cancellation can be honoured
+            # rather than silently dropped - a caller that cancelled this
+            # shutdown must still see its CancelledError.
+            raise asyncio.CancelledError
 
     # -- internals -----------------------------------------------------
 

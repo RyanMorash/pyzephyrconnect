@@ -336,6 +336,19 @@ async def test_teardown_disconnects_before_stopping_the_network_thread(fake_paho
     assert names.index("disconnect") < names.index("loop_stop")
 
 
+def test_teardown_stops_the_network_thread_even_if_disconnect_raises():
+    """loop_stop() is what JOINS paho's network thread. Skipping it because
+    disconnect() raised leaks the very thread this function exists to reap -
+    hence the try/finally rather than two plain statements."""
+    client = MagicMock()
+    client.disconnect.side_effect = OSError("socket already gone")
+
+    with pytest.raises(OSError):
+        ShadowClient._teardown(client)
+
+    client.loop_stop.assert_called_once()
+
+
 async def test_cancelled_handshake_tears_down_the_paho_client(fake_paho):
     """A cancellation arriving mid-handshake must still tear down the paho
     client and its network thread via the shielded teardown in disconnect()

@@ -375,6 +375,23 @@ async def test_exchange_transient_failure_propagates_without_refetch(fake_aws):
     assert fake_aws["identity"].get_id.call_count == 0
 
 
+async def test_throttled_exchange_is_not_retried_with_an_extra_get_id(fake_aws):
+    """The refetch used to fire on ANY ClientError, so Cognito throttling
+    the exchange immediately spent a second request on get_id - doubling
+    the load against the exact rate limit _classify deliberately treats as
+    retryable. Only codes that mean the stored identity itself is wrong may
+    trigger the refetch."""
+    fake_aws["identity"].get_credentials_for_identity.side_effect = _client_error(
+        "TooManyRequestsException"
+    )
+    auth = _StaticAuth(_stored_tokens(3600), MagicMock())
+
+    with pytest.raises(ZephyrTransportError):
+        await auth.async_get_credentials()
+
+    assert fake_aws["identity"].get_id.call_count == 0
+
+
 # -- canary: the real pycognito exception --------------------------------
 
 
@@ -567,6 +584,52 @@ async def test_refresh_failure_log_is_scrubbed_of_the_rejection_detail(
 
     assert "refresh failed" in caplog.text
     assert "SECRET-SENTINEL" not in caplog.text
+
+
+async def test_refresh_uses_the_username_that_minted_the_refresh_token(fake_aws):
+    """SECRET_HASH is HMAC(client_secret, username + client_id) and
+    pycognito recomputes it on every REFRESH_TOKEN_AUTH call, so the refresh
+    must use the username the stored refresh token was minted under - the
+    documented reason ZephyrTokens carries one. Building Cognito from the
+    constructor argument instead made the field decorative and sent a hash
+    Cognito rejects whenever a consumer rebuilt the object with a
+    differently spelled username while restoring the same tokens."""
+    stored = ZephyrTokens(
+        username="old@example.com",
+        id_token="OLD-ID",
+        refresh_token="REFRESH",
+        identity_id=IDENTITY,
+        expires_at=time.time() - 1,
+    )
+    auth = CredentialsAuth("new@example.com", "pw", MagicMock(), tokens=stored)
+
+    tokens = await auth.async_get_tokens()
+
+    fake_aws["cognito"].renew_access_token.assert_called_once()
+    assert auth_module.Cognito.call_args.kwargs["username"] == "old@example.com"
+    # And the tokens the refresh produced still carry it, so the NEXT
+    # refresh reproduces the same hash instead of drifting back.
+    assert tokens.username == "old@example.com"
+
+
+async def test_srp_minted_tokens_carry_the_constructor_username(fake_aws):
+    """The counterpart: an SRP login authenticates as the username this
+    object was constructed with, so its tokens must record that one, not
+    whatever a discarded stored record happened to hold."""
+    fake_aws["cognito"].renew_access_token.side_effect = _not_authorized()
+    stored = ZephyrTokens(
+        username="old@example.com",
+        id_token="OLD-ID",
+        refresh_token="REFRESH",
+        identity_id=IDENTITY,
+        expires_at=time.time() - 1,
+    )
+    auth = CredentialsAuth("new@example.com", "pw", MagicMock(), tokens=stored)
+
+    tokens = await auth.async_get_tokens()
+
+    fake_aws["cognito"].authenticate.assert_called_once_with(password="pw")
+    assert tokens.username == "new@example.com"
 
 
 async def test_refresh_path_replays_the_stored_identity_without_refetching(fake_aws):

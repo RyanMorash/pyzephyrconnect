@@ -230,6 +230,54 @@ async def test_async_setup_refuses_to_run_twice(wired):
     wired["auth"].async_get_credentials.assert_awaited_once()
 
 
+async def test_setup_with_zero_devices_still_refuses_to_run_twice(wired):
+    """_hoods was the sentinel, so an account with no devices left it empty
+    and a SECOND full setup - credential exchange, discovery and a fresh set
+    of Hood objects sharing the existing supervisor - was permitted."""
+    wired["api"].get_own_devices = AsyncMock(return_value=[])
+    client = _client()
+
+    assert await client.async_setup() == []
+    assert client._setup_complete is True
+
+    with pytest.raises(ZephyrError, match="already run"):
+        await client.async_setup()
+
+
+async def test_a_setup_that_fails_midway_can_be_retried_cleanly(wired):
+    """The other half of the sentinel bug: a failure partway through the
+    discovery loop left _hoods partially filled, which made the client look
+    initialized and its failed setup unretryable forever. The retry must
+    also start from empty - appending to the leftovers would return stale
+    and duplicated hoods."""
+    discover = json.loads((FIXTURES / "discoverdevice.json").read_text())
+    calls = []
+
+    async def discover_device(thing_name):
+        calls.append(thing_name)
+        if thing_name == OTHER and len(calls) == 2:
+            # Fails on the SECOND device of the first attempt only.
+            raise ZephyrError("discoverdevice failed")
+        return {**discover, "thingName": thing_name}
+
+    wired["api"].get_own_devices = AsyncMock(
+        return_value=[{"thingName": THING}, {"thingName": OTHER}]
+    )
+    wired["api"].discover_device = AsyncMock(side_effect=discover_device)
+
+    client = _client()
+    with pytest.raises(ZephyrError):
+        await client.async_setup()
+
+    assert client._setup_complete is False
+    assert len(client._hoods) == 1          # the partial result is there...
+
+    hoods = await client.async_setup()      # ...and must not be retried into
+
+    assert client._setup_complete is True
+    assert [hood.thing_name for hood in hoods] == [THING, OTHER]
+
+
 async def test_setup_performs_the_identity_exchange(wired):
     """Not just tokens: the config-flow ordering "async_setup(), then read
     identity_id for the unique ID" depends on the exchange having run."""
@@ -1036,6 +1084,52 @@ async def test_async_stop_isolates_one_hoods_teardown_failure(wired):
     shadow_b.disconnect.assert_awaited_once()
     assert hoods[0]._should_run is False
     assert hoods[1]._should_run is False
+
+
+async def test_async_stop_tears_down_every_hood_before_honouring_a_cancel(wired):
+    """Shutdown was asymmetric about cancellation: suppress(BaseException)
+    around the supervisor await could swallow a caller's cancel outright,
+    while a cancellation arriving during hood.async_stop() escaped the
+    `except Exception` and stranded every remaining hood - a leaked paho
+    network thread each. Both funnel here now (asyncio re-delivers a
+    swallowed cancel at the next await, which is this loop): each hood is
+    torn down, and only then is the cancellation re-raised so the caller
+    that asked for it still sees it."""
+    first = json.loads((FIXTURES / "discoverdevice.json").read_text())
+    second = json.loads((FIXTURES / "discoverdevice.json").read_text())
+    second["thingName"] = OTHER
+    wired["api"].get_own_devices = AsyncMock(
+        return_value=[{"thingName": THING}, {"thingName": OTHER}]
+    )
+    wired["api"].discover_device = AsyncMock(
+        side_effect=lambda thing: first if thing == THING else second
+    )
+
+    shadow_a = MagicMock()
+    shadow_a.connect = AsyncMock()
+    shadow_a.disconnect = AsyncMock(side_effect=asyncio.CancelledError)
+    shadow_a.request_state = AsyncMock()
+
+    shadow_b = MagicMock()
+    shadow_b.connect = AsyncMock()
+    shadow_b.disconnect = AsyncMock()
+    shadow_b.request_state = AsyncMock()
+
+    client_module.ShadowClient.side_effect = (
+        lambda thing_name, *a, **k: shadow_a if thing_name == THING else shadow_b
+    )
+
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+    await hoods[1].async_start()
+
+    with pytest.raises(asyncio.CancelledError):
+        await client.async_stop()
+
+    shadow_b.disconnect.assert_awaited_once()   # not stranded
+    assert hoods[1]._should_run is False
+    assert client._supervisor is None
 
 
 async def test_async_stop_suppresses_a_supervisor_that_raised(wired):

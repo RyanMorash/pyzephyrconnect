@@ -9,6 +9,7 @@ allowlist structural: only these methods exist.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import Awaitable, Callable
 
@@ -147,7 +148,31 @@ class Hood:
         shadow = self._shadow_factory(self)
         await shadow.connect()
         self._shadow = shadow
-        await shadow.request_state()
+        try:
+            await shadow.request_state()
+        except BaseException:
+            # Without this the hood LOOKS healthy - _shadow set, so
+            # async_ensure_running declines to rebuild and async_start
+            # returns early - while the initial state GET never happened,
+            # so nothing ever populates state and no later tick retries.
+            # Put it back in the no-socket shape the supervisor knows how
+            # to recover from and let the next tick rebuild.
+            #
+            # Cleared before the await, and _connected joins the clear for
+            # the same reasons as _stop: a cancellation landing on the
+            # teardown below must not leave _shadow pointing at a dead
+            # client, and reporting connected=True with no socket misleads
+            # the derived client.connected. BaseException, not Exception,
+            # so a cancellation here tears the client down too - mirrors
+            # ShadowClient.connect's own cleanup.
+            self._shadow = None
+            self._connected = False
+            # Best-effort: the caller needs the ORIGINAL failure, not
+            # whatever the teardown of a half-built client raises on top
+            # of it. The paho thread still has to go either way.
+            with contextlib.suppress(Exception):
+                await shadow.disconnect()
+            raise
 
     async def _stop(self) -> None:
         if self._shadow is not None:
