@@ -604,7 +604,7 @@ git commit -m "feat: distinguish absent from zero in HoodState and HoodCapabilit
 - Consumes: `Endpoints`/`DEFAULT_ENDPOINTS` from Task 3, `ZephyrAuthError`.
 - Produces:
   - `ZephyrTokens(username: str, id_token: str, refresh_token: str, identity_id: str, expires_at: float)`, frozen, with `as_dict() -> dict[str, str | float]`, `from_dict(Mapping) -> ZephyrTokens`, and `expired: bool`.
-  - `AbstractAuth(session, endpoints=DEFAULT_ENDPOINTS)` with abstract `async_get_tokens() -> ZephyrTokens`.
+  - `AbstractAuth(session, endpoints=DEFAULT_ENDPOINTS)` with abstract `async_get_tokens() -> ZephyrTokens` and **concrete** `async_get_credentials()`, `credentials_expired`, `mqtt_client_id`, `async_attach_policy()`, `identity_id` and the `_on_identity_refetched` hook — the complete surface `ZephyrClient` consumes, so a subclass implementing only the abstract method works end to end.
   - Existing `Credentials` dataclass is unchanged.
 
 `ZephyrTokens.username` exists because Cognito's `SECRET_HASH` is `HMAC-SHA256(client_secret, username + client_id)` and pycognito recomputes it from `self.username` on every `REFRESH_TOKEN_AUTH` call. Tokens without a username cannot drive a refresh.
@@ -659,6 +659,40 @@ def test_abstract_auth_cannot_be_instantiated():
     with pytest.raises(TypeError):
         AbstractAuth(session=None)
 ```
+
+Also append to `tests/test_auth.py` (it has the `fake_aws` fixture the
+concrete AWS members need):
+
+```python
+class _StaticAuth(AbstractAuth):
+    """The documented consumer path: implement one method, nothing else."""
+
+    def __init__(self, tokens, session):
+        super().__init__(session)
+        self._static = tokens
+
+    async def async_get_tokens(self):
+        return self._static
+
+
+async def test_a_minimal_subclass_satisfies_the_whole_client_contract(fake_aws):
+    """ZephyrClient consumes async_get_credentials, credentials_expired,
+    mqtt_client_id and async_attach_policy. If any of those live only on
+    CredentialsAuth, a custom AbstractAuth satisfies the type checker and
+    AttributeErrors at runtime - which is exactly the consumer the abstract
+    class exists for."""
+    auth = _StaticAuth(_stored_tokens(3600), MagicMock())
+
+    creds = await auth.async_get_credentials()
+    assert creds.secret_key == "SECRET"
+    assert auth.credentials_expired is False
+    assert auth.mqtt_client_id == f"{IDENTITY}-ha"
+    await auth.async_attach_policy()
+    fake_aws["iot"].attach_policy.assert_called_once()
+```
+
+(`_stored_tokens` is the four-line helper Task 6 adds to this file; if Task 5
+runs first, add it now with `expires_in` defaulting to 3600.)
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -744,11 +778,19 @@ class ZephyrTokens:
 
 
 class AbstractAuth(ABC):
-    """Supplies valid Zephyr cloud tokens.
+    """Supplies valid Zephyr cloud tokens - and everything derived from them.
 
-    Implement this to keep credentials out of the library entirely: the
-    consumer owns storage and refresh policy, and the library only ever
-    asks for a token that works right now.
+    Implement `async_get_tokens()` and nothing else: the identity exchange,
+    the AWS credential cache, the MQTT client ID and the IoT policy attach
+    are all concrete here, built on the one abstract method. That is what
+    makes the class implementable by a consumer - ZephyrClient consumes
+    async_get_credentials, credentials_expired, mqtt_client_id and
+    async_attach_policy, so if those lived only on CredentialsAuth, a custom
+    subclass would satisfy the type checker and AttributeError at runtime.
+
+    Only the ID token crosses the abstract boundary. The AWS credentials
+    derived from it last an hour and are bound to a live socket; nothing
+    about them is worth delegating or persisting.
 
     CredentialsAuth is the built-in implementation for the simple case.
     """
@@ -760,24 +802,186 @@ class AbstractAuth(ABC):
     ) -> None:
         self.session = session
         self.endpoints = endpoints
+        self._credentials: Credentials | None = None
+        # Set when the exchange discovers a stored identity_id is stale.
+        # Runtime authority over tokens.identity_id from that point on.
+        self._identity_override: str | None = None
+        self._seen_tokens: ZephyrTokens | None = None
+        # Serialises the identity exchange - distinct from any lock a
+        # subclass uses for token acquisition.
+        self._aws_lock = asyncio.Lock()
 
     @abstractmethod
     async def async_get_tokens(self) -> ZephyrTokens:
-        """Return valid, unexpired tokens, refreshing if necessary."""
+        """Return valid, unexpired tokens, refreshing if necessary.
+
+        Called on every REST request and by the credential supervisor, so
+        implementations should return a cached value while it is fresh.
+        """
 
     @property
     def identity_id(self) -> str:
-        """Cognito identity ID from the most recent tokens.
+        """Cognito identity ID, the full region-prefixed string.
 
-        Consumers use this as a stable per-account key. Implementations that
-        cache tokens differently should override this; the default reads the
-        `_tokens` attribute an implementation is expected to maintain.
+        Stable per account: the identity pool keys this on the user pool's
+        immutable `sub` claim, so it survives password and email changes and
+        is idempotent across calls - the natural unique key for a consumer
+        that needs to identify this account.
+
+        Available after the first async_get_credentials(), which
+        ZephyrClient.async_setup() performs (and CredentialsAuth also makes
+        it available after async_get_tokens()). Raises ZephyrAuthError
+        before that.
         """
-        tokens = getattr(self, "_tokens", None)
-        if tokens is None:
-            raise ZephyrAuthError("async_get_tokens() has not been called")
-        return tokens.identity_id
+        if self._identity_override is not None:
+            return self._identity_override
+        if self._seen_tokens is None:
+            raise ZephyrAuthError("no tokens acquired yet")
+        return self._seen_tokens.identity_id
+
+    @property
+    def mqtt_client_id(self) -> str:
+        """Identity ID plus a stable suffix.
+
+        The IoT policy pins the client ID to the identity. Using the bare
+        identity ID makes this library and the phone app evict each other.
+        Derived from identity_id, never the other way around.
+        """
+        return f"{self.identity_id}{const.CLIENT_ID_SUFFIX}"
+
+    @property
+    def credentials_expired(self) -> bool:
+        """True when the cached AWS credentials need renewing.
+
+        A plain property on purpose. The supervisor must be able to ask "do
+        these need replacing?" without async_get_credentials() renewing them
+        as a side effect, which would make the answer always False and the
+        socket never get rebuilt.
+        """
+        return self._credentials is None or self._credentials.expired
+
+    async def async_get_credentials(self) -> Credentials:
+        """AWS credentials for SigV4-presigning the MQTT WebSocket URL.
+
+        Derived from the ID token rather than persisted: they last an hour
+        and are bound to a live socket, so there is nothing worth storing.
+        """
+        tokens = await self.async_get_tokens()
+        self._seen_tokens = tokens
+        if not self.credentials_expired:
+            assert self._credentials is not None
+            return self._credentials
+        async with self._aws_lock:
+            if not self.credentials_expired:
+                assert self._credentials is not None
+                return self._credentials
+            stored_identity = self._identity_override or tokens.identity_id
+            identity_id, credentials = await asyncio.to_thread(
+                self._exchange, tokens.id_token, stored_identity
+            )
+            if identity_id != stored_identity:
+                # The stored identity was stale and _exchange refetched it.
+                # This MUST take effect: mqtt_client_id derives from it, and
+                # a client ID built on a dead identity gets a connection
+                # where subscribe and publish succeed and every message is
+                # silently dropped (PROTOCOL.md section 3.3).
+                self._identity_override = identity_id
+                self._on_identity_refetched(identity_id)
+            self._credentials = credentials
+            return self._credentials
+
+    async def async_attach_policy(self) -> None:
+        """Bind the IoT policy to this identity.
+
+        MUST run before connecting. An open MQTT connection does not pick up
+        newly attached permissions.
+        """
+        credentials = await self.async_get_credentials()
+        await asyncio.to_thread(self._attach, self.identity_id, credentials)
+
+    def _on_identity_refetched(self, identity_id: str) -> None:
+        """Hook: a stored identity_id was stale and has been replaced.
+
+        Default no-op. CredentialsAuth overrides it to write the corrected
+        value back into its persisted tokens.
+        """
+
+    # -- blocking bodies, run in a worker thread ----------------------
+
+    def _identity_client(self):
+        return boto3.client(
+            "cognito-identity",
+            region_name=self.endpoints.region,
+            config=Config(signature_version=UNSIGNED),
+        )
+
+    def _exchange(
+        self, id_token: str, identity_id: str | None
+    ) -> tuple[str, Credentials]:
+        """Trade an ID token for AWS credentials.
+
+        A persisted identity_id is replayed when we have one, but it can be
+        stale - and unlike an in-memory value, a bad one survives restarts.
+        On failure it is discarded and refetched once before giving up.
+        """
+        client = self._identity_client()
+        logins = {self.endpoints.provider: id_token}
+
+        def fetch(iid: str | None) -> tuple[str, dict]:
+            resolved = iid or client.get_id(
+                IdentityPoolId=self.endpoints.identity_pool, Logins=logins
+            )["IdentityId"]
+            raw = client.get_credentials_for_identity(
+                IdentityId=resolved, Logins=logins
+            )["Credentials"]
+            return resolved, raw
+
+        try:
+            resolved, raw = fetch(identity_id)
+        except Exception:
+            if identity_id is None:
+                raise
+            _LOGGER.debug("stored identity ID rejected; refetching")
+            resolved, raw = fetch(None)
+
+        return resolved, Credentials(
+            access_key=raw["AccessKeyId"],
+            # "SecretKey", not "SecretAccessKey" - differs from STS.
+            secret_key=raw["SecretKey"],
+            session_token=raw["SessionToken"],
+            expiration=raw["Expiration"],
+        )
+
+    def _attach(self, identity_id: str, creds: Credentials) -> None:
+        client = boto3.client(
+            "iot",
+            region_name=self.endpoints.region,
+            aws_access_key_id=creds.access_key,
+            aws_secret_access_key=creds.secret_key,
+            aws_session_token=creds.session_token,
+        )
+        try:
+            attached = client.list_attached_policies(target=identity_id)
+            names = [p["policyName"] for p in attached.get("policies", [])]
+            if const.POLICY_NAME in names:
+                return
+        except Exception:  # noqa: BLE001 - listing is best-effort
+            _LOGGER.debug("list_attached_policies failed; attaching anyway")
+
+        try:
+            client.attach_policy(
+                policyName=const.POLICY_NAME, target=identity_id
+            )
+        except Exception as err:  # noqa: BLE001
+            raise ZephyrPolicyError(
+                f"Could not attach {const.POLICY_NAME} to {identity_id}. "
+                "Without it the MQTT connection succeeds but every message is "
+                "silently dropped."
+            ) from err
 ```
+
+Everything `ZephyrClient` consumes now exists on the base class, implemented
+in terms of the one method a subclass writes.
 
 Export `AbstractAuth` and `ZephyrTokens` from `src/pyzephyrconnect/__init__.py`.
 
@@ -803,7 +1007,7 @@ git commit -m "feat: add ZephyrTokens and the AbstractAuth surface"
 
 **Interfaces:**
 - Consumes: `ZephyrTokens`, `AbstractAuth`, `Endpoints`, `Credentials`.
-- Produces: `CredentialsAuth(username, password, session, *, tokens=None, token_updater=None, endpoints=DEFAULT_ENDPOINTS)` implementing `async_get_tokens()`, plus `async_get_credentials() -> Credentials`, `async_attach_policy() -> None`, and the `mqtt_client_id` property. `ZephyrAuth` is deleted and replaced by this class.
+- Produces: `CredentialsAuth(username, password, session, *, tokens=None, token_updater=None, endpoints=DEFAULT_ENDPOINTS)` implementing `async_get_tokens()` and overriding the `_on_identity_refetched` hook to persist a corrected identity. `async_get_credentials()`, `async_attach_policy()`, `credentials_expired` and `mqtt_client_id` are **inherited from AbstractAuth** (Task 5), not defined here. `ZephyrAuth` is deleted and replaced by this class.
 
 Behaviour contract:
 
@@ -1003,40 +1207,27 @@ class CredentialsAuth(AbstractAuth):
         self._tokens = tokens
         self._token_updater = token_updater
         self._user: Cognito | None = None
-        self._credentials: Credentials | None = None
-        # Serialises refresh. Without it, concurrent callers each run a full
-        # SRP login against a pool that rate-limits (PROTOCOL.md section 3.1),
-        # and ZephyrApi asks for tokens on every single request.
+        # Restored tokens make identity_id readable immediately.
+        self._seen_tokens = tokens
+        # Serialises token acquisition. Without it, concurrent callers each
+        # run a full SRP login against a pool that rate-limits (PROTOCOL.md
+        # section 3.1), and ZephyrApi asks for tokens on every request.
+        # Distinct from the inherited _aws_lock guarding the exchange.
         self._lock = asyncio.Lock()
 
-    @property
-    def identity_id(self) -> str:
-        """Cognito identity ID, the full "us-west-2:uuid" string.
+    def _on_identity_refetched(self, identity_id: str) -> None:
+        """Persist a corrected identity into the stored tokens.
 
-        Stable per account: the identity pool keys this on the user pool's
-        immutable `sub` claim, so it survives password and email changes and
-        is idempotent across calls. That makes it the natural unique key for
-        a consumer that needs to identify this account - for example a Home
-        Assistant config entry's unique ID.
-
-        Raises ZephyrAuthError if async_get_tokens() has not run yet.
+        The base class already routes mqtt_client_id through its override;
+        this makes the correction survive a restart instead of being
+        rediscovered by a failed exchange every time.
         """
-        if self._tokens is None:
-            raise ZephyrAuthError("async_get_tokens() has not been called")
-        return self._tokens.identity_id
+        if self._tokens is not None:
+            self._tokens = replace(self._tokens, identity_id=identity_id)
+            if self._token_updater is not None:
+                self._token_updater(self._tokens)
 
-    @property
-    def mqtt_client_id(self) -> str:
-        """Identity ID plus a stable suffix.
-
-        The IoT policy pins the client ID to the identity. Using the bare
-        identity ID makes this library and the phone app evict each other.
-
-        Derived from identity_id, never the other way around.
-        """
-        return f"{self.identity_id}{const.CLIENT_ID_SUFFIX}"
-
-    # -- blocking bodies, run in a worker thread ----------------------
+    # -- blocking bodies, run in a worker thread ----------------------    # -- blocking bodies, run in a worker thread ----------------------
 
     def _cognito(self, *, refresh_token: str | None = None) -> Cognito:
         return Cognito(
@@ -1060,78 +1251,12 @@ class CredentialsAuth(AbstractAuth):
         user.renew_access_token()
         return user
 
-    def _identity_client(self):
-        return boto3.client(
-            "cognito-identity",
-            region_name=self.endpoints.region,
-            config=Config(signature_version=UNSIGNED),
-        )
+    # _identity_client, _exchange and _attach are inherited from
+    # AbstractAuth: they operate on tokens and endpoints, nothing
+    # Cognito-login-specific, and hoisting them is what makes AbstractAuth
+    # implementable by consumers.
 
-    def _exchange(
-        self, id_token: str, identity_id: str | None
-    ) -> tuple[str, Credentials]:
-        """Trade an ID token for AWS credentials.
-
-        A persisted identity_id is replayed when we have one, but it can be
-        stale - and unlike an in-memory value, a bad one survives restarts.
-        On failure it is discarded and refetched once before giving up.
-        """
-        client = self._identity_client()
-        logins = {self.endpoints.provider: id_token}
-
-        def fetch(iid: str | None) -> tuple[str, dict]:
-            resolved = iid or client.get_id(
-                IdentityPoolId=self.endpoints.identity_pool, Logins=logins
-            )["IdentityId"]
-            raw = client.get_credentials_for_identity(
-                IdentityId=resolved, Logins=logins
-            )["Credentials"]
-            return resolved, raw
-
-        try:
-            resolved, raw = fetch(identity_id)
-        except Exception:
-            if identity_id is None:
-                raise
-            _LOGGER.debug("stored identity ID rejected; refetching")
-            resolved, raw = fetch(None)
-
-        return resolved, Credentials(
-            access_key=raw["AccessKeyId"],
-            # "SecretKey", not "SecretAccessKey" - differs from STS.
-            secret_key=raw["SecretKey"],
-            session_token=raw["SessionToken"],
-            expiration=raw["Expiration"],
-        )
-
-    def _attach(self, identity_id: str, creds: Credentials) -> None:
-        client = boto3.client(
-            "iot",
-            region_name=self.endpoints.region,
-            aws_access_key_id=creds.access_key,
-            aws_secret_access_key=creds.secret_key,
-            aws_session_token=creds.session_token,
-        )
-        try:
-            attached = client.list_attached_policies(target=identity_id)
-            names = [p["policyName"] for p in attached.get("policies", [])]
-            if const.POLICY_NAME in names:
-                return
-        except Exception:  # noqa: BLE001 - listing is best-effort
-            _LOGGER.debug("list_attached_policies failed; attaching anyway")
-
-        try:
-            client.attach_policy(
-                policyName=const.POLICY_NAME, target=identity_id
-            )
-        except Exception as err:  # noqa: BLE001
-            raise ZephyrPolicyError(
-                f"Could not attach {const.POLICY_NAME} to {identity_id}. "
-                "Without it the MQTT connection succeeds but every message is "
-                "silently dropped."
-            ) from err
-
-    # -- async surface -------------------------------------------------
+    # -- async surface -------------------------------------------------    # -- async surface -------------------------------------------------
 
     async def async_get_tokens(self) -> ZephyrTokens:
         if self._tokens is not None and not self._tokens.expired:
@@ -1185,62 +1310,14 @@ class CredentialsAuth(AbstractAuth):
             identity_id=identity_id,
             expires_at=credentials.expiration.timestamp(),
         )
+        self._seen_tokens = self._tokens
         if self._token_updater is not None:
             self._token_updater(self._tokens)
         return self._tokens
 
-    async def async_get_credentials(self) -> Credentials:
-        """AWS credentials for SigV4-presigning the MQTT WebSocket URL.
-
-        Derived from the ID token rather than persisted: they last an hour
-        and are bound to a live socket, so there is nothing worth storing.
-        """
-        await self.async_get_tokens()
-        if not self.credentials_expired:
-            assert self._credentials is not None
-            return self._credentials
-        async with self._lock:
-            if not self.credentials_expired:
-                assert self._credentials is not None
-                return self._credentials
-            tokens = self._tokens
-            assert tokens is not None
-            identity_id, credentials = await asyncio.to_thread(
-                self._exchange, tokens.id_token, tokens.identity_id
-            )
-            if identity_id != tokens.identity_id:
-                # The stored identity was stale and _exchange refetched it.
-                # This MUST be written back: mqtt_client_id is derived from
-                # it, and an MQTT client ID built on a dead identity gets a
-                # connection where subscribe and publish succeed and every
-                # message is silently dropped (PROTOCOL.md section 3.3).
-                self._tokens = replace(tokens, identity_id=identity_id)
-                if self._token_updater is not None:
-                    self._token_updater(self._tokens)
-            self._credentials = credentials
-            return self._credentials
-
-    @property
-    def credentials_expired(self) -> bool:
-        """True when the cached AWS credentials need renewing.
-
-        A plain property on purpose. The supervisor must be able to ask "do
-        these need replacing?" without async_get_credentials() renewing them
-        as a side effect, which would make the answer always False and the
-        socket never get rebuilt.
-        """
-        return self._credentials is None or self._credentials.expired
-
-    async def async_attach_policy(self) -> None:
-        """Bind the IoT policy to this identity.
-
-        MUST run before connecting. An open MQTT connection does not pick up
-        newly attached permissions.
-        """
-        tokens = await self.async_get_tokens()
-        credentials = await self.async_get_credentials()
-        await asyncio.to_thread(self._attach, tokens.identity_id, credentials)
 ```
+
+Add `from collections.abc import Callable````
 
 Add `from collections.abc import Callable`, `from dataclasses import replace` and `import asyncio` to the imports. Delete the old `ZephyrAuth` class entirely.
 
@@ -1811,6 +1888,16 @@ async def test_starting_twice_does_not_orphan_a_client():
     assert len(made) == 1
 
 
+async def test_reconnect_does_not_start_a_hood_that_was_never_started():
+    """The supervisor reconnects every hood it knows about. Discovering two
+    hoods and starting one must not mean the other quietly comes up on the
+    next credential refresh."""
+    hood, shadow = _hood()
+    await hood.async_reconnect()
+
+    shadow.connect.assert_not_awaited()
+
+
 async def test_a_write_during_a_reconnect_waits_rather_than_failing():
     """The supervisor rebuilds the socket about every 50 minutes. A write
     landing in that window is not a disconnected hood, and must not surface
@@ -1953,6 +2040,11 @@ class Hood:
         waits rather than failing with a spurious ZephyrNotConnectedError.
         """
         async with self._lock:
+            if self._shadow is None:
+                # Never started, or deliberately stopped. The supervisor
+                # calls this for every hood on the account; it must not
+                # bring up MQTT for hoods the consumer chose not to start.
+                return
             await self._stop()
             await self._start()
 
@@ -2387,7 +2479,12 @@ class ZephyrClient:
 
     async def async_setup(self) -> list[Hood]:
         """Authenticate and discover every hood on the account."""
-        await self._auth.async_get_tokens()
+        # The full chain, not just tokens: this performs the identity
+        # exchange, which is what makes auth.identity_id readable - the
+        # config-flow ordering "async_setup(), then read identity_id for
+        # the unique ID" depends on it. Also exactly what the pre-refactor
+        # authenticate() verified at setup.
+        await self._auth.async_get_credentials()
         devices = await self._api.get_own_devices()
         for device in devices:
             if not (thing_name := device.get("thingName")):
@@ -2532,6 +2629,7 @@ The supervisor:
         # Renews the Cognito tokens and re-exchanges for AWS credentials.
         await self._auth.async_get_credentials()
         for hood in self._hoods.values():
+            # No-ops for never-started hoods - the guard is in Hood.
             await hood.async_reconnect()
         return True
 ```
@@ -2549,6 +2647,11 @@ to `client.py`.
   until the supervisor rebuilds it. Noisy but self-correcting, and worth
   keeping: for an ordinary network drop the URL is still valid and paho's
   reconnect is the faster fix.
+- **A REST 403 raises rather than forcing a refresh and retrying once.**
+  `async_get_tokens()` already refreshes inside a 10-minute margin, so a 403
+  means the token was genuinely rejected (revocation, or a vendor-side
+  change), which retrying cannot fix. If server-side clock skew ever shows
+  up in practice, add a single forced-refresh retry in `ZephyrApi._post`.
 - **`expires_at` uses the AWS credential expiry as the token expiry.** Both
   are one hour from the same exchange so they track, but that is an
   assumption. If they ever diverge, read the `exp` claim from the ID token
@@ -2732,6 +2835,6 @@ The release workflow verifies the tag against `pyproject.toml` and `__init__.py`
 
 **Amendment against the spec:** the spec says `async_set_state` is removed outright. Task 9 keeps one raw entry point, `Hood.async_set_fields`, because the probe CLI writes arbitrary allowlisted fields to map unknown semantics and a fixed method surface cannot express that. It is allowlist-enforcing and is the chokepoint every typed method delegates through, so the spec's intent — no caller can write a non-writable field — holds.
 
-**Type consistency:** `Hood.async_set_fields` is used by Tasks 9 and 11. `Hood.handle_state` is used by Tasks 9 and 10. `CredentialsAuth.async_get_credentials` is used by Tasks 6, 8 and 10. `Endpoints.device_api_list` / `.device_api_discover` are used by Tasks 3 and 7. `ZephyrTokens.expired` is used by Tasks 5 and 6.
+**Type consistency:** `Hood.async_set_fields` is used by Tasks 9 and 11. `Hood.handle_state` is used by Tasks 9 and 10. `AbstractAuth.async_get_credentials` is defined in Task 5 and consumed by Tasks 8 and 10; `CredentialsAuth` (Task 6) inherits it. `Endpoints.device_api_list` / `.device_api_discover` are used by Tasks 3 and 7. `ZephyrTokens.expired` is used by Tasks 5 and 6.
 
 **Ordering:** Tasks 1–4 are independent of each other. Task 4 leaves `tests/test_client.py` failing; Task 10 fixes it. Tasks 5→6→7→8→9→10 are strictly sequential.

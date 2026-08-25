@@ -86,7 +86,18 @@ class ZephyrTokens:
 
 
 class AbstractAuth(ABC):
-    """Abstract class to supply valid Zephyr cloud tokens."""
+    """Abstract class to supply valid Zephyr cloud tokens.
+
+    One abstract method. Everything else ZephyrClient consumes -
+    async_get_credentials(), credentials_expired, mqtt_client_id,
+    async_attach_policy(), identity_id - is CONCRETE on this class,
+    implemented in terms of async_get_tokens(). The identity exchange,
+    the AWS credential cache and the policy attach are library concerns
+    that operate on tokens and endpoints; leaving them to implementations
+    would make the abstract contract a lie: a custom subclass would
+    satisfy the type checker and AttributeError the moment the client
+    touched MQTT.
+    """
 
     def __init__(self, session: aiohttp.ClientSession,
                  endpoints: Endpoints = DEFAULT_ENDPOINTS) -> None: ...
@@ -94,6 +105,12 @@ class AbstractAuth(ABC):
     @abstractmethod
     async def async_get_tokens(self) -> ZephyrTokens:
         """Return valid, unexpired tokens, refreshing if necessary."""
+
+    # Concrete, built on async_get_tokens():
+    #   async_get_credentials() / credentials_expired
+    #   mqtt_client_id / identity_id
+    #   async_attach_policy()
+    #   _on_identity_refetched(id)  - hook; CredentialsAuth persists
 
 
 class CredentialsAuth(AbstractAuth):
@@ -149,8 +166,10 @@ A persisted `identity_id` that is stale or wrong makes
 discarded, `get_id` is called again, and the exchange is retried once. Only a
 second failure raises `ZephyrAuthError`.
 
-A refetched identity is written back into the stored tokens and pushed to
-`token_updater`. `mqtt_client_id` derives from it, so keeping the dead value
+A refetched identity is cached as an override on `AbstractAuth` (so every
+implementation benefits) and surfaced through the `_on_identity_refetched`
+hook, which `CredentialsAuth` overrides to write it back into the stored
+tokens and push to `token_updater`. `mqtt_client_id` derives from it, so keeping the dead value
 would pin the MQTT client ID to an identity the IoT policy does not cover —
 the silent-drop failure, arrived at from the recovery path meant to prevent it.
 
@@ -296,7 +315,9 @@ Lifecycle and writes share a per-hood `asyncio.Lock`. The supervisor's rebuild
 briefly has no socket, and a write landing in that window is not a
 disconnected hood; it waits rather than raising. `async_start()` is idempotent
 under the same lock, since overwriting a live `ShadowClient` orphans a paho
-network thread.
+network thread. `async_reconnect()` no-ops on a hood with no socket: the
+supervisor calls it for every hood on the account, and it must not bring up
+MQTT for hoods the consumer chose not to start.
 
 The IoT policy is attached through a `prepare` callable each `Hood` runs
 before its first connect, latched once per client. It cannot live in
@@ -306,6 +327,12 @@ without it every message is silently dropped.
 
 `connected` is per-hood, derived rather than latched on the client. A single
 flag reported whichever shadow changed state last.
+
+`ZephyrClient.async_setup()` calls `async_get_credentials()`, not just
+`async_get_tokens()`: the identity exchange is what makes `identity_id`
+readable, and the consumer ordering "setup, then read `identity_id` as the
+account's unique key" depends on it. This matches what the pre-refactor
+`authenticate()` verified at setup.
 
 `ZephyrClient.async_setup()` returns `list[Hood]` instead of
 `list[HoodCapabilities]`. `ZephyrClient.async_set_state`,
@@ -450,6 +477,14 @@ respect.
 11. **The MQTT path uses plain system trust, not the TWCA bundle.** The IoT
     ATS endpoint chains to Amazon Root CA 1. Only the vendor REST host needs
     the supplementary anchors.
-12. **Endpoint overrides do not weaken TLS.** The TWCA certificates are
+12. **The abstract contract must cover everything the client consumes.**
+    Found on the fourth review pass: `ZephyrClient` consumed four members
+    (`async_get_credentials`, `credentials_expired`, `mqtt_client_id`,
+    `async_attach_policy`) that existed only on `CredentialsAuth`, so the
+    documented subclass-`AbstractAuth` path failed at runtime. The AWS half
+    is now concrete on the base class. The regression test is a minimal
+    subclass implementing only `async_get_tokens()` driven through the
+    whole credential/policy path.
+13. **Endpoint overrides do not weaken TLS.** The TWCA certificates are
     supplementary anchors on top of the system store, so a redirected host
     verifies against normal system trust. `verify_mode` stays `CERT_REQUIRED`.
