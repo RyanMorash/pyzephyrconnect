@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from pyzephyrconnect.exceptions import ZephyrDataError
 from pyzephyrconnect.models import HoodCapabilities, HoodState
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -43,7 +44,7 @@ def test_capabilities_tolerate_a_missing_optional_field(discover):
     del discover["maxCharcoalfilterTimer"]
     caps = HoodCapabilities.from_discover(discover)
     assert caps.supports_tru_hue is False
-    assert caps.max_charcoal_filter_hours == 0
+    assert caps.max_charcoal_filter_hours is None
 
 
 def test_state_parses_reported_block(shadow):
@@ -82,7 +83,7 @@ def test_state_logs_a_warning_on_malformed_int_field(shadow, caplog):
     reported["alarmfaultcode"] = "not-a-number"
     with caplog.at_level("WARNING"):
         state = HoodState.from_reported(reported)
-    assert state.alarm_fault_code == 0
+    assert state.alarm_fault_code is None
     warnings = [r for r in caplog.records if r.levelname == "WARNING"]
     assert len(warnings) == 1
     assert "alarmfaultcode" in warnings[0].message
@@ -112,3 +113,49 @@ def test_state_merge_works_with_read_only_raw(shadow):
     assert merged.fan == 5
     assert merged.use_grease_filter_time == 642, "unchanged keys must survive"
     assert merged.raw["fan"] == 5
+
+
+def test_absent_state_fields_are_none_not_zero():
+    """A missing alarm must not read as 'no alarm', and a missing power must
+    not read as 'off'. Those are different facts and the consumer decides."""
+    state = HoodState.from_reported({})
+    assert state.power is None
+    assert state.alarm_fault_code is None
+    assert state.is_online is None
+    assert state.fault_codes is None
+
+
+def test_absent_usage_counters_stay_zero():
+    """Zero is the genuine starting value for a new filter, and the
+    filter-life percentage needs a number."""
+    state = HoodState.from_reported({})
+    assert state.use_fan_time == 0
+    assert state.use_grease_filter_time == 0
+
+
+def test_malformed_state_field_degrades_to_none_and_warns(caplog):
+    """State arrives continuously; one bad payload must not crash the
+    integration, but it must not read as a valid zero either."""
+    state = HoodState.from_reported({"power": "nonsense"})
+    assert state.power is None
+    assert "power" in caplog.text
+
+
+def test_present_zero_is_preserved(shadow):
+    state = HoodState.from_reported(shadow["state"]["reported"])
+    assert state.power == 0 or state.power is not None
+
+
+def test_capabilities_absent_numeric_is_none_not_zero():
+    """Entity creation is gated on capabilities, so a hood that omits a key
+    must set up without that feature - not fail setup."""
+    caps = HoodCapabilities.from_discover({"thingName": "t"})
+    assert caps.max_fan_speed is None
+    assert caps.max_charcoal_filter_hours is None
+
+
+def test_capabilities_malformed_numeric_raises():
+    """Present-but-garbage is a real error: it runs once at setup, so it
+    should fail loudly rather than produce a wrong capability set."""
+    with pytest.raises(ZephyrDataError):
+        HoodCapabilities.from_discover({"maxFanSpeed": "six"})
