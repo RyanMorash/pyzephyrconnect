@@ -52,15 +52,13 @@ def _auth_double(endpoints=DEFAULT_ENDPOINTS, order=None):
     auth.endpoints = endpoints
     auth.identity_id = "us-west-2:abc"
     auth.mqtt_client_id = "us-west-2:abc-ha"
-    auth.credentials_expired = False          # explicit bool, never a Mock
+    auth.credentials_expired = False  # explicit bool, never a Mock
     # Explicit int for the same reason: the supervisor compares this against
     # each hood's recorded generation, and a bare Mock attribute compares
     # unequal to everything - every tick would then look like a stale socket.
     auth.credentials_generation = 0
     auth.async_get_tokens = AsyncMock()
-    credentials = Credentials(
-        "k", "s", "t", datetime.now(UTC) + timedelta(hours=1)
-    )
+    credentials = Credentials("k", "s", "t", datetime.now(UTC) + timedelta(hours=1))
 
     def _exchange():
         """Bump the generation and return the cached credentials."""
@@ -276,9 +274,7 @@ async def test_a_malformed_device_entry_is_skipped_not_crashed(wired, caplog):
     A non-dict element in the devices list (e.g. None) must not reach
     device.get("thingName") and raise AttributeError.
     """
-    wired["api"].get_own_devices = AsyncMock(
-        return_value=[None, {"thingName": THING}]
-    )
+    wired["api"].get_own_devices = AsyncMock(return_value=[None, {"thingName": THING}])
     with caplog.at_level(logging.WARNING):
         hoods = await _client().async_setup()
     assert len(hoods) == 1
@@ -448,9 +444,9 @@ async def test_a_setup_that_fails_midway_can_be_retried_cleanly(wired):
         await client.async_setup()
 
     assert client._setup_complete is False
-    assert len(client._hoods) == 1          # the partial result is there...
+    assert len(client._hoods) == 1  # the partial result is there...
 
-    hoods = await client.async_setup()      # ...and must not be retried into
+    hoods = await client.async_setup()  # ...and must not be retried into
 
     assert client._setup_complete is True
     assert [hood.thing_name for hood in hoods] == [THING, OTHER]
@@ -491,7 +487,7 @@ async def test_a_retried_setup_returns_only_what_the_retry_discovered(wired):
     with pytest.raises(ZephyrError):
         await client.async_setup()
 
-    assert [thing for thing in client._hoods] == [THING]   # the leftover
+    assert [thing for thing in client._hoods] == [THING]  # the leftover
 
     hoods = await client.async_setup()
 
@@ -858,9 +854,7 @@ async def test_the_shadow_gets_the_credentials_provider_not_a_credential(wired):
     creds = await provider()
     assert isinstance(creds, Credentials)
     wired["auth"].async_get_credentials.assert_awaited()
-    assert (
-        hoods[0]._presigned_generation == wired["auth"].credentials_generation
-    )
+    assert hoods[0]._presigned_generation == wired["auth"].credentials_generation
 
 
 async def test_the_recorded_generation_belongs_to_the_credentials_used(wired):
@@ -875,9 +869,7 @@ async def test_the_recorded_generation_belongs_to_the_credentials_used(wired):
     expire - the reverse direction of the bug the generation counter was
     added for.
     """
-    creds = Credentials(
-        "pinned", "s", "t", datetime.now(UTC) + timedelta(hours=1)
-    )
+    creds = Credentials("pinned", "s", "t", datetime.now(UTC) + timedelta(hours=1))
     used = []
 
     async def presign_pair():
@@ -888,9 +880,7 @@ async def test_the_recorded_generation_belongs_to_the_credentials_used(wired):
         wired["auth"].credentials_generation = 9
         return creds, 4
 
-    wired["auth"].async_get_presign_credentials = AsyncMock(
-        side_effect=presign_pair
-    )
+    wired["auth"].async_get_presign_credentials = AsyncMock(side_effect=presign_pair)
 
     async def connect(*args, **kwargs):
         """Call the wired provider and record the credentials it returns."""
@@ -992,11 +982,13 @@ async def test_get_accepted_replaces_and_update_accepted_merges(wired):
     await hoods[0].async_start()
 
     client._handle_message(
-        hoods[0], f"$aws/things/{THING}/shadow/get/accepted",
+        hoods[0],
+        f"$aws/things/{THING}/shadow/get/accepted",
         {"state": {"reported": {"power": 1, "fan": 3}}},
     )
     client._handle_message(
-        hoods[0], f"$aws/things/{THING}/shadow/update/accepted",
+        hoods[0],
+        f"$aws/things/{THING}/shadow/update/accepted",
         {"state": {"reported": {"fan": 5}}},
     )
 
@@ -1013,14 +1005,16 @@ async def test_update_accepted_keeps_counters_it_did_not_mention(wired):
     client = _client()
     hoods = await client.async_setup()
     client._handle_message(
-        hoods[0], f"$aws/things/{THING}/shadow/get/accepted",
+        hoods[0],
+        f"$aws/things/{THING}/shadow/get/accepted",
         {"state": {"reported": {"fan": 0, "light": 0, "usegreasefiltertime": 642}}},
     )
 
     seen = []
     hoods[0].add_listener(seen.append)
     client._handle_message(
-        hoods[0], f"$aws/things/{THING}/shadow/update/accepted",
+        hoods[0],
+        f"$aws/things/{THING}/shadow/update/accepted",
         {"state": {"reported": {"light": 1, "power": 1}}, "version": 302691},
     )
 
@@ -1040,11 +1034,13 @@ async def test_update_delta_is_ignored(wired):
     hoods = await client.async_setup()
     await hoods[0].async_start()
     client._handle_message(
-        hoods[0], f"$aws/things/{THING}/shadow/get/accepted",
+        hoods[0],
+        f"$aws/things/{THING}/shadow/get/accepted",
         {"state": {"reported": {"fan": 1}}},
     )
     client._handle_message(
-        hoods[0], f"$aws/things/{THING}/shadow/update/delta",
+        hoods[0],
+        f"$aws/things/{THING}/shadow/update/delta",
         {"state": {"fan": 6}},
     )
 
@@ -1062,7 +1058,8 @@ async def test_a_delta_notifies_nobody_and_logs_no_identifier(wired, caplog):
     client = _client()
     hoods = await client.async_setup()
     client._handle_message(
-        hoods[0], f"$aws/things/{THING}/shadow/get/accepted",
+        hoods[0],
+        f"$aws/things/{THING}/shadow/get/accepted",
         {"state": {"reported": {"fan": 0, "light": 0}}},
     )
     before = hoods[0].state
@@ -1071,7 +1068,8 @@ async def test_a_delta_notifies_nobody_and_logs_no_identifier(wired, caplog):
     hoods[0].add_listener(seen.append)
     with caplog.at_level(logging.DEBUG, logger="pyzephyrconnect.client"):
         client._handle_message(
-            hoods[0], f"$aws/things/{THING}/shadow/update/delta",
+            hoods[0],
+            f"$aws/things/{THING}/shadow/update/delta",
             {"state": {"light": 1, "power": 1}, "version": 302688},
         )
 
@@ -1120,7 +1118,8 @@ async def test_a_rejection_never_logs_the_payload(wired, caplog):
 
     with caplog.at_level(logging.WARNING, logger="pyzephyrconnect.client"):
         client._handle_message(
-            hoods[0], f"$aws/things/{THING}/shadow/update/rejected",
+            hoods[0],
+            f"$aws/things/{THING}/shadow/update/rejected",
             {"message": "rejected", "location": "40.0,-105.0"},
         )
 
@@ -1181,7 +1180,8 @@ async def test_a_malformed_message_does_not_escape_onto_the_loop(wired, caplog):
 
     with caplog.at_level(logging.ERROR, logger="pyzephyrconnect.client"):
         client._handle_message(
-            hoods[0], f"$aws/things/{THING}/shadow/get/accepted",
+            hoods[0],
+            f"$aws/things/{THING}/shadow/get/accepted",
             {"state": {"reported": {"fan": 1}}},
         )
 
@@ -1245,11 +1245,11 @@ async def test_refresh_does_not_ask_a_method_that_renews_as_a_side_effect(wired)
 
     wired["auth"].credentials_expired = False
     assert await client._refresh_once() is False
-    assert wired["shadow"].connect.await_count == 1      # no rebuild
+    assert wired["shadow"].connect.await_count == 1  # no rebuild
 
     wired["auth"].credentials_expired = True
     assert await client._refresh_once() is True
-    assert wired["shadow"].connect.await_count == 2      # rebuilt
+    assert wired["shadow"].connect.await_count == 2  # rebuilt
 
 
 async def test_a_rest_driven_refresh_still_rebuilds_the_socket(wired):
@@ -1306,9 +1306,9 @@ async def test_a_hood_started_after_the_refresh_is_not_rebuilt(wired):
 
     client = _client()
     hoods = await client.async_setup()
-    await hoods[0].async_start()             # presigned under generation N
+    await hoods[0].async_start()  # presigned under generation N
     wired["auth"].credentials_generation += 1
-    await hoods[1].async_start()             # presigns under the new one
+    await hoods[1].async_start()  # presigns under the new one
 
     reconnected: list[str] = []
 
@@ -1336,7 +1336,7 @@ async def test_a_generation_mismatch_does_not_start_a_hood_that_never_ran(wired)
     the decision does not depend on a no-op deeper down.
     """
     client = _client()
-    hoods = await client.async_setup()        # discovered, never started
+    hoods = await client.async_setup()  # discovered, never started
     wired["auth"].credentials_generation += 1
 
     assert hoods[0].needs_represign(wired["auth"].credentials_generation) is False
@@ -1445,10 +1445,10 @@ async def test_a_transient_failure_does_not_end_supervision(wired):
         return False
 
     client._refresh_once = flaky
-    monkeypatch_interval(client, 0)          # see helper in this module
+    monkeypatch_interval(client, 0)  # see helper in this module
     await _run_supervisor_ticks(client, 2)
 
-    assert len(calls) == 2                   # kept going after the OSError
+    assert len(calls) == 2  # kept going after the OSError
 
 
 async def test_supervisor_stops_on_a_policy_error(wired):
@@ -1590,7 +1590,7 @@ async def test_a_supervisor_with_nothing_to_supervise_retires_and_re_arms(wired)
         await asyncio.sleep(0)
 
     assert supervisor.done()
-    assert supervisor.exception() is None       # retired, did not crash
+    assert supervisor.exception() is None  # retired, did not crash
 
     # Re-armed by the next start: _ensure_supervisor counts a DONE task as
     # not running, so nothing has to remember to restart it.
@@ -1617,7 +1617,7 @@ async def test_stopping_the_last_hood_retires_the_supervisor_too(wired):
     assert supervisor is not None
     for _ in range(3):
         await asyncio.sleep(0)
-    assert not supervisor.done()                # still wanted
+    assert not supervisor.done()  # still wanted
 
     await hoods[0].async_stop()
     for _ in range(5):
@@ -1643,7 +1643,7 @@ async def test_a_socketless_wanted_hood_recovers_instead_of_reconnecting(wired):
     client = _client()
     hoods = await client.async_setup()
     await hoods[0].async_start()
-    await hoods[0]._stop_for_supervisor()       # intent survives, socket gone
+    await hoods[0]._stop_for_supervisor()  # intent survives, socket gone
 
     assert hoods[0]._should_run is True
     assert hoods[0]._shadow is None
@@ -1660,7 +1660,7 @@ async def test_a_socketless_wanted_hood_recovers_instead_of_reconnecting(wired):
 
     hoods[0].async_reconnect = record_reconnect
 
-    assert await client._refresh_once() is False    # not the rebuild branch
+    assert await client._refresh_once() is False  # not the rebuild branch
     assert reconnected == []
     assert wired["shadow"].connect.await_count == 2  # recovery brought it back
 
@@ -1757,7 +1757,7 @@ async def test_async_stop_isolates_one_hoods_teardown_failure(wired):
     await hoods[0].async_start()
     await hoods[1].async_start()
 
-    await client.async_stop()          # must not raise
+    await client.async_stop()  # must not raise
 
     shadow_a.disconnect.assert_awaited_once()
     shadow_b.disconnect.assert_awaited_once()
@@ -1808,7 +1808,7 @@ async def test_async_stop_tears_down_every_hood_before_honouring_a_cancel(wired)
     with pytest.raises(asyncio.CancelledError):
         await client.async_stop()
 
-    shadow_b.disconnect.assert_awaited_once()   # not stranded
+    shadow_b.disconnect.assert_awaited_once()  # not stranded
     assert hoods[1]._should_run is False
     assert client._supervisor is None
 
@@ -1835,7 +1835,7 @@ async def test_async_stop_suppresses_a_supervisor_that_raised(wired):
     assert task.done()
     client._supervisor = task
 
-    await client.async_stop()          # must not raise
+    await client.async_stop()  # must not raise
 
     assert client._supervisor is None
     assert hoods[0]._should_run is False
@@ -1878,10 +1878,10 @@ async def test_async_stop_honours_a_cancel_landing_on_the_supervisor_await(
     with contextlib.suppress(asyncio.CancelledError):
         await client._supervisor
     client._supervisor = asyncio.create_task(_stubborn_supervisor())
-    await asyncio.sleep(0)                      # let it reach its sleep
+    await asyncio.sleep(0)  # let it reach its sleep
 
     stop_task = asyncio.create_task(client.async_stop())
-    for _ in range(2):                          # reach the supervisor await
+    for _ in range(2):  # reach the supervisor await
         await asyncio.sleep(0)
     stop_task.cancel()
 
@@ -1914,7 +1914,7 @@ async def test_async_stop_does_not_mistake_its_own_cancel_for_the_callers(
     client._supervisor = asyncio.create_task(_stubborn_supervisor())
     await asyncio.sleep(0)
 
-    await client.async_stop()          # must not raise
+    await client.async_stop()  # must not raise
 
     assert client._supervisor is None
     assert hoods[0]._should_run is False

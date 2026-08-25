@@ -519,9 +519,12 @@ class AbstractAuth(ABC):
 
         def fetch(iid: str | None) -> tuple[str, dict]:
             """Resolves `iid` if None, then mints raw credentials for it."""
-            resolved = iid or client.get_id(
-                IdentityPoolId=self.endpoints.identity_pool, Logins=logins
-            )["IdentityId"]
+            resolved = (
+                iid
+                or client.get_id(
+                    IdentityPoolId=self.endpoints.identity_pool, Logins=logins
+                )["IdentityId"]
+            )
             raw = client.get_credentials_for_identity(
                 IdentityId=resolved, Logins=logins
             )["Credentials"]
@@ -599,9 +602,7 @@ class AbstractAuth(ABC):
             _LOGGER.debug("list_attached_policies failed; attaching anyway")
 
         try:
-            client.attach_policy(
-                policyName=const.POLICY_NAME, target=identity_id
-            )
+            client.attach_policy(policyName=const.POLICY_NAME, target=identity_id)
         except Exception as err:  # noqa: BLE001
             code = ""
             if isinstance(err, ClientError):
@@ -905,9 +906,8 @@ class CredentialsAuth(AbstractAuth):
         self._tokens = ZephyrTokens(
             username=token_username,
             id_token=user.id_token,
-            refresh_token=user.refresh_token or (
-                stored.refresh_token if stored else ""
-            ),
+            refresh_token=user.refresh_token
+            or (stored.refresh_token if stored else ""),
             identity_id=identity_id,
             # The AWS credential expiry stands in for the token expiry.
             # Both are one hour from this same exchange, so they track - but

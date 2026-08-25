@@ -24,8 +24,12 @@ TOKEN = "SESSIONTOKEN/with+special=chars"
 def _url(**kw) -> str:
     """Build a presigned URL from the test constants with overrides."""
     params = dict(
-        access_key=KEY, secret_key=SECRET, session_token=TOKEN,
-        endpoint=ENDPOINT, region="us-west-2", now=NOW,
+        access_key=KEY,
+        secret_key=SECRET,
+        session_token=TOKEN,
+        endpoint=ENDPOINT,
+        region="us-west-2",
+        now=NOW,
     )
     params.update(kw)
     return build_presigned_url(**params)
@@ -61,9 +65,7 @@ def test_security_token_is_excluded_from_the_signature():
     broker rejects, and the failure looks like a generic handshake error.
     """
     with_token = parse_qs(urlsplit(_url()).query)["X-Amz-Signature"][0]
-    without = parse_qs(
-        urlsplit(_url(session_token=None)).query
-    )["X-Amz-Signature"][0]
+    without = parse_qs(urlsplit(_url(session_token=None)).query)["X-Amz-Signature"][0]
     assert with_token == without
 
 

@@ -388,9 +388,7 @@ class ShadowClient:
         # a blocking call. connect() is async and runs on the event loop, and
         # this path executes on every connect including every supervisor
         # reconnect.
-        client.tls_set_context(
-            await asyncio.to_thread(ssl.create_default_context)
-        )
+        client.tls_set_context(await asyncio.to_thread(ssl.create_default_context))
         # paho retries indefinitely at a fixed short interval by default. Cap
         # the backoff so an expired credential does not become a hot loop.
         client.reconnect_delay_set(min_delay=1, max_delay=120)
@@ -415,8 +413,7 @@ class ShadowClient:
                 await asyncio.wait_for(self._subscribed.wait(), timeout)
             except TimeoutError as err:
                 raise ZephyrTransportError(
-                    "MQTT connected but shadow subscriptions did not "
-                    "complete in time"
+                    "MQTT connected but shadow subscriptions did not complete in time"
                 ) from err
             if self._subscribe_error is not None:
                 error, self._subscribe_error = self._subscribe_error, None
@@ -468,9 +465,7 @@ class ShadowClient:
         # before the executor picks it up, leaking a paho client whose
         # network thread is already running - the exact leak this cleanup
         # exists to prevent, one level down.
-        teardown = asyncio.ensure_future(
-            asyncio.to_thread(self._teardown, client)
-        )
+        teardown = asyncio.ensure_future(asyncio.to_thread(self._teardown, client))
         try:
             await asyncio.shield(teardown)
         except asyncio.CancelledError:
@@ -554,9 +549,7 @@ class ShadowClient:
                 f"publish to shadow/{operation} failed: rc={info.rc}"
             )
 
-    async def _publish_or_disconnect(
-        self, topic: str, payload: dict[str, Any]
-    ) -> None:
+    async def _publish_or_disconnect(self, topic: str, payload: dict[str, Any]) -> None:
         """Publishes, tearing the connection down rather than queuing a write.
 
         A refused write must never actuate hardware later. Tearing the

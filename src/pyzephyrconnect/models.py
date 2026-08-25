@@ -154,9 +154,7 @@ class HoodCapabilities:
             max_charcoal_filter_hours=as_int("maxCharcoalfilterTimer"),
             labor_warranty=str(payload.get("laborWarranty", "")),
             parts_warranty=str(payload.get("partsWarranty", "")),
-            urls=MappingProxyType(
-                {k: payload[k] for k in _URL_KEYS if payload.get(k)}
-            ),
+            urls=MappingProxyType({k: payload[k] for k in _URL_KEYS if payload.get(k)}),
             raw=MappingProxyType(dict(payload)),
         )
 
@@ -305,13 +303,14 @@ class HoodState:
     def merge(self, delta: dict[str, Any]) -> HoodState:
         """Builds a new state with `delta` applied over the raw payload.
 
-        update/delta and update/accepted carry only changed keys, so a
+        update/accepted carries only the keys that changed, so a
         replace-the-whole-object approach would silently zero everything
-        the device did not mention.
+        the device did not mention. (update/delta is also partial, but the
+        client deliberately drops those messages without merging - see
+        ZephyrClient._handle_message.)
 
         Args:
-            delta: Changed keys from an update/delta or update/accepted
-                message.
+            delta: Changed keys from an update/accepted message.
 
         Returns:
             A new HoodState reparsed from the merged raw payload.

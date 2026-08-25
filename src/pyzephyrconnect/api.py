@@ -171,9 +171,7 @@ class ZephyrApi:
                     # aiohttp returns None for an empty 200 body; a bare
                     # list or string is equally unusable to every caller of
                     # this method.
-                    raise ZephyrDataError(
-                        f"{url} returned an unexpected body shape"
-                    )
+                    raise ZephyrDataError(f"{url} returned an unexpected body shape")
                 return body
         except aiohttp.ClientConnectorCertificateError as err:
             # Must stay ABOVE the ClientError clause - it is a subclass, and
@@ -190,9 +188,7 @@ class ZephyrApi:
             # DNS failure, connection reset, timeout: retryable transport
             # noise. Left unwrapped it escapes the "consumers catch
             # ZephyrError" contract from async_setup() and async_poll().
-            raise ZephyrTransportError(
-                f"request to {url} failed: {err}"
-            ) from err
+            raise ZephyrTransportError(f"request to {url} failed: {err}") from err
 
     async def get_own_devices(self) -> list[dict[str, Any]]:
         """Returns the caller's devices.

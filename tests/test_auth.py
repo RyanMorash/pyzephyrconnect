@@ -10,7 +10,12 @@ import pytest
 from botocore.exceptions import ClientError
 
 from pyzephyrconnect import auth as auth_module
-from pyzephyrconnect.auth import AbstractAuth, Credentials, CredentialsAuth, ZephyrTokens
+from pyzephyrconnect.auth import (
+    AbstractAuth,
+    Credentials,
+    CredentialsAuth,
+    ZephyrTokens,
+)
 from pyzephyrconnect.exceptions import (
     ZephyrAuthError,
     ZephyrPolicyError,
@@ -29,8 +34,7 @@ def _creds_response(expires_in_seconds=3600):
             # is a documented trap in PROTOCOL.md section 3.2.
             "SecretKey": "SECRET",
             "SessionToken": "TOKEN",
-            "Expiration": datetime.now(UTC)
-            + timedelta(seconds=expires_in_seconds),
+            "Expiration": datetime.now(UTC) + timedelta(seconds=expires_in_seconds),
         }
     }
 
@@ -64,12 +68,8 @@ def test_credentials_expire_early_by_the_refresh_margin():
     Reporting 'valid' until the last second guarantees a mid-flight
     expiry, because rebuilding the socket is not instant.
     """
-    nearly = Credentials(
-        "k", "s", "t", datetime.now(UTC) + timedelta(seconds=60)
-    )
-    plenty = Credentials(
-        "k", "s", "t", datetime.now(UTC) + timedelta(seconds=3600)
-    )
+    nearly = Credentials("k", "s", "t", datetime.now(UTC) + timedelta(seconds=60))
+    plenty = Credentials("k", "s", "t", datetime.now(UTC) + timedelta(seconds=3600))
     assert nearly.expired is True
     assert plenty.expired is False
 
@@ -154,7 +154,8 @@ async def test_attach_policy_wraps_a_refused_attach_in_zephyr_policy_error(
 
 
 @pytest.mark.parametrize(
-    "code", ["AccessDeniedException", "UnauthorizedException", "ResourceNotFoundException"]
+    "code",
+    ["AccessDeniedException", "UnauthorizedException", "ResourceNotFoundException"],
 )
 async def test_the_terminal_attach_codes_stay_policy_errors(fake_aws, code):
     """Tests that each terminal attach code raises ZephyrPolicyError."""
@@ -173,9 +174,7 @@ async def test_a_throttled_attach_stays_retryable(fake_aws):
     wrapping it as a policy error permanently stops every hood over a blip
     that would have cleared on the next tick.
     """
-    fake_aws["iot"].attach_policy.side_effect = _iot_error(
-        "TooManyRequestsException"
-    )
+    fake_aws["iot"].attach_policy.side_effect = _iot_error("TooManyRequestsException")
     auth = CredentialsAuth("u", "p", MagicMock())
 
     with pytest.raises(ZephyrTransportError):
@@ -205,9 +204,7 @@ async def test_a_rejected_credential_at_attach_surfaces_as_an_auth_error(
     credential means the user must reauth, which is neither a retry nor a
     policy problem.
     """
-    fake_aws["iot"].attach_policy.side_effect = _iot_error(
-        "NotAuthorizedException"
-    )
+    fake_aws["iot"].attach_policy.side_effect = _iot_error("NotAuthorizedException")
     auth = CredentialsAuth("u", "p", MagicMock())
 
     with pytest.raises(ZephyrAuthError):
@@ -333,7 +330,7 @@ async def test_identity_id_survives_a_refresh(fake_aws):
         "user@example.com", "pw", MagicMock(), tokens=_stored_tokens()
     )
     first = (await auth.async_get_tokens()).identity_id
-    auth._tokens = _stored_tokens()          # force another refresh
+    auth._tokens = _stored_tokens()  # force another refresh
     assert (await auth.async_get_tokens()).identity_id == first
 
 
@@ -613,12 +610,8 @@ async def test_identity_override_resets_when_tokens_change_accounts(fake_aws):
 
     # Second exchange, under a different account's tokens entirely.
     fake_aws["identity"].get_credentials_for_identity.side_effect = None
-    fake_aws["identity"].get_credentials_for_identity.return_value = (
-        _creds_response()
-    )
-    fake_aws["identity"].get_id.return_value = {
-        "IdentityId": other_account_identity
-    }
+    fake_aws["identity"].get_credentials_for_identity.return_value = _creds_response()
+    fake_aws["identity"].get_id.return_value = {"IdentityId": other_account_identity}
     exchanges_before = fake_aws["identity"].get_credentials_for_identity.call_count
 
     auth._static = ZephyrTokens(
@@ -631,8 +624,7 @@ async def test_identity_override_resets_when_tokens_change_accounts(fake_aws):
     await auth.async_get_credentials()
 
     assert (
-        fake_aws["identity"].get_credentials_for_identity.call_count
-        > exchanges_before
+        fake_aws["identity"].get_credentials_for_identity.call_count > exchanges_before
     ), "swapping to a new account's tokens must trigger a fresh exchange"
     assert auth.identity_id == other_account_identity
 
@@ -674,11 +666,11 @@ async def test_replacing_the_cached_credentials_moves_the_generation(fake_aws):
     auth = CredentialsAuth("user@example.com", "pw", MagicMock())
     assert auth.credentials_generation == 0
 
-    await auth.async_get_tokens()             # the REST-driven refresh path
+    await auth.async_get_tokens()  # the REST-driven refresh path
     after_acquire = auth.credentials_generation
     assert after_acquire > 0
 
-    await auth.async_get_credentials()        # served from the cache
+    await auth.async_get_credentials()  # served from the cache
     assert auth.credentials_generation == after_acquire
 
     # Tokens still fresh, credentials gone: this drops through to the

@@ -360,6 +360,7 @@ class ZephyrClient:
         Returns:
             A fresh, unstarted ShadowClient for this hood.
         """
+
         async def provider() -> Credentials:
             """Fetches presign credentials; notes generation on the hood."""
             # The PAIR, in one call. Fetching the credentials and then
@@ -471,9 +472,7 @@ class ZephyrClient:
             {k: v for k, v in payload.items() if k not in _PERSONAL_DATA_KEYS}
         )
 
-    def _handle_message(
-        self, hood: Hood, topic: str, payload: dict[str, Any]
-    ) -> None:
+    def _handle_message(self, hood: Hood, topic: str, payload: dict[str, Any]) -> None:
         """Folds an incoming shadow message into one hood's state.
 
         get/accepted carries a full document; update/accepted carries only
@@ -580,9 +579,7 @@ class ZephyrClient:
             try:
                 await asyncio.sleep(self._supervisor_interval)
                 await self._refresh_once()
-                if not any(
-                    hood._should_run for hood in self._hoods.values()
-                ):
+                if not any(hood._should_run for hood in self._hoods.values()):
                     # Nothing left to supervise, so retire rather than tick
                     # forever. A running task holds this client strongly
                     # through every sleep (verified uncollectable via gc), so
@@ -622,9 +619,7 @@ class ZephyrClient:
                         _LOGGER.exception("stopping hood after terminal error")
                 # Log the TYPE, not the message - ZephyrPolicyError text may
                 # name the policy, and identifiers do not belong at ERROR.
-                _LOGGER.error(
-                    "refresh supervisor stopping: %s", type(err).__name__
-                )
+                _LOGGER.error("refresh supervisor stopping: %s", type(err).__name__)
                 return
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("refresh cycle failed; retrying next tick")
