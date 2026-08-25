@@ -1,17 +1,18 @@
 import asyncio
 import json
-from datetime import UTC, datetime
+import ssl
+from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
 import pytest
 
 from pyzephyrconnect import shadow as shadow_module
 from pyzephyrconnect.auth import Credentials
-from pyzephyrconnect.exceptions import ZephyrPolicyError
+from pyzephyrconnect.exceptions import ZephyrPolicyError, ZephyrWriteError
 from pyzephyrconnect.shadow import ShadowClient, ShadowTopics
 
 THING = "aaaaaaaabbbbbbbbccccccccddddddddeeeeeeee"
-CREDS = Credentials("AKIA", "SECRET", "TOKEN", datetime(2030, 1, 1, tzinfo=UTC))
+CREDS = Credentials("k", "s", "t", datetime.now(UTC) + timedelta(hours=1))
 
 
 def test_topics_are_built_from_the_thing_name():
@@ -56,30 +57,58 @@ def fake_paho(monkeypatch):
     return client
 
 
+async def _default_provider():
+    return CREDS
+
+
 def _make(on_message=None):
     return ShadowClient(
-        THING, f"{THING}-ha", on_message or MagicMock(), MagicMock()
+        THING, f"{THING}-ha", on_message or MagicMock(), MagicMock(), _default_provider
     )
+
+
+def _shadow(credentials_provider=_default_provider, **kwargs):
+    """A ShadowClient on the new 5-argument constructor."""
+    return ShadowClient(
+        THING,
+        "us-west-2:abc-ha",
+        lambda topic, payload: None,
+        lambda connected: None,
+        credentials_provider,
+        **kwargs,
+    )
+
+
+async def _connect(shadow):
+    """Drive connect() to completion against the fake paho client.
+
+    fake_paho's connect_async side_effect fires on_connect/on_subscribe
+    synchronously, but call_soon_threadsafe only schedules those callbacks -
+    they land once connect() itself yields to the loop (inside its own
+    asyncio.wait_for calls). So a plain await is enough; no separate
+    task/simulate step is needed against this fixture.
+    """
+    await shadow.connect(timeout=1)
 
 
 async def test_connect_uses_a_presigned_websocket_path(fake_paho):
     sc = _make()
-    await sc.connect(CREDS)
+    await _connect(sc)
 
     path = fake_paho.ws_set_options.call_args.kwargs["path"]
     assert path.startswith("/mqtt?X-Amz-Algorithm=AWS4-HMAC-SHA256")
     assert "X-Amz-Signature=" in path
     assert "X-Amz-Security-Token=" in path
-    fake_paho.tls_set.assert_called_once()
+    fake_paho.tls_set_context.assert_called_once()
 
 
 async def test_connect_uses_the_suffixed_client_id(fake_paho):
-    await _make().connect(CREDS)
+    await _connect(_make())
     assert shadow_module.mqtt.Client.call_args.kwargs["client_id"] == f"{THING}-ha"
 
 
 async def test_connect_targets_port_443(fake_paho):
-    await _make().connect(CREDS)
+    await _connect(_make())
     args = fake_paho.connect_async.call_args.args
     assert args[1] == 443
 
@@ -100,7 +129,7 @@ async def test_denied_subscribe_surfaces_as_a_policy_error_from_connect(fake_pah
     fake_paho.connect_async.side_effect = fire_connack_then_deny_subscribe
 
     with pytest.raises(ZephyrPolicyError, match="attach"):
-        await _make().connect(CREDS)
+        await _connect(_make())
 
 
 async def test_granted_subscribes_let_connect_succeed(fake_paho):
@@ -114,12 +143,12 @@ async def test_granted_subscribes_let_connect_succeed(fake_paho):
 
     fake_paho.connect_async.side_effect = fire_connack_then_grant_subscribes
 
-    await _make().connect(CREDS)  # must not raise
+    await _connect(_make())  # must not raise
 
 
 async def test_request_state_publishes_an_empty_get(fake_paho):
     sc = _make()
-    await sc.connect(CREDS)
+    await _connect(sc)
     await sc.request_state()
 
     topic, payload = fake_paho.publish.call_args.args[:2]
@@ -133,7 +162,7 @@ async def test_publish_state_wraps_fields_in_state_reported(fake_paho):
     ignored by the hardware, which was the root cause of a real bug; the
     absence of "desired" anywhere in the payload is the regression guard."""
     sc = _make()
-    await sc.connect(CREDS)
+    await _connect(sc)
     await sc.publish_state({"light": 1})
 
     topic, payload = fake_paho.publish.call_args.args[:2]
@@ -144,8 +173,8 @@ async def test_publish_state_wraps_fields_in_state_reported(fake_paho):
 
 async def test_publish_state_rejects_an_empty_payload(fake_paho):
     sc = _make()
-    await sc.connect(CREDS)
-    with pytest.raises(ValueError):
+    await _connect(sc)
+    with pytest.raises(ZephyrWriteError):
         await sc.publish_state({})
 
 
@@ -153,7 +182,7 @@ async def test_reconnect_uses_capped_exponential_backoff(fake_paho):
     """paho retries indefinitely at a fixed short interval by default. An
     expired credential would otherwise become a hot reconnect loop against
     AWS IoT."""
-    await _make().connect(CREDS)
+    await _connect(_make())
     kwargs = fake_paho.reconnect_delay_set.call_args.kwargs
     assert kwargs["min_delay"] >= 1
     assert kwargs["max_delay"] <= 300
@@ -164,7 +193,7 @@ async def test_incoming_message_is_dispatched_with_parsed_json(fake_paho):
     with call_soon_threadsafe, so the dispatch needs a loop tick to land."""
     received = []
     sc = _make(on_message=lambda topic, payload: received.append((topic, payload)))
-    await sc.connect(CREDS)
+    await _connect(sc)
 
     msg = MagicMock()
     msg.topic = f"$aws/things/{THING}/shadow/get/accepted"
@@ -182,7 +211,7 @@ async def test_malformed_payload_is_dropped_without_dispatching(fake_paho):
     consumer must not be handed anything."""
     received = []
     sc = _make(on_message=lambda topic, payload: received.append((topic, payload)))
-    await sc.connect(CREDS)
+    await _connect(sc)
 
     msg = MagicMock()
     msg.topic = f"$aws/things/{THING}/shadow/get/accepted"
@@ -197,7 +226,7 @@ async def test_malformed_payload_warning_omits_the_thing_name(fake_paho, caplog)
     """The full topic ($aws/things/<thingName>/shadow/...) contains personal
     data. Only the topic leaf (accepted/delta/rejected) may be logged."""
     sc = _make()
-    await sc.connect(CREDS)
+    await _connect(sc)
 
     msg = MagicMock()
     msg.topic = f"$aws/things/{THING}/shadow/get/accepted"
@@ -216,7 +245,7 @@ async def test_publish_failure_raises_transport_error_without_the_thing_name(
     exception message."""
     fake_paho.publish.return_value = MagicMock(rc=1)
     sc = _make()
-    await sc.connect(CREDS)
+    await _connect(sc)
 
     with pytest.raises(shadow_module.ZephyrTransportError) as excinfo:
         await sc.request_state()
@@ -235,3 +264,45 @@ def test_dispatch_on_a_closed_loop_returns_without_raising():
     sc._loop = loop
 
     sc._dispatch(MagicMock())  # must not raise
+
+
+async def test_connect_asks_the_provider_for_fresh_credentials(fake_paho):
+    """A presigned URL cannot outlive its signature. Every connect attempt
+    must re-presign, or a reconnect after expiry retries a dead URL."""
+    calls = []
+
+    async def provider():
+        calls.append(1)
+        return Credentials("k", "s", "t", datetime.now(UTC) + timedelta(hours=1))
+
+    shadow = _shadow(credentials_provider=provider)
+    await _connect(shadow)
+    await shadow.disconnect()
+    await _connect(shadow)
+
+    assert len(calls) == 2
+
+
+async def test_tls_context_is_not_built_on_the_event_loop(fake_paho):
+    """paho's tls_set() calls load_default_certs() inline, which Home
+    Assistant reports as a blocking call on the loop. Hand it a finished
+    context instead."""
+    shadow = _shadow()
+    await _connect(shadow)
+
+    client = shadow._client
+    client.tls_set.assert_not_called()
+    client.tls_set_context.assert_called_once()
+    ctx = client.tls_set_context.call_args.args[0]
+    # Design Risks 10-11: a default context - CERT_REQUIRED, hostname
+    # checking on, and NOT the TWCA-augmented REST context.
+    assert ctx.verify_mode is ssl.VERIFY_DEFAULT or ctx.verify_mode.name == "CERT_REQUIRED"
+    assert ctx.check_hostname is True
+
+
+async def test_publish_empty_state_raises_a_library_error(fake_paho):
+    """ValueError escapes a consumer catching ZephyrError."""
+    shadow = _shadow()
+    await _connect(shadow)
+    with pytest.raises(ZephyrWriteError):
+        await shadow.publish_state({})

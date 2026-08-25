@@ -12,7 +12,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Callable
+import ssl
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlsplit
@@ -21,7 +22,8 @@ import paho.mqtt.client as mqtt
 
 from . import const
 from .auth import Credentials
-from .exceptions import ZephyrPolicyError, ZephyrTransportError
+from .const import DEFAULT_ENDPOINTS, Endpoints
+from .exceptions import ZephyrPolicyError, ZephyrTransportError, ZephyrWriteError
 from .presign import build_presigned_url
 
 _LOGGER = logging.getLogger(__name__)
@@ -87,11 +89,16 @@ class ShadowClient:
         client_id: str,
         on_message: Callable[[str, dict[str, Any]], None],
         on_connection_change: Callable[[bool], None],
+        credentials_provider: Callable[[], Awaitable[Credentials]],
+        *,
+        endpoints: Endpoints = DEFAULT_ENDPOINTS,
     ) -> None:
         self.topics = ShadowTopics(thing_name)
         self._client_id = client_id
         self._on_message_cb = on_message
         self._on_connection_cb = on_connection_change
+        self._credentials_provider = credentials_provider
+        self._endpoints = endpoints
         self._client: mqtt.Client | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._connected = asyncio.Event()
@@ -181,14 +188,22 @@ class ShadowClient:
 
     # -- async surface -------------------------------------------------
 
-    async def connect(self, credentials: Credentials, timeout: float = 15.0) -> None:
+    async def connect(self, timeout: float = 15.0) -> None:
+        """Open the WebSocket and subscribe to the shadow topics.
+
+        Credentials are fetched from the provider on every attempt rather
+        than captured once: the presigned URL embeds a SigV4 signature that
+        expires with them, so a reconnect must re-presign or it will retry a
+        URL AWS IoT has already stopped accepting.
+        """
         self._loop = asyncio.get_running_loop()
+        credentials = await self._credentials_provider()
         url = build_presigned_url(
             credentials.access_key,
             credentials.secret_key,
             credentials.session_token,
-            endpoint=const.IOT_ENDPOINT,
-            region=const.REGION,
+            endpoint=self._endpoints.iot_endpoint,
+            region=self._endpoints.region,
             now=datetime.now(UTC),
         )
         parts = urlsplit(url)
@@ -201,8 +216,19 @@ class ShadowClient:
         )
         client.ws_set_options(path=f"{parts.path}?{parts.query}")
         # The IoT ATS endpoint chains to Amazon Root CA 1, which system trust
-        # stores already carry. Only the vendor REST host needs the extra CAs.
-        client.tls_set()
+        # stores already carry. Only the vendor REST host needs the extra CAs,
+        # so this is a plain default context - NOT the TWCA one.
+        #
+        # Built in a worker thread and handed to paho finished. paho's
+        # tls_set() constructs the context inline on the calling thread: it
+        # does ssl.SSLContext(...) and then, because ca_certs is None,
+        # context.load_default_certs() - which Home Assistant instruments as
+        # a blocking call. connect() is async and runs on the event loop, and
+        # this path executes on every connect including every supervisor
+        # reconnect.
+        client.tls_set_context(
+            await asyncio.to_thread(ssl.create_default_context)
+        )
         # paho retries indefinitely at a fixed short interval by default. Cap
         # the backoff so an expired credential does not become a hot loop.
         client.reconnect_delay_set(min_delay=1, max_delay=120)
@@ -212,40 +238,57 @@ class ShadowClient:
         client.on_message = self._on_message
 
         _LOGGER.debug(
-            "connecting to %s as %s", const.IOT_ENDPOINT, self._client_id
+            "connecting to %s as %s", self._endpoints.iot_endpoint, self._client_id
         )
-        client.connect_async(const.IOT_ENDPOINT, 443, keepalive=30)
+        client.connect_async(self._endpoints.iot_endpoint, 443, keepalive=30)
         client.loop_start()
         self._client = client
 
         try:
-            await asyncio.wait_for(self._connected.wait(), timeout)
-        except TimeoutError as err:
+            try:
+                await asyncio.wait_for(self._connected.wait(), timeout)
+            except TimeoutError as err:
+                raise ZephyrTransportError(
+                    f"MQTT connection to {self._endpoints.iot_endpoint} timed out"
+                ) from err
+            try:
+                await asyncio.wait_for(self._subscribed.wait(), timeout)
+            except TimeoutError as err:
+                raise ZephyrTransportError(
+                    "MQTT connected but shadow subscriptions did not "
+                    "complete in time"
+                ) from err
+            if self._subscribe_error is not None:
+                error, self._subscribe_error = self._subscribe_error, None
+                raise error
+        except BaseException:
+            # Covers the ZephyrTransportError raises above, ZephyrPolicyError,
+            # AND CancelledError: whatever interrupts the handshake, the paho
+            # client and its network thread must be torn down before the
+            # exception leaves - nothing outside holds a reference yet.
             await self.disconnect()
-            raise ZephyrTransportError(
-                f"MQTT connection to {const.IOT_ENDPOINT} timed out"
-            ) from err
-
-        try:
-            await asyncio.wait_for(self._subscribed.wait(), timeout)
-        except TimeoutError as err:
-            await self.disconnect()
-            raise ZephyrTransportError(
-                "MQTT connected but shadow subscriptions did not complete in time"
-            ) from err
-
-        if self._subscribe_error is not None:
-            error, self._subscribe_error = self._subscribe_error, None
-            await self.disconnect()
-            raise error
+            raise
 
     async def disconnect(self) -> None:
         if self._client is None:
             return
-        self._client.loop_stop()
-        self._client.disconnect()
-        self._client = None
+        client, self._client = self._client, None
+        # Off the loop: loop_stop() JOINS paho's network thread (see
+        # paho/mqtt/client.py), and that thread is frequently inside a
+        # synchronous socket recv. A thread join on the event loop was
+        # tolerable once at shutdown; this now runs on every ~50-minute
+        # supervisor rebuild, per hood.
+        await asyncio.to_thread(self._teardown, client)
         self._connected.clear()
+        self._subscribed.clear()
+
+    @staticmethod
+    def _teardown(client: mqtt.Client) -> None:
+        # disconnect() BEFORE loop_stop(). The network thread is what writes
+        # the DISCONNECT packet; stopping it first means the packet is queued
+        # and never sent, and the broker only notices via keepalive timeout.
+        client.disconnect()
+        client.loop_stop()
 
     def _publish(self, topic: str, payload: dict[str, Any]) -> None:
         if self._client is None:
@@ -280,5 +323,5 @@ class ShadowClient:
         should reach this until the write path has been validated.
         """
         if not fields:
-            raise ValueError("refusing to publish an empty reported state")
+            raise ZephyrWriteError("refusing to publish an empty reported state")
         self._publish(self.topics.update, {"state": {"reported": fields}})
