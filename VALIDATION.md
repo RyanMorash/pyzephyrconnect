@@ -1,12 +1,21 @@
 # Hardware validation runbook
 
-The shadow write path is **unverified**. Publishing to
-`$aws/things/<thing>/shadow/update` actuates a physical fan and light.
+> **Status: run against the reference hood (`AK7400AS`), except step 9.**
+> The answers are recorded in `PROTOCOL.md` §5, and what remains genuinely
+> unknown is `PROTOCOL.md` §7. Step 9 (`resetgreasefilter`) is deliberately
+> deferred until the grease filter is actually being cleaned — see below.
+>
+> The write path is no longer unverified, and the earlier blanket rule that
+> nothing may write to the shadow is lifted. Publishing to
+> `$aws/things/<thing>/shadow/update` still actuates a physical fan and
+> light, so writes stay attended and field names stay validated against
+> observed `reported` values.
+>
+> Keep this document. It is the procedure to re-run on another model, and
+> the same sequence answers the §7 items that are still open.
+
 This runbook establishes what each field does, one field at a time, with
 the hood attended.
-
-Nothing in the Home Assistant integration may write to the shadow until
-this is complete — three of these answers determine the entity design.
 
 ## Before you start
 
@@ -67,36 +76,48 @@ deliberate friction, not a bug.
 and cannot be reconstructed. **Do not run step 9 until you are actually
 cleaning the grease filter.** Everything else can proceed without it.
 
-## The three answers that gate the integration
+## The three answers that gated the integration — ANSWERED
 
-Record these in `PROTOCOL.md` §7, replacing the open items.
+Full detail in `PROTOCOL.md` §5. Summarised here so the runbook reads as a
+record of what happened.
 
-**1. `power` semantics (from step 1 and 3).**
-- Did `light=1` work on its own, or did nothing happen until `power=1`?
-- When you set `power=1` alone, did the fan or light come on by itself?
-- When you set `light=1`, did `power` change to 1 in the reported diff?
+**1. `power` — master switch with memory, not a precondition.**
+Writing `0` turns everything off; writing `1` restores the levels that were
+running before (observed restoring fan 6 and light 1 together). `fan` and
+`light` write through directly while `power` reads `0`, and the device
+raises `power` itself.
 
-→ *Master switch* (light/fan need power=1): the HA fan and light entities
-write `power` alongside the level, and there is no separate power entity.
-→ *Derived* (power reports 1 when anything is on): read-only, not exposed.
-→ *Independent standby*: gets its own `switch` entity.
+→ Power gets its own `switch` entity, and the fan and light entities must
+**not** write `power` alongside the level.
 
-**2. `setdelaytimer` units and domain (step 6).**
-Try a value like 5, then 10. Watch whether `delaytimer` starts counting.
-- Are the units minutes or something else?
-- Does it accept arbitrary values, or snap to presets (e.g. 5/10/15)?
+**2. `setdelaytimer` — seconds, arbitrary values.**
+Not minutes. The vendor app's two presets are a UI choice; the device
+accepts any value. The device derives `delaytimer` and counts it down
+itself in 60-second steps, reporting about once a minute.
 
-→ Arbitrary → HA `number` entity. Presets → HA `select` entity.
+→ HA `number` entity, converting minutes to seconds on write. The ceiling
+is still unprobed (`PROTOCOL.md` §7).
 
-**3. Filter counter units (observable during any fan run).**
-`usegreasefiltertime` is 642 against a `maxGreasefilterTimer` of 60. That
-only reconciles if the counter is minutes and the max is hours (≈10.7 h
-of 60 h). Run the fan for a known number of minutes and see how much
-`usefantime` and `usegreasefiltertime` move.
+**3. Filter counters — minutes, against a maximum in hours.**
+Confirmed, and cross-checked against the vendor app rather than inferred:
+643 minutes against a 60-hour life is 82.1%, and the app displays 82%.
 
-→ Confirms the filter-life percentage formula, or corrects it.
+```
+remaining = 1 - used_minutes / (life_hours * 60)
+```
+
+→ Note the scope. This settles `usegreasefiltertime` and
+`usecharcoalfiltertime` only. `usefantime` and `uselighttime` are separate
+fields whose units are **still unestablished** — they held flat across five
+minutes of running while `usegreasefiltertime` moved, so they are coarser
+than minutes, and that is all that is known. See `PROTOCOL.md` §7 item 1.
 
 ## Also worth noting while you're there
+
+Answered in passing: **`setcleanairfunction` is an operating mode, not a
+setting** — enabling it starts the fan at speed 1.
+
+Still open (and see `PROTOCOL.md` §7 for the rest):
 
 - **`act`** currently reads `"Disabled"`. Does it ever change? Watch it
   during steps 3-7 and record any other value you see.
@@ -123,12 +144,14 @@ the request path and rebuilds the MQTT socket before they expire.
 either the system CA store or the bundled TWCA anchors — likely a vendor
 CA rotation. Do not disable verification; recapture the chain.
 
-**A write is accepted but nothing physically happens.** Record it. It
-likely means the field needs `power=1` first, or is not the field we
-think it is. That is exactly what this exercise is for.
+**A write is accepted but nothing physically happens.** Record it. On the
+reference hood `power` is *not* a precondition — `fan` and `light` actuate
+while `power` reads `0` — so this is more likely a field that is not what we
+think it is, or a model that behaves differently. That is exactly what this
+exercise is for.
 
 ## When you're done
 
-Update `PROTOCOL.md` §7 with the answers, then the Home Assistant
-integration plan can be written against known semantics instead of
-assumptions.
+Record answers in `PROTOCOL.md` §5 and strike the corresponding item from
+§7. That has been done for the three gating questions above; §7 now lists
+only what is still unknown.

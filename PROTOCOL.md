@@ -7,8 +7,9 @@ Verified working end to end against a real device (model `AK7400AS`).
 All device identifiers in this document (thing name, serial, MAC,
 coordinates, identity ID) are placeholders, not real values.
 
-Target use: a Home Assistant integration. Everything below is read path
-unless explicitly marked otherwise.
+Target use: a Home Assistant integration. Both the read and write paths are
+covered; the write path actuates hardware and is marked as such where it
+appears (§5, §7).
 
 ---
 
@@ -38,7 +39,7 @@ writes are both shadow operations.
 | Region | `us-west-2` |
 | User Pool ID | `us-west-2_McuoKpkna` |
 | App Client ID | `5a2qiskdvvu7gre1jvbjnunu20` |
-| App Client Secret | *(in `awsconfiguration.json`; required for SRP)* |
+| App Client Secret | *(in `awsconfiguration.json`; mirrored in `const.py`, required for SRP)* |
 | Identity Pool ID | `us-west-2:fb4c1b66-12c2-414b-83a1-a1902f7d98e3` |
 | IoT ATS endpoint | `a1nqxu0hki9zw3-ats.iot.us-west-2.amazonaws.com` |
 | IoT policy name | `RangeHoodPolicy` |
@@ -51,7 +52,10 @@ Amplify emitted it because the vendor ticked "generate client secret".
 It ships inside the app bundle, so it is not a secret in any meaningful
 sense, but SRP will fail without it (it is needed for `SECRET_HASH`).
 
-Do not commit these to a public repo alongside real credentials.
+These vendor constants are committed deliberately — they ship in the app
+bundle and gate nothing. What must never be committed is the account side:
+your email, password, Cognito tokens, `identityId`, or any real
+`thingName`/`SN`/`MAC`/`location` from §4.
 
 ## 3. Auth chain
 
@@ -173,6 +177,34 @@ it from this endpoint. Do not attempt to derive or guess it.
 Note the response includes precise device coordinates. Anything built on
 this should treat the payload as containing personal location data.
 
+### discoverdevice — capabilities and state over HTTPS
+
+A second endpoint on the same host returns one device's declared
+capabilities merged with its current reported state:
+
+```
+POST https://zephyr-prod-app.gemteks.com/prod/discoverdevice
+Authorization: <raw ID token>          # bare, same rules as above
+Content-Type: application/json
+
+{"thingName":"aaaaaaaabbbbbbbbccccccccddddddddeeeeeeee"}
+```
+
+The response is **flat** — no `state`/`reported` nesting — and is a superset
+of the shadow's `reported` block: the same runtime keys plus `modelName`,
+`SN`, `MAC`, warranty dates, support URLs, and the capability maxima
+(`maxFanSpeed`, `maxLightLevel`, `maxGreasefilterTimer`,
+`maxCharcoalfilterTimer`).
+
+Those maxima appear **only here**. The device shadow does not carry them, so
+capability discovery cannot be done over MQTT — compare
+`tests/fixtures/discoverdevice.json` against
+`tests/fixtures/shadow_get_accepted.json`.
+
+This is the library's HTTPS read path. It backs `hood.async_poll()` and works
+whether or not MQTT is up, which is what makes a degraded read possible while
+the shadow connection is down.
+
 ### TLS caveat
 
 `zephyr-prod-app.gemteks.com` presents a chain (TWCA → GEMTEK wildcard)
@@ -201,16 +233,30 @@ plan around.
 
 ## 5. MQTT / shadow
 
-WebSocket, SigV4-signed, port 443:
+WebSocket, SigV4-signed, port 443. The library uses **paho-mqtt** with a
+hand-rolled presigner (`presign.py`), not the AWS IoT SDK's awscrt
+connection builder that earlier drafts of this document assumed:
 
 ```python
-mqtt_connection_builder.websockets_with_default_aws_signing(
-    endpoint=ENDPOINT, region=REGION,
-    credentials_provider=auth.AwsCredentialsProvider.new_static(
-        creds["AccessKeyId"], creds["SecretKey"], creds["SessionToken"]),
-    client_id=identity_id,      # full "us-west-2:uuid"
-    clean_session=True, keep_alive_secs=30)
+url = build_presigned_url(
+    creds.access_key, creds.secret_key, creds.session_token,
+    endpoint=IOT_ENDPOINT, region=REGION, now=datetime.now(UTC))
+parts = urlsplit(url)
+
+client = mqtt.Client(
+    callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+    client_id=client_id,          # see "Client ID" below
+    transport="websockets", protocol=mqtt.MQTTv311)
+client.ws_set_options(path=f"{parts.path}?{parts.query}")
+client.tls_set_context(ssl.create_default_context())
+client.connect_async(IOT_ENDPOINT, 443, keepalive=30)
 ```
+
+The presigned URL embeds a signature over credentials that expire in an
+hour, so **every reconnect must re-presign**. Reusing the URL retries a
+signature AWS IoT has already stopped accepting — and paho's own
+auto-reconnect will do exactly that, indefinitely, unless something
+rebuilds the socket (§7).
 
 ### Topics
 
@@ -252,67 +298,141 @@ into cached state produces a phantom "change" — that exact bug
 disguised the desired/reported root cause for a full debugging cycle.
 
 The write path is covered by `tests/test_shadow.py` and
-`tests/test_client.py`. **Field semantics are only partly mapped** —
-see §7.
+`tests/test_client.py`.
 
-### Client ID collision
+### Field semantics
 
-The IoT policy pins the client ID to the identity ID. Running the phone
-app and a script with the same client ID causes mutual session takeover
-(each evicts the other, reconnect loop). Append a suffix
-(`identity_id + "-ha"`) to coexist — this works, so the policy's client
-ID constraint is either absent or a prefix match. Worth using a stable
-distinct suffix for the HA integration.
+Established against the real hood by the `VALIDATION.md` runbook. Each of
+these was an open question in earlier revisions of this document.
 
-### awscrt API gotchas
+**`power` — a master switch with memory, not a precondition.**
+Writing `0` turns everything off. Writing `1` restores the levels that were
+running before (observed restoring fan 6 and light 1 together). It does
+**not** gate the other controls: `fan` and `light` can be written directly
+while `power` reads `0`, and the device raises `power` itself in response.
+So a client exposes power as its own control, and must *not* write `power`
+alongside a fan or light level.
 
-- `subscribe()` and `publish()` return `(future, packet_id)` tuples.
-  Index `[0]` before `.result()`.
-- `subscribe()` **resolves its future even when the broker denies that
-  topic**. Check the granted QoS in the result dict: `0`/`1` is a real
-  subscription, `128` or `None` means denied. Not checking this makes
-  denied subscribes look successful.
-- Message callbacks run on a CRT background thread. The main thread must
-  stay alive (event wait or sleep) or the process exits before delivery.
-- `awscrt.io.init_logging(io.LogLevel.Debug, "stderr")` exposes protocol
-  detail that `AwsCrtError` swallows. Useful when something fails
-  opaquely.
+**`setdelaytimer` — seconds, arbitrary values.**
+Not minutes, and not preset-snapped: the vendor app offers two presets, but
+that is a UI choice and the device accepts any value. The device derives
+`delaytimer` from it and counts down itself in 60-second steps, reporting
+roughly once a minute — so `delaytimer` is device-authored and writing it is
+unnecessary. The upper bound is unknown (§7).
+
+**Filter counters — counter in minutes, capability maximum in hours.**
+`usegreasefiltertime` / `usecharcoalfiltertime` count **minutes**, while
+`maxGreasefilterTimer` / `maxCharcoalfilterTimer` are **hours**. Conflating
+them is wrong by 60x. Cross-checked against the vendor app's own display:
+643 minutes against a 60-hour life is 82.1%, and the app shows 82%. So
+
+```
+remaining = 1 - used_minutes / (life_hours * 60)
+```
+
+This does **not** extend to `usefantime` / `uselighttime`, whose units are
+still unestablished — see §7.
+
+**`setcleanairfunction` — an operating mode, not a setting.**
+Enabling it starts the fan at speed 1.
+
+### Client ID
+
+AWS IoT evicts concurrent sessions sharing a client ID, so the phone app and
+a script using the bare identity ID mutually evict each other in a reconnect
+loop. Appending a suffix avoids it, which means the policy's client ID
+constraint is either absent or a prefix match.
+
+Settled shape, one connection per hood:
+
+```
+<identity_id>-ha-<thingName>          # e.g. us-west-2:uuid-ha-aaaa...eeee
+```
+
+The `-ha` suffix is what lets this coexist with the vendor app; the
+per-thing suffix is what keeps two hoods on one account from evicting each
+other. Keep the region prefix on the identity ID (§3.2).
+
+### Transport gotchas
+
+- **A refused subscribe still looks like a success.** paho fires
+  `on_subscribe` even when the broker denied the topic. Granted QoS `128`
+  means denied — check `reason_code_list` explicitly. This is the same trap
+  as the missing-policy case in §3.3 and usually has the same cause.
+- **Callbacks run on paho's network thread, and must never raise.** paho
+  re-raises callback exceptions into the thread runner, which has no
+  handler, so one exception silently kills the network thread and updates
+  simply stop arriving. Marshal onto the event loop
+  (`call_soon_threadsafe`) and swallow exceptions at the boundary.
+- **`X-Amz-Security-Token` is appended *after* signing** and is not part of
+  the canonical query string. Signing over it produces a signature the
+  broker rejects with an opaque handshake error. See `presign.py`.
+- **Use `tls_set_context()`, not `tls_set()`.** paho's `tls_set()` builds
+  the SSL context inline on the calling thread and, with `ca_certs=None`,
+  calls `load_default_certs()` — a blocking call on the event loop, which
+  Home Assistant flags. Build the context in a worker thread and hand it
+  over finished.
+- **The IoT endpoint needs the plain default trust store.** It chains to
+  Amazon Root CA 1. Only the vendor REST host (§4) needs the TWCA anchors;
+  do not reuse that context here.
+- **Cap the reconnect backoff.** paho retries indefinitely at a fixed short
+  interval by default, which turns an expired credential into a hot loop —
+  `reconnect_delay_set(min_delay=1, max_delay=120)`.
 
 ## 6. Failure modes seen, and what they meant
 
 | Symptom | Cause |
 |---|---|
-| `ForbiddenException` from `get_thing_shadow` (HTTPS) | Policy grants MQTT topic actions, not `iot:GetThingShadow`. The REST data plane is not usable here — use MQTT. |
+| `ForbiddenException` from `get_thing_shadow` (HTTPS) | Policy grants MQTT topic actions, not `iot:GetThingShadow`. The **AWS IoT** REST data plane is unusable — read the shadow over MQTT, or the vendor's own `discoverdevice` endpoint (§4). |
 | Connect OK, subscribe OK, publish OK, no messages | No IoT policy attached to the identity (§3.3). |
 | Subscribe "succeeds" but topic is dead | Granted QoS 128 — check it explicitly. |
 | Second and third subscribes time out after first denial | IoT closes the connection on a refused subscribe. Sequential probing on one connection is invalid; reconnect per probe. |
 | `AccessDeniedException` on `iot:ListThings` | Expected and correct — the role has no control-plane enumeration. |
 | `CERTIFICATE_VERIFY_FAILED: Missing Subject Key Identifier` | Vendor's broken intermediate (§4). |
 
-## 7. Open items for the integration
+## 7. Open items
 
-1. **Map shadow fields to functions.** Toggle each control in the app
-   while subscribed to `update/accepted`; record which keys change.
-   (Not `update/delta` — it never reflects device state here, see §5.)
-   Needed before exposing writes beyond the probe CLI.
-2. **Write path is implemented; individual fields still need
-   validating.** The mechanism is settled and tested — publish
-   `{"state":{"reported":{...}}}` to `.../update` (§5). What remains
-   unproven is the effect of most individual fields. This is a range
-   hood — a wrong payload actuates a fan and possibly heat/light.
-   Validate field names against observed `reported` values before
-   writing, and test with the device attended.
-3. **Credential refresh loop.** Tokens and AWS credentials both expire
-   at 1 hour. HA needs a scheduled refresh (`renew_access_token()` →
-   re-exchange → rebuild the MQTT connection), or an
-   `AwsCredentialsProvider` backed by a callback rather than static
-   credentials.
-4. **Reconnect handling.** Wire `on_connection_interrupted` /
-   `on_connection_resumed`; check `session_present` on resume and
-   re-subscribe if false.
-5. **Polling vs push.** `update/accepted` gives push updates when the
-   device or another client changes state, but a periodic `get` is a
-   reasonable safety net for missed messages.
+The `VALIDATION.md` runbook has been run against the reference hood
+(`AK7400AS`), except step 9. What it established is folded into §5 —
+`power` semantics, `setdelaytimer` units, the filter-life formula, and
+`setcleanairfunction`. Credential refresh, reconnect handling and the
+polling/push decision, listed as open in earlier revisions, are implemented
+in the library. What follows is what is genuinely still unknown.
+
+1. **`usefantime` / `uselighttime` units.** Inferred as hours, never
+   measured. Not covered by the filter-counter answer in §5: those are the
+   *filter* counters, and these are separate fields. All that is actually
+   known is that both held flat across five minutes of fan runtime while
+   `usegreasefiltertime` moved, so they are coarser than minutes. This
+   matters more than it looks — a consumer exposing them as a monotonic
+   duration feeds long-term statistics, where a 60x unit error silently
+   corrupts history rather than showing up as an obvious wrong number.
+   Cheapest check: read `usefantime` either side of an hour of running, or
+   compare against any runtime figure the vendor app displays — the same
+   cross-check that settled the filter formula.
+2. **The `setdelaytimer` ceiling.** The device accepts arbitrary values
+   (§5), but the maximum is unprobed and validated at exactly one point: 60
+   minutes worked. One write above an hour establishes whether a larger
+   value is accepted, clamped, or rejected.
+3. **Whether the hood actually stops when `delaytimer` reaches 0.** The
+   countdown has been observed running; it has not been watched to zero end
+   to end.
+4. **`act` beyond `"Disabled"`.** The field is understood as a mode string
+   but no other value has ever been observed. Treat it as free-form; do not
+   build an enum on one sample.
+5. **Charcoal filter reset.** There is no `resetcharcoalfilter` field in the
+   shadow. If the vendor app offers a charcoal reset, watch
+   `update/accepted` while pressing it — it may reuse `resetgreasefilter`,
+   or be app-side only. Until this is known, a recirculating hood gets a
+   charcoal-life figure with no way to reset it.
+6. **`fanwarning` vs `alarmfan`.** Neither has ever fired, so what
+   distinguishes them is unknown. Record both if either ever trips.
+7. **`resetgreasefilter` (runbook step 9) — deliberately deferred.** It
+   zeroes `usegreasefiltertime`, which cannot be reconstructed. Do not run
+   it until the grease filter is actually being cleaned.
+
+Writes remain hardware-actuating: validate field names against observed
+`reported` values before writing, and test with the device attended.
 
 ## 8. Security notes
 

@@ -515,20 +515,19 @@ class Hood:
         await self.async_set_fields({"setcleanairfunction": int(bool(on))})
 
     async def async_set_delay_timer(self, value: int) -> None:
-        """Arms the delay-off timer.
+        """Arms the delay-off timer, in SECONDS.
 
-        UNITS UNESTABLISHED: VALIDATION.md question 2 - whether this is
-        seconds or minutes, and whether it snaps to presets, is exactly what
-        the hardware runbook exists to answer. Do not document units as fact
-        anywhere until step 6 of the runbook has run.
+        Seconds, not minutes - established by step 6 of the hardware runbook
+        and recorded in PROTOCOL.md 5. The device accepts arbitrary values;
+        the vendor app exposing only two presets is a UI choice, not a device
+        constraint. The upper bound is still unprobed.
 
         The device derives and decrements `delaytimer` from this itself, so
         only `setdelaytimer` is written.
 
         Args:
-            value: The timer value to write to `setdelaytimer`; units are
-                deliberately undocumented until the runbook establishes
-                them.
+            value: Delay in seconds to write to `setdelaytimer`. Callers
+                working in minutes must multiply by 60.
 
         Raises:
             ZephyrNotConnectedError: If this hood is not connected - never
