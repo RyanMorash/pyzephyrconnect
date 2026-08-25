@@ -27,6 +27,7 @@ from . import const
 from .const import DEFAULT_ENDPOINTS, Endpoints
 from .exceptions import (
     ZephyrAuthError,
+    ZephyrDataError,
     ZephyrError,
     ZephyrPolicyError,
     ZephyrTransportError,
@@ -83,13 +84,16 @@ class ZephyrTokens:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> ZephyrTokens:
-        return cls(
-            username=str(data["username"]),
-            id_token=str(data["id_token"]),
-            refresh_token=str(data["refresh_token"]),
-            identity_id=str(data["identity_id"]),
-            expires_at=float(data["expires_at"]),
-        )
+        try:
+            return cls(
+                username=str(data["username"]),
+                id_token=str(data["id_token"]),
+                refresh_token=str(data["refresh_token"]),
+                identity_id=str(data["identity_id"]),
+                expires_at=float(data["expires_at"]),
+            )
+        except (KeyError, TypeError, ValueError) as err:
+            raise ZephyrDataError("persisted tokens are malformed") from err
 
 
 class AbstractAuth(ABC):
@@ -528,7 +532,7 @@ class CredentialsAuth(AbstractAuth):
                 # transient failure both wastes it and misreports the cause
                 # to the caller. Classify first: only a genuine
                 # ZephyrAuthError falls through to SRP below.
-                _LOGGER.debug("refresh failed (%s)", err)
+                _LOGGER.debug("refresh failed (%s)", type(err).__name__)
                 classified = self._classify(err)
                 if not isinstance(classified, ZephyrAuthError):
                     raise classified from err

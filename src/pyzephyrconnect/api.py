@@ -20,6 +20,7 @@ from .auth import AbstractAuth
 from .exceptions import (
     ZephyrAuthError,
     ZephyrCertificateError,
+    ZephyrDataError,
     ZephyrError,
     ZephyrTransportError,
 )
@@ -114,7 +115,24 @@ class ZephyrApi:
                 if response.status >= 400:
                     raise ZephyrError(f"{url} returned HTTP {response.status}")
                 # The API sends text/plain for some responses.
-                return await response.json(content_type=None)
+                try:
+                    body = await response.json(content_type=None)
+                except (ValueError, UnicodeDecodeError) as err:
+                    # json.JSONDecodeError is a ValueError, and aiohttp does
+                    # not wrap it. A vendor maintenance page or WAF
+                    # interstitial returns non-JSON HTML here - transient,
+                    # not a data-shape bug the caller should treat as fatal.
+                    raise ZephyrTransportError(
+                        f"{url} returned an unparseable body"
+                    ) from err
+                if not isinstance(body, dict):
+                    # aiohttp returns None for an empty 200 body; a bare
+                    # list or string is equally unusable to every caller of
+                    # this method.
+                    raise ZephyrDataError(
+                        f"{url} returned an unexpected body shape"
+                    )
+                return body
         except aiohttp.ClientConnectorCertificateError as err:
             # Must stay ABOVE the ClientError clause - it is a subclass, and
             # the certificate diagnosis is the valuable one.

@@ -1,3 +1,4 @@
+import json
 import ssl
 import time
 from importlib import resources
@@ -14,6 +15,7 @@ from pyzephyrconnect.const import DEFAULT_ENDPOINTS, Endpoints
 from pyzephyrconnect.exceptions import (
     ZephyrAuthError,
     ZephyrCertificateError,
+    ZephyrDataError,
     ZephyrError,
     ZephyrTransportError,
 )
@@ -236,6 +238,35 @@ async def test_certificate_failure_still_wins_over_the_transport_clause():
     api = ZephyrApi(_fake_auth(_RaisingSession(exc)))
     with pytest.raises(ZephyrCertificateError):
         await api.get_own_devices()
+
+
+async def test_non_json_body_raises_zephyr_transport_error():
+    """A vendor maintenance page or WAF interstitial returns a 200 with a
+    non-JSON body. json.JSONDecodeError is a ValueError and aiohttp does not
+    wrap it - left unhandled it would escape _post() as a raw ValueError
+    instead of the ZephyrError subclasses consumers are told to catch."""
+    session = FakeSession(
+        FakeResponse(None, json_exc=json.JSONDecodeError("bad", "<html>", 0))
+    )
+    with pytest.raises(ZephyrTransportError):
+        await ZephyrApi(_fake_auth(session)).get_own_devices()
+
+
+async def test_empty_body_raises_zephyr_data_error():
+    """aiohttp returns None for an empty 200 body. get_own_devices() calls
+    .get('devices') on the result, which would AttributeError on None if
+    _post() did not reject the shape first."""
+    session = FakeSession(FakeResponse(None))
+    with pytest.raises(ZephyrDataError):
+        await ZephyrApi(_fake_auth(session)).get_own_devices()
+
+
+async def test_non_dict_body_raises_zephyr_data_error():
+    """A bare list or string body is equally unusable to every caller of
+    _post(), even though it decoded as valid JSON."""
+    session = FakeSession(FakeResponse(["unexpected", "list"]))
+    with pytest.raises(ZephyrDataError):
+        await ZephyrApi(_fake_auth(session)).get_own_devices()
 
 
 async def test_ssl_context_is_built_once_and_cached(monkeypatch):

@@ -127,10 +127,15 @@ async def main(argv: list[str] | None = None) -> int:
             print("no devices on this account", file=sys.stderr)
             return 1
 
-        hood = next(
-            (h for h in hoods if h.thing_name == args.thing),
-            hoods[0],
-        )
+        if args.thing:
+            hood = next((h for h in hoods if h.thing_name == args.thing), None)
+            if hood is None:
+                # Do not echo the available thing names here - they are
+                # device identifiers.
+                print("error: no device matches --thing", file=sys.stderr)
+                return 2
+        else:
+            hood = hoods[0]
         caps = hood.capabilities
         print(f"device: {caps.model} (fan 0-{caps.max_fan_speed}, "
               f"light 0-{caps.max_light_level})")

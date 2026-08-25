@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from conftest import FakeResponse, FakeSession
 from pyzephyrconnect import client as client_module
 from pyzephyrconnect.auth import Credentials, CredentialsAuth, ZephyrTokens
 from pyzephyrconnect.client import ZephyrClient
@@ -206,6 +207,33 @@ async def test_setup_performs_the_identity_exchange(wired):
     identity_id for the unique ID" depends on the exchange having run."""
     await _client().async_setup()
     wired["auth"].async_get_credentials.assert_awaited()
+
+
+async def test_setup_with_a_none_discover_body_raises_zephyr_error_not_attributeerror():
+    """End-to-end through the REAL ZephyrApi, not the `wired` fixture's
+    mocked one: a discoverdevice response that decodes to None (aiohttp's
+    shape for an empty 200 body) must be rejected by ZephyrApi._post()
+    before it ever reaches HoodCapabilities.from_discover(), which would
+    otherwise blow up as a raw, uncategorized AttributeError instead of a
+    ZephyrError subclass consumers are told to catch."""
+    session = FakeSession(
+        FakeResponse({"devices": [{"thingName": THING}]}),
+        FakeResponse(None),
+    )
+    auth = _auth_double()
+    auth.session = session
+    auth.async_get_tokens = AsyncMock(
+        return_value=ZephyrTokens(
+            username="u@example.com",
+            id_token="ID-TOKEN",
+            refresh_token="R",
+            identity_id="us-west-2:abc",
+            expires_at=time.time() + 3600,
+        )
+    )
+
+    with pytest.raises(ZephyrError):
+        await ZephyrClient(auth).async_setup()
 
 
 # -- identity ---------------------------------------------------------

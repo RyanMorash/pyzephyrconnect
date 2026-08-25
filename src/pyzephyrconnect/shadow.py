@@ -244,9 +244,7 @@ class ShadowClient:
         client.on_subscribe = self._on_subscribe
         client.on_message = self._on_message
 
-        _LOGGER.debug(
-            "connecting to %s as %s", self._endpoints.iot_endpoint, self._client_id
-        )
+        _LOGGER.debug("connecting to %s", self._endpoints.iot_endpoint)
         client.connect_async(self._endpoints.iot_endpoint, 443, keepalive=30)
         client.loop_start()
         self._client = client

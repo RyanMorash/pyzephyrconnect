@@ -341,7 +341,12 @@ without it every message is silently dropped.
 flag reported whichever shadow changed state last.
 
 Each hood's MQTT connection gets its own client ID:
-`mqtt_client_id + "-" + thing_name[:8]`. AWS IoT treats two live connections
+`mqtt_client_id + "-" + thing_name` (the full thing name, not an 8-char
+prefix — deviation from the original design: truncation gave two things
+sharing an 8-char prefix identical client IDs, the exact same-ID eviction
+this suffix exists to prevent, and identity (~50 chars) plus the full
+40-hex thing name stays comfortably under AWS IoT's 128-char client-ID
+limit). AWS IoT treats two live connections
 with the same client ID as one session and evicts one for the other, so N
 hoods sharing the bare `identity_id + "-ha"` would flap forever. The IoT
 policy's client-ID constraint is absent-or-prefix-match (`PROTOCOL.md` §5),

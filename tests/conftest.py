@@ -9,11 +9,20 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 
 class FakeResponse:
-    def __init__(self, payload, status=200):
+    def __init__(self, payload, status=200, json_exc=None):
         self._payload = payload
         self.status = status
+        # Raised by json() instead of returning a value, when set - lets a
+        # test simulate a non-JSON body (a maintenance page, a WAF
+        # interstitial) without touching the network.
+        self._json_exc = json_exc
 
     async def json(self, content_type=None):
+        if self._json_exc is not None:
+            raise self._json_exc
+        # Returned as-is, including None - aiohttp's real json() returns
+        # None for an empty 200 body, and callers must see that literally
+        # rather than some FakeResponse-specific coercion.
         return self._payload
 
     async def text(self):

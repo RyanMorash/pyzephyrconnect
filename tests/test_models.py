@@ -143,7 +143,7 @@ def test_malformed_state_field_degrades_to_none_and_warns(caplog):
 
 def test_present_zero_is_preserved(shadow):
     state = HoodState.from_reported(shadow["state"]["reported"])
-    assert state.power == 0 or state.power is not None
+    assert state.power == 0
 
 
 def test_capabilities_absent_numeric_is_none_not_zero():

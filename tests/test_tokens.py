@@ -3,6 +3,7 @@ import time
 import pytest
 
 from pyzephyrconnect.auth import AbstractAuth, ZephyrTokens
+from pyzephyrconnect.exceptions import ZephyrDataError
 
 
 def _tokens(**overrides):
@@ -40,3 +41,19 @@ def test_expired_is_true_inside_the_refresh_margin():
 def test_abstract_auth_cannot_be_instantiated():
     with pytest.raises(TypeError):
         AbstractAuth(session=None)
+
+
+def test_from_dict_with_a_missing_key_raises_zephyr_data_error():
+    """README tells consumers to call from_dict() on restored storage. A
+    corrupted or partial record must not escape as a raw KeyError."""
+    data = _tokens().as_dict()
+    del data["refresh_token"]
+    with pytest.raises(ZephyrDataError):
+        ZephyrTokens.from_dict(data)
+
+
+def test_from_dict_with_an_unparseable_expiry_raises_zephyr_data_error():
+    data = _tokens().as_dict()
+    data["expires_at"] = "soon"
+    with pytest.raises(ZephyrDataError):
+        ZephyrTokens.from_dict(data)
