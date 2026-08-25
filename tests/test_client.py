@@ -219,11 +219,15 @@ async def test_a_malformed_device_entry_is_skipped_not_crashed(wired, caplog):
 
 async def test_async_setup_refuses_to_run_twice(wired):
     """Re-running setup would replace started Hood objects while their
-    sockets and the supervisor still reference the old ones."""
+    sockets and the supervisor still reference the old ones. The guard is
+    checked before the credential exchange, so a repeat call must not
+    perform a second needless network round trip either."""
     client = _client()
     await client.async_setup()
     with pytest.raises(ZephyrError, match="already run"):
         await client.async_setup()
+
+    wired["auth"].async_get_credentials.assert_awaited_once()
 
 
 async def test_setup_performs_the_identity_exchange(wired):
@@ -269,16 +273,23 @@ async def test_identity_id_returns_the_auth_value(wired):
     assert client.identity_id == "us-west-2:abc"
 
 
-async def test_a_refetched_identity_is_written_back(wired):
-    """mqtt_client_id is derived from identity_id. Keeping a dead one gets a
-    connection where subscribe and publish succeed and every message is
-    silently dropped."""
+async def test_a_refetched_identity_reaches_new_shadow_client_ids(wired):
+    """mqtt_client_id is derived from identity_id. A mid-session refetch
+    (AbstractAuth._identity_override) must reach every shadow built AFTER
+    it, not just client.identity_id - keeping a dead one in a shadow's
+    client ID gets a connection where subscribe and publish succeed and
+    every message is silently dropped."""
     auth = wired["auth"]
-    auth.identity_id = "us-west-2:new"
     client = _client()
-    await client.async_setup()
+    hoods = await client.async_setup()
+
+    auth.identity_id = "us-west-2:new"
+    auth.mqtt_client_id = "us-west-2:new-ha"
+    client._make_shadow(hoods[0])
 
     assert client.identity_id == "us-west-2:new"
+    args = client_module.ShadowClient.call_args.args
+    assert args[1] == f"us-west-2:new-ha-{THING}"
 
 
 def test_identity_id_raises_before_async_setup():

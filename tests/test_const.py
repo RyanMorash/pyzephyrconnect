@@ -1,4 +1,6 @@
 """Constants must stay pinned - these are reverse-engineered values."""
+import dataclasses
+
 import pytest
 
 from pyzephyrconnect import const
@@ -53,5 +55,5 @@ def test_overriding_the_base_moves_both_rest_urls():
 
 
 def test_endpoints_are_frozen():
-    with pytest.raises(Exception):
+    with pytest.raises(dataclasses.FrozenInstanceError):
         DEFAULT_ENDPOINTS.region = "eu-west-1"

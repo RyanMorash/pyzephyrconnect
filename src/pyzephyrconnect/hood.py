@@ -151,14 +151,19 @@ class Hood:
 
     async def _stop(self) -> None:
         if self._shadow is not None:
-            # Swap before the await: a cancellation landing on the await
-            # would otherwise leave _shadow pointing at a torn-down client
-            # with _should_run still True - and async_ensure_running would
-            # then decline to rebuild forever, a permanently dark hood.
+            # Swap before the await, and clear _connected right alongside
+            # it: a cancellation OR a raise landing on the await would
+            # otherwise leave _shadow pointing at a torn-down client with
+            # _should_run still True - and async_ensure_running would then
+            # decline to rebuild forever, a permanently dark hood. The flag
+            # joins the swap on the clear-before-await side because a
+            # failed teardown means the connection is gone regardless -
+            # reporting connected=True with _shadow already None would
+            # mislead the derived `client.connected` and availability logic.
             # Mirrors ShadowClient.disconnect's clear-before-await.
             shadow, self._shadow = self._shadow, None
+            self._connected = False
             await shadow.disconnect()
-        self._connected = False
 
     async def async_poll(self) -> HoodState:
         """Read state over HTTPS. Used at setup and while push is down.

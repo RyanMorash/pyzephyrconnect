@@ -18,10 +18,13 @@ from pyzephyrconnect import ZephyrClient
 
 async with aiohttp.ClientSession() as session:
     client = ZephyrClient.from_credentials("you@example.com", "password", session)
-    for hood in await client.async_setup():
-        print(hood.capabilities.model, hood.capabilities.max_fan_speed)
-        await hood.async_start()
-        print(hood.state)
+    try:
+        for hood in await client.async_setup():
+            print(hood.capabilities.model, hood.capabilities.max_fan_speed)
+            await hood.async_start()
+            print(hood.state)
+    finally:
+        await client.async_stop()
 ```
 
 ## Persisting tokens
@@ -31,6 +34,8 @@ session and a callback to save new ones, and a restart skips the SRP
 login entirely:
 
 ```python
+from pyzephyrconnect import ZephyrClient, ZephyrTokens
+
 client = ZephyrClient.from_credentials(
     username, password, session,
     tokens=ZephyrTokens.from_dict(saved) if saved else None,

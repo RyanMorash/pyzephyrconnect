@@ -365,6 +365,23 @@ async def test_stop_swaps_the_shadow_reference_before_the_await():
     shadow.connect.assert_awaited_once()  # not revived
 
 
+async def test_connected_flag_clears_before_a_failed_teardown_propagates():
+    """A disconnect() that raises must not leave the hood reporting
+    connected=True with _shadow already torn down - that would mislead the
+    derived client.connected and availability logic. The flag joins the
+    swap on the clear-before-await side of _stop for exactly this reason."""
+    hood, shadow = _hood()
+    await hood.async_start()
+    hood.handle_connection_change(True)
+    shadow.disconnect = AsyncMock(side_effect=OSError("boom"))
+
+    with pytest.raises(OSError):
+        await hood.async_stop()
+
+    assert hood.connected is False
+    assert hood._shadow is None
+
+
 async def test_typed_power_and_delay_timer_publish_shapes():
     hood, shadow = _hood()
     await hood.async_start()

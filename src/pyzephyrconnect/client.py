@@ -133,17 +133,19 @@ class ZephyrClient:
 
     async def async_setup(self) -> list[Hood]:
         """Authenticate and discover every hood on the account."""
+        if self._hoods:
+            # Re-running setup would replace started Hood objects while
+            # their sockets and the supervisor still reference the old ones.
+            # One client = one setup; build a new client to re-discover.
+            # Checked before the credential exchange below so a repeat call
+            # fails fast instead of paying for a needless network round trip.
+            raise ZephyrError("async_setup() has already run on this client")
         # The full chain, not just tokens: this performs the identity
         # exchange, which is what makes auth.identity_id readable - the
         # config-flow ordering "async_setup(), then read identity_id for
         # the unique ID" depends on it. Also exactly what the pre-refactor
         # authenticate() verified at setup.
         await self._auth.async_get_credentials()
-        if self._hoods:
-            # Re-running setup would replace started Hood objects while
-            # their sockets and the supervisor still reference the old ones.
-            # One client = one setup; build a new client to re-discover.
-            raise ZephyrError("async_setup() has already run on this client")
         devices = await self._api.get_own_devices()
         if not isinstance(devices, list):
             # get_own_devices is typed to return a list, but this is the
