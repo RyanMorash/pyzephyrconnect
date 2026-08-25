@@ -1292,14 +1292,13 @@ async def test_async_stop_isolates_one_hoods_teardown_failure(wired):
 
 
 async def test_async_stop_tears_down_every_hood_before_honouring_a_cancel(wired):
-    """Shutdown was asymmetric about cancellation: suppress(BaseException)
-    around the supervisor await could swallow a caller's cancel outright,
-    while a cancellation arriving during hood.async_stop() escaped the
-    `except Exception` and stranded every remaining hood - a leaked paho
-    network thread each. Both funnel here now (asyncio re-delivers a
-    swallowed cancel at the next await, which is this loop): each hood is
-    torn down, and only then is the cancellation re-raised so the caller
-    that asked for it still sees it."""
+    """Shutdown was asymmetric about cancellation: a cancellation arriving
+    during hood.async_stop() escaped the `except Exception` and stranded
+    every remaining hood - a leaked paho network thread each. This is the
+    mid-loop half of the funnel (the supervisor-await half is pinned by
+    test_async_stop_honours_a_cancel_landing_on_the_supervisor_await); both
+    set the same flag, so each hood is torn down and only then is the
+    cancellation re-raised so the caller that asked for it still sees it."""
     first = json.loads((FIXTURES / "discoverdevice.json").read_text())
     second = json.loads((FIXTURES / "discoverdevice.json").read_text())
     second["thingName"] = OTHER
@@ -1338,10 +1337,10 @@ async def test_async_stop_tears_down_every_hood_before_honouring_a_cancel(wired)
 
 
 async def test_async_stop_suppresses_a_supervisor_that_raised(wired):
-    """`with contextlib.suppress(BaseException)` around awaiting the
-    supervisor must swallow ANY exception it finished with, not just
-    CancelledError - narrowing that guard would skip the hood-stopping loop
-    entirely, leaking a paho thread per hood, and leave `_supervisor` set so
+    """The `except Exception` around awaiting the supervisor must swallow
+    whatever ordinary exception it finished with, not just CancelledError -
+    letting it out would skip the hood-stopping loop entirely, leaking a
+    paho thread per hood, and leave `_supervisor` set so
     `_ensure_supervisor` never restarts it."""
     client = _client()
     hoods = await client.async_setup()
@@ -1354,6 +1353,79 @@ async def test_async_stop_suppresses_a_supervisor_that_raised(wired):
     await asyncio.sleep(0)
     assert task.done()
     client._supervisor = task
+
+    await client.async_stop()          # must not raise
+
+    assert client._supervisor is None
+    assert hoods[0]._should_run is False
+    wired["shadow"].disconnect.assert_awaited()
+
+
+async def _stubborn_supervisor() -> None:
+    """A supervisor that survives its first cancel long enough to be caught.
+
+    `async_stop` cancels the supervisor and awaits it. If the task finished
+    instantly the await would never suspend, and a cancel aimed at THIS
+    method could not land there - the very case under test. Absorbing the
+    first CancelledError and sleeping before re-raising holds the await
+    open for one real tick, which is the window the tests below aim at.
+    """
+    try:
+        await asyncio.sleep(3600)
+    except asyncio.CancelledError:
+        await asyncio.sleep(0.05)
+        raise
+
+
+async def test_async_stop_honours_a_cancel_landing_on_the_supervisor_await(
+    wired,
+):
+    """A caller's cancel delivered DURING `await self._supervisor` must not
+    be swallowed. Python never re-delivers a caught cancellation, so the
+    hood-loop funnel cannot rescue this one: blanket suppression here let
+    async_stop return normally while the caller (wait_for, a task group)
+    believed it had cancelled - the cancellation contract, silently broken.
+    Teardown still comes first: every hood is stopped, and only then is the
+    CancelledError re-raised."""
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+    client._supervisor.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await client._supervisor
+    client._supervisor = asyncio.create_task(_stubborn_supervisor())
+    await asyncio.sleep(0)                      # let it reach its sleep
+
+    stop_task = asyncio.create_task(client.async_stop())
+    for _ in range(2):                          # reach the supervisor await
+        await asyncio.sleep(0)
+    stop_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await stop_task
+
+    wired["shadow"].disconnect.assert_awaited()  # torn down before it flew
+    assert hoods[0]._should_run is False
+    assert client._supervisor is None
+
+
+async def test_async_stop_does_not_mistake_its_own_cancel_for_the_callers(
+    wired,
+):
+    """The discrimination pin. `async_stop` cancels the supervisor itself,
+    so `await self._supervisor` raises CancelledError on the ordinary path
+    too - the same exception type as the case above. Only
+    `current_task().cancelling()` separates them, and reading it wrong here
+    would turn every clean shutdown into a spurious CancelledError at the
+    consumer."""
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+    client._supervisor.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await client._supervisor
+    client._supervisor = asyncio.create_task(_stubborn_supervisor())
+    await asyncio.sleep(0)
 
     await client.async_stop()          # must not raise
 

@@ -24,7 +24,6 @@ Three behaviours here are deliberate and documented rather than changed:
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 from collections.abc import Callable
 from typing import Any
@@ -205,29 +204,43 @@ class ZephyrClient:
         client, not to any one hood, and keeps ticking (renewing credentials,
         reconnecting whatever is still `_should_run`) until this cancels it.
         """
+        # Set BEFORE the supervisor block: a caller's cancellation can land
+        # either at the supervisor await or inside the hood loop, and both
+        # sites funnel into this one flag so the cancellation is honoured
+        # exactly once, after every hood is down.
+        cancelled = False
         if self._supervisor is not None:
             self._supervisor.cancel()
             # Await it. Cancelling without awaiting can leave a hood halfway
             # through async_reconnect() with no socket and no supervisor, and
             # lets the task be collected with an unretrieved CancelledError.
-            # Suppress BaseException, not just CancelledError: a supervisor
-            # that died with some other exception would otherwise re-raise
-            # it here, which skips the hood-stopping loop below entirely -
-            # leaking a paho network thread per hood on every consumer
-            # reload - and leaves _supervisor set, so _ensure_supervisor's
-            # `is None or .done()` check never restarts it and every retry
-            # fails forever. The exception itself is not lost: _supervise's
-            # own except clauses already logged it before the task exited.
-            with contextlib.suppress(BaseException):
+            try:
                 await self._supervisor
+            except asyncio.CancelledError:
+                # Awaiting a task we just cancelled raises CancelledError -
+                # expected, not the caller's. But a cancel delivered to THIS
+                # task during the await raises the same type, and blanket
+                # suppression would swallow it for good: Python does not
+                # re-deliver a caught cancellation, so async_stop would
+                # return normally and the caller's cancellation contract
+                # (wait_for, task groups) would silently break. cancelling()
+                # counts only external cancel() requests against this task,
+                # so it is the discriminator. Honour the caller's cancel
+                # AFTER every hood is torn down, via the flag above.
+                if asyncio.current_task().cancelling() > 0:
+                    cancelled = True
+            except Exception:  # noqa: BLE001
+                # The supervisor died with its own error; it already logged
+                # it (see _supervise's except clauses), and a dead supervisor
+                # must not block teardown. Re-raising here would skip the
+                # hood-stopping loop below entirely - leaking a paho network
+                # thread per hood on every consumer reload - and leave
+                # _supervisor set, so _ensure_supervisor's `is None or
+                # .done()` check never restarts it and every retry fails.
+                pass
             self._supervisor = None
         # A cancellation reaching this loop must not strand the hoods that
         # have not been torn down yet, and must not be swallowed either.
-        # Note this is also where a CALLER's cancellation resurfaces: the
-        # suppress(BaseException) above swallows it at the supervisor await,
-        # and asyncio re-delivers a pending cancellation at the next await
-        # point - which is this loop - so both cases funnel through here.
-        cancelled = False
         for hood in self._hoods.values():
             try:
                 await hood.async_stop()
