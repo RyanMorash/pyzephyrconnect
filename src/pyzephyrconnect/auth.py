@@ -569,6 +569,10 @@ class CredentialsAuth(AbstractAuth):
                 stored.refresh_token if stored else ""
             ),
             identity_id=identity_id,
+            # The AWS credential expiry stands in for the token expiry.
+            # Both are one hour from this same exchange, so they track - but
+            # that is an assumption, not a guarantee. If they ever diverge,
+            # read the `exp` claim off the ID token instead.
             expires_at=credentials.expiration.timestamp(),
         )
         self._seen_tokens = self._tokens

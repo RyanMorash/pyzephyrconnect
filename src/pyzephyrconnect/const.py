@@ -65,6 +65,12 @@ CLIENT_ID_SUFFIX = "-ha"
 # Credentials last 1 hour. Refresh early enough to rebuild the socket.
 REFRESH_MARGIN_SECONDS = 600
 
+# How often the refresh supervisor wakes to check credential expiry and
+# reopen any hood the consumer wants up. Well inside REFRESH_MARGIN_SECONDS,
+# so a tick that fails transiently still has many more before the signature
+# on the presigned WebSocket URL actually dies.
+SUPERVISOR_INTERVAL_SECONDS = 60
+
 # Fields the probe CLI is permitted to write. Everything else in the shadow
 # is a counter, an alarm, or device-reported telemetry. Note: delaytimer is
 # device-reported only; the device derives and decrements it from setdelaytimer,

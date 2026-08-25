@@ -118,6 +118,18 @@ class Hood:
             if self._should_run and self._shadow is None:
                 await self._start()
 
+    async def _stop_for_supervisor(self) -> None:
+        """Close the socket without clearing consumer intent.
+
+        The supervisor's terminal branch calls this: paho must stop
+        hammering presigned URLs that can no longer be renewed, and the
+        derived `connected` property must flip to False - but the consumer
+        never asked for this hood to stop, so _should_run survives and the
+        recovery path (async_ensure_running) can still bring it back.
+        """
+        async with self._lock:
+            await self._stop()
+
     # Lock-free bodies. Callers above hold self._lock; asyncio.Lock is not
     # reentrant, so async_reconnect cannot call the public methods.
 
