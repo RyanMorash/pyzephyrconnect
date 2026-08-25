@@ -7,6 +7,7 @@ import pytest
 
 from pyzephyrconnect.probe import (
     _REDACT,
+    _range,
     _redacted,
     diff_states,
     parse_assignment,
@@ -76,6 +77,23 @@ def test_dangerous_writes_pass_with_both_flags(field):
     """Tests that dangerous fields validate with --confirm and --force."""
     with nullcontext():
         validate_write(field, confirmed=True, forced=True)
+
+
+@pytest.mark.parametrize(("maximum", "expected"), [(6, "0-6"), (3, "0-3"), (0, "0-0")])
+def test_range_formats_an_advertised_maximum(maximum, expected):
+    """Tests that an advertised maximum renders as the 0-N device banner form."""
+    assert _range(maximum) == expected
+
+
+def test_range_names_an_unadvertised_maximum_unknown():
+    """Tests that a missing maximum renders as 'range unknown', never '0-None'.
+
+    A hood we have never seen may not advertise maxFanSpeed or
+    maxLightLevel; the device banner must say so instead of printing the
+    literal '0-None'.
+    """
+    assert _range(None) == "range unknown"
+    assert "None" not in _range(None)
 
 
 def test_diff_reports_only_changed_keys():
