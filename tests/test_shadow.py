@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import ssl
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
@@ -111,6 +112,20 @@ async def test_connect_targets_port_443(fake_paho):
     await _connect(_make())
     args = fake_paho.connect_async.call_args.args
     assert args[1] == 443
+
+
+async def test_connecting_log_omits_the_client_id_and_thing_name(fake_paho, caplog):
+    """Pins the scrubbed DEBUG connect log: it may name the endpoint, but
+    never the per-connection client ID (identity + thing name) or the bare
+    thing name - both are personal data, and a careless future edit that
+    logs `self._client_id` directly must fail this test."""
+    sc = _shadow()
+    with caplog.at_level(logging.DEBUG, logger="pyzephyrconnect.shadow"):
+        await _connect(sc)
+
+    assert "connecting to" in caplog.text
+    assert "us-west-2:abc-ha" not in caplog.text
+    assert THING not in caplog.text
 
 
 async def test_denied_subscribe_surfaces_as_a_policy_error_from_connect(fake_paho):

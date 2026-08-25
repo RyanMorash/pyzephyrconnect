@@ -1,3 +1,4 @@
+import logging
 import time
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
@@ -537,6 +538,35 @@ async def test_transient_refresh_failure_raises_instead_of_burning_an_srp_login(
         await auth.async_get_tokens()
 
     fake_aws["cognito"].authenticate.assert_not_called()
+
+
+async def test_refresh_failure_log_is_scrubbed_of_the_rejection_detail(
+    fake_aws, caplog
+):
+    """The DEBUG refresh-failure log must record only the exception TYPE,
+    never its message - botocore's ClientError echoes the Message field
+    back verbatim, and that field can carry a secret. Drives the same
+    NotAuthorizedException -> SRP-fallback path as
+    test_rejected_refresh_token_falls_back_to_srp, but asserts on the log
+    instead of the outcome, to catch a future edit that logs str(err)."""
+    fake_aws["cognito"].renew_access_token.side_effect = ClientError(
+        {
+            "Error": {
+                "Code": "NotAuthorizedException",
+                "Message": "refresh token invalid: SECRET-SENTINEL",
+            }
+        },
+        "InitiateAuth",
+    )
+    auth = CredentialsAuth(
+        "user@example.com", "pw", MagicMock(), tokens=_stored_tokens()
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="pyzephyrconnect.auth"):
+        await auth.async_get_tokens()
+
+    assert "refresh failed" in caplog.text
+    assert "SECRET-SENTINEL" not in caplog.text
 
 
 async def test_refresh_path_replays_the_stored_identity_without_refetching(fake_aws):

@@ -145,7 +145,19 @@ class ZephyrClient:
             # One client = one setup; build a new client to re-discover.
             raise ZephyrError("async_setup() has already run on this client")
         devices = await self._api.get_own_devices()
+        if not isinstance(devices, list):
+            # get_own_devices is typed to return a list, but this is the
+            # last line of defense against a vendor response shape change -
+            # iterating a dict would silently walk its keys instead of
+            # raising, and a scalar would blow up with a bare TypeError.
+            _LOGGER.warning("getowndevices returned an unexpected shape; no devices")
+            devices = []
         for device in devices:
+            if not isinstance(device, dict):
+                # Same defense, per-entry: a malformed list element must not
+                # reach device.get() below and raise AttributeError.
+                _LOGGER.warning("skipping a malformed device entry")
+                continue
             if not (thing_name := device.get("thingName")):
                 # A KeyError here would escape ZephyrError and reach the
                 # consumer as an unknown crash rather than a setup retry.

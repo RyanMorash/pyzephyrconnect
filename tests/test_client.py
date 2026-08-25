@@ -193,6 +193,30 @@ async def test_a_device_with_no_thing_name_is_skipped_not_crashed(wired):
     assert hoods[0].thing_name == THING
 
 
+async def test_get_own_devices_returning_a_non_list_yields_no_hoods(wired, caplog):
+    """A vendor response shape change (e.g. an error body decoding to a bare
+    string) must not escape as an AttributeError/TypeError from the `for`
+    loop below - it should be treated as zero devices."""
+    wired["api"].get_own_devices = AsyncMock(return_value="T1")
+    with caplog.at_level(logging.WARNING):
+        hoods = await _client().async_setup()
+    assert hoods == []
+    assert "unexpected shape" in caplog.text
+
+
+async def test_a_malformed_device_entry_is_skipped_not_crashed(wired, caplog):
+    """A non-dict element in the devices list (e.g. None) must not reach
+    device.get("thingName") and raise AttributeError."""
+    wired["api"].get_own_devices = AsyncMock(
+        return_value=[None, {"thingName": THING}]
+    )
+    with caplog.at_level(logging.WARNING):
+        hoods = await _client().async_setup()
+    assert len(hoods) == 1
+    assert hoods[0].thing_name == THING
+    assert "malformed device entry" in caplog.text
+
+
 async def test_async_setup_refuses_to_run_twice(wired):
     """Re-running setup would replace started Hood objects while their
     sockets and the supervisor still reference the old ones."""
