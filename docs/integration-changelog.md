@@ -85,10 +85,61 @@ Notes:
   `AbstractAuth`, implement `async_get_tokens()`, and pass the instance to
   `ZephyrClient(auth)` directly.
 
-### `identity_id` is unchanged
+> ### Redact the tokens in diagnostics before shipping persistence
+>
+> `ZephyrTokens.as_dict()` contains `id_token` and `refresh_token`. A Cognito
+> refresh token is valid for around 30 days by default and is on its own
+> sufficient to take over the account.
+>
+> If you store it under `entry.data["tokens"]`, the existing diagnostics
+> handler will dump it. `async_redact_data` matches on key names, so a
+> `REDACT_KEYS` set containing `CONF_PASSWORD` will **not** reach `id_token`
+> or `refresh_token` nested inside a `tokens` sub-dict — they will appear in
+> full. The entire premise of that diagnostics file is that it is safe to
+> paste into a public issue, so this must be handled in the same commit that
+> introduces persistence, not after.
+>
+> Add the token keys to the redaction set, or redact the whole `tokens` key:
+>
+> ```python
+> REDACT_KEYS = {
+>     "thingName", "SN", "MAC", "location",
+>     CONF_USERNAME, CONF_PASSWORD,
+>     "tokens", "id_token", "refresh_token",
+> }
+> ```
+>
+> `identity_id` is a stable account identifier and is worth redacting for the
+> same reason `SN` and `MAC` are, even though it is not a credential.
+>
+> Consider whether the tokens belong in `entry.data` at all. Home Assistant
+> stores config entries as plain JSON in `.storage/core.config_entries`. The
+> password is already there, so tokens are not a new class of exposure — but
+> they are a second live credential to keep track of, and one that is easy to
+> forget when writing a redaction list.
 
-`client.identity_id` still returns the full `us-west-2:uuid` string and is
-still the right unique ID for the config entry.
+### `identity_id` is unchanged, and is the right config entry unique ID
+
+`client.identity_id` still returns the full `us-west-2:uuid` string.
+
+It is a sound permanent unique ID for the account's config entry. Cognito
+Identity Pools key an identity on the *provider's* user identifier, which for
+a User Pool provider is the immutable `sub` claim — not the email, not the
+password. So it survives a password change, survives an email change, is
+idempotent across `get_id` calls, and does not change on token refresh. It is
+also the right granularity: this is a hub-type integration where one account
+can own several hoods, so `thingName` would be per-device and the email is
+both mutable and personal data.
+
+The one theoretical failure is the vendor recreating their identity pool,
+which would reissue every user's ID. Not worth designing around: the IoT
+policy attachments are keyed on identity IDs too, so that event breaks the
+integration outright and a churned unique ID is the least of it.
+
+`identity_id` is now read directly off the auth object rather than
+reconstructed by stripping the `-ha` suffix off the MQTT client ID. Availability
+is unchanged — it raises `ZephyrAuthError` until tokens have been acquired, and
+`async_setup()` acquires them, so the existing config-flow ordering still works.
 
 ---
 

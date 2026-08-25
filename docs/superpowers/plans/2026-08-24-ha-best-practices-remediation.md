@@ -749,6 +749,19 @@ class AbstractAuth(ABC):
     @abstractmethod
     async def async_get_tokens(self) -> ZephyrTokens:
         """Return valid, unexpired tokens, refreshing if necessary."""
+
+    @property
+    def identity_id(self) -> str:
+        """Cognito identity ID from the most recent tokens.
+
+        Consumers use this as a stable per-account key. Implementations that
+        cache tokens differently should override this; the default reads the
+        `_tokens` attribute an implementation is expected to maintain.
+        """
+        tokens = getattr(self, "_tokens", None)
+        if tokens is None:
+            raise ZephyrAuthError("async_get_tokens() has not been called")
+        return tokens.identity_id
 ```
 
 Export `AbstractAuth` and `ZephyrTokens` from `src/pyzephyrconnect/__init__.py`.
@@ -889,6 +902,28 @@ async def test_stale_identity_id_is_discarded_and_refetched_once(fake_aws):
     assert identity.get_credentials_for_identity.call_count == 2
 
 
+async def test_identity_id_is_read_not_reconstructed(fake_aws):
+    """Consumers use this as a config entry's permanent unique ID, so it must
+    come from the tokens rather than by stripping a suffix off a value
+    derived from it."""
+    auth = CredentialsAuth("user@example.com", "pw", MagicMock())
+    await auth.async_get_tokens()
+
+    assert auth.identity_id == IDENTITY
+    assert auth.mqtt_client_id == f"{auth.identity_id}-ha"
+
+
+async def test_identity_id_survives_a_refresh(fake_aws):
+    """Password changes and token refreshes must not change the account key -
+    the identity pool keys this on the user pool's immutable sub claim."""
+    auth = CredentialsAuth(
+        "user@example.com", "pw", MagicMock(), tokens=_stored_tokens()
+    )
+    first = (await auth.async_get_tokens()).identity_id
+    auth._tokens = _stored_tokens()          # force another refresh
+    assert (await auth.async_get_tokens()).identity_id == first
+
+
 async def test_mqtt_client_id_keeps_the_region_prefix_and_suffix(fake_aws):
     """The policy pins client ID to identity; the suffix is what lets this
     coexist with the phone app instead of evicting it."""
@@ -944,15 +979,31 @@ class CredentialsAuth(AbstractAuth):
         self._credentials: Credentials | None = None
 
     @property
+    def identity_id(self) -> str:
+        """Cognito identity ID, the full "us-west-2:uuid" string.
+
+        Stable per account: the identity pool keys this on the user pool's
+        immutable `sub` claim, so it survives password and email changes and
+        is idempotent across calls. That makes it the natural unique key for
+        a consumer that needs to identify this account - for example a Home
+        Assistant config entry's unique ID.
+
+        Raises ZephyrAuthError if async_get_tokens() has not run yet.
+        """
+        if self._tokens is None:
+            raise ZephyrAuthError("async_get_tokens() has not been called")
+        return self._tokens.identity_id
+
+    @property
     def mqtt_client_id(self) -> str:
         """Identity ID plus a stable suffix.
 
         The IoT policy pins the client ID to the identity. Using the bare
         identity ID makes this library and the phone app evict each other.
+
+        Derived from identity_id, never the other way around.
         """
-        if self._tokens is None:
-            raise ZephyrAuthError("async_get_tokens() has not been called")
-        return f"{self._tokens.identity_id}{const.CLIENT_ID_SUFFIX}"
+        return f"{self.identity_id}{const.CLIENT_ID_SUFFIX}"
 
     # -- blocking bodies, run in a worker thread ----------------------
 
@@ -1974,8 +2025,14 @@ class ZephyrClient:
 
     @property
     def identity_id(self) -> str:
-        """Cognito identity ID. Stable per account; a natural unique key."""
-        return self._auth.mqtt_client_id.removesuffix(const.CLIENT_ID_SUFFIX)
+        """Cognito identity ID. Stable per account; a natural unique key.
+
+        Reads the identity straight off the auth object. Do not reconstruct
+        it by stripping the suffix off mqtt_client_id - that derives a source
+        from its own derivative and returns a wrong value the day
+        CLIENT_ID_SUFFIX changes.
+        """
+        return self._auth.identity_id
 
     async def async_setup(self) -> list[Hood]:
         """Authenticate and discover every hood on the account."""
