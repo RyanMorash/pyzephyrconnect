@@ -1,5 +1,10 @@
 """Constants must stay pinned - these are reverse-engineered values."""
+import dataclasses
+
+import pytest
+
 from pyzephyrconnect import const
+from pyzephyrconnect.const import DEFAULT_ENDPOINTS, Endpoints
 
 
 def test_aws_constants_are_pinned():
@@ -30,3 +35,25 @@ def test_writable_fields_cover_the_validation_sequence():
     # device to set delaytimer to 300 and count it down in 60-second intervals,
     # so delaytimer must not be in the write allowlist.
     assert "delaytimer" not in const.WRITABLE_FIELDS
+
+
+def test_defaults_reproduce_the_current_constants():
+    e = DEFAULT_ENDPOINTS
+    assert e.region == "us-west-2"
+    assert e.iot_endpoint == "a1nqxu0hki9zw3-ats.iot.us-west-2.amazonaws.com"
+    assert e.device_api_list == "https://zephyr-prod-app.gemteks.com/prod/getowndevices"
+    assert e.device_api_discover == "https://zephyr-prod-app.gemteks.com/prod/discoverdevice"
+    assert e.provider == "cognito-idp.us-west-2.amazonaws.com/us-west-2_McuoKpkna"
+
+
+def test_overriding_the_base_moves_both_rest_urls():
+    """Developers must be able to specify API locations - a staging host, or
+    a vendor host change, should not require a release."""
+    e = Endpoints(device_api_base="https://staging.example.com/prod")
+    assert e.device_api_list == "https://staging.example.com/prod/getowndevices"
+    assert e.device_api_discover == "https://staging.example.com/prod/discoverdevice"
+
+
+def test_endpoints_are_frozen():
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        DEFAULT_ENDPOINTS.region = "eu-west-1"

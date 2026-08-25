@@ -2,6 +2,7 @@
 
 All values reverse-engineered from the vendor iOS app. See PROTOCOL.md.
 """
+from dataclasses import dataclass, field
 
 REGION = "us-west-2"
 USER_POOL = "us-west-2_McuoKpkna"
@@ -20,12 +21,55 @@ DEVICE_API_BASE = "https://zephyr-prod-app.gemteks.com/prod"
 DEVICE_API_LIST = f"{DEVICE_API_BASE}/getowndevices"
 DEVICE_API_DISCOVER = f"{DEVICE_API_BASE}/discoverdevice"
 
+
+@dataclass(frozen=True, slots=True)
+class Endpoints:
+    """Where the vendor cloud lives.
+
+    Defaults reproduce the production Zephyr/Gemtek deployment. They are
+    overridable so the library can be pointed at a staging host, exercised
+    in tests without monkeypatching module globals, and survive a vendor
+    host change without needing a release.
+    """
+
+    region: str = REGION
+    user_pool: str = USER_POOL
+    client_id: str = CLIENT_ID
+    # repr=False: it is already public (ships in the iOS bundle), but there
+    # is no reason to print it in logs or tracebacks.
+    client_secret: str = field(default=CLIENT_SECRET, repr=False)
+    identity_pool: str = IDENTITY_POOL
+    iot_endpoint: str = IOT_ENDPOINT
+    device_api_base: str = DEVICE_API_BASE
+
+    @property
+    def provider(self) -> str:
+        """Cognito login-provider key for the identity-pool exchange."""
+        return f"cognito-idp.{self.region}.amazonaws.com/{self.user_pool}"
+
+    @property
+    def device_api_list(self) -> str:
+        return f"{self.device_api_base}/getowndevices"
+
+    @property
+    def device_api_discover(self) -> str:
+        return f"{self.device_api_base}/discoverdevice"
+
+
+DEFAULT_ENDPOINTS = Endpoints()
+
 # Suffix appended to the Cognito identity ID to form the MQTT client ID, so
 # the library can coexist with the phone app instead of evicting it.
 CLIENT_ID_SUFFIX = "-ha"
 
 # Credentials last 1 hour. Refresh early enough to rebuild the socket.
 REFRESH_MARGIN_SECONDS = 600
+
+# How often the refresh supervisor wakes to check credential expiry and
+# reopen any hood the consumer wants up. Well inside REFRESH_MARGIN_SECONDS,
+# so a tick that fails transiently still has many more before the signature
+# on the presigned WebSocket URL actually dies.
+SUPERVISOR_INTERVAL_SECONDS = 60
 
 # Fields the probe CLI is permitted to write. Everything else in the shadow
 # is a counter, an alarm, or device-reported telemetry. Note: delaytimer is

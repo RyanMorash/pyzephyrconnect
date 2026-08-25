@@ -36,8 +36,10 @@ Expect: device line (model, fan 0-6, light 0-3), then the current state
 dump with identifiers redacted. If the connection is refused or nothing
 arrives, stop — see Troubleshooting.
 
-While it watches, press a button on the hood itself. You should see the
-change appear. That confirms push updates work before you write anything.
+While it watches, press a button on the hood itself. The watch window is
+not a live stream — when it ends, the CLI prints a before/after diff, and
+your button press should appear in it. That confirms push updates work
+before you write anything.
 
 ## The sequence
 
@@ -113,8 +115,9 @@ raises `ZephyrPolicyError` on a denied subscribe, so you should see a
 clear error rather than silence — if you get silence instead, that is a
 bug worth reporting.
 
-**`ZephyrAuthError`.** Credentials wrong or the ID token expired.
-Tokens last one hour; the library refreshes at ~50 min.
+**`ZephyrAuthError`.** Credentials wrong, or both the refresh token and a
+fresh SRP login failed. Tokens last one hour; the library refreshes them in
+the request path and rebuilds the MQTT socket before they expire.
 
 **`ZephyrCertificateError`.** The vendor's chain is no longer trusted by
 either the system CA store or the bundled TWCA anchors — likely a vendor

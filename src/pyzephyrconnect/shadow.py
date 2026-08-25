@@ -10,9 +10,11 @@ with no error anywhere.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
-from collections.abc import Callable
+import ssl
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlsplit
@@ -21,10 +23,25 @@ import paho.mqtt.client as mqtt
 
 from . import const
 from .auth import Credentials
-from .exceptions import ZephyrPolicyError, ZephyrTransportError
+from .const import DEFAULT_ENDPOINTS, Endpoints
+from .exceptions import (
+    ZephyrNotConnectedError,
+    ZephyrPolicyError,
+    ZephyrTransportError,
+    ZephyrWriteError,
+)
 from .presign import build_presigned_url
 
 _LOGGER = logging.getLogger(__name__)
+
+
+class _PublishQueued(Exception):
+    """Internal: paho accepted the message but had no socket to send it.
+
+    Never escapes this module. _publish is synchronous and cannot tear the
+    connection down itself, so it raises this for its async callers to act
+    on - they disconnect, then raise ZephyrNotConnectedError.
+    """
 
 
 class ShadowTopics:
@@ -87,11 +104,16 @@ class ShadowClient:
         client_id: str,
         on_message: Callable[[str, dict[str, Any]], None],
         on_connection_change: Callable[[bool], None],
+        credentials_provider: Callable[[], Awaitable[Credentials]],
+        *,
+        endpoints: Endpoints = DEFAULT_ENDPOINTS,
     ) -> None:
         self.topics = ShadowTopics(thing_name)
         self._client_id = client_id
         self._on_message_cb = on_message
         self._on_connection_cb = on_connection_change
+        self._credentials_provider = credentials_provider
+        self._endpoints = endpoints
         self._client: mqtt.Client | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._connected = asyncio.Event()
@@ -120,6 +142,26 @@ class ShadowClient:
         self._dispatch(self._reset_subscription_state, len(topics))
         for topic in topics:
             client.subscribe(topic, qos=1)
+        try:
+            # paho re-fires on_connect on ITS OWN auto-reconnect, and nothing
+            # else re-reads the shadow there: every state change during the
+            # outage stays invisible until the hourly supervisor represign
+            # rebuilds the socket and Hood._start issues a fresh GET. The
+            # broker processes the SUBSCRIBEs above first on this same
+            # connection, so get/accepted lands on a live subscription. On the
+            # initial connect this merely duplicates Hood._start's
+            # request_state - a second empty GET, which is harmless.
+            #
+            # The callback's `client`, NOT self._client: during the first
+            # handshake connect() has not assigned self._client yet, so this
+            # would silently skip exactly the path it exists to cover.
+            #
+            # Runs on paho's network thread, so it may never raise - see the
+            # module docstring. Best-effort: the next represign re-reads
+            # anyway.
+            client.publish(self.topics.get, "{}", qos=1)
+        except Exception:  # noqa: BLE001
+            pass
         self._dispatch(self._connected.set)
         self._dispatch(self._on_connection_cb, True)
 
@@ -181,14 +223,29 @@ class ShadowClient:
 
     # -- async surface -------------------------------------------------
 
-    async def connect(self, credentials: Credentials, timeout: float = 15.0) -> None:
+    async def connect(self, timeout: float = 15.0) -> None:
+        """Open the WebSocket and subscribe to the shadow topics.
+
+        Credentials are fetched from the provider on every attempt rather
+        than captured once: the presigned URL embeds a SigV4 signature that
+        expires with them, so a reconnect must re-presign or it will retry a
+        URL AWS IoT has already stopped accepting.
+        """
         self._loop = asyncio.get_running_loop()
+        if self._client is not None:
+            # connect() is the ~50-minute reconnect path; connecting over a
+            # live client would leak its network thread and reuse stale
+            # readiness events.
+            await self.disconnect()
+        self._connected.clear()
+        self._subscribed.clear()
+        credentials = await self._credentials_provider()
         url = build_presigned_url(
             credentials.access_key,
             credentials.secret_key,
             credentials.session_token,
-            endpoint=const.IOT_ENDPOINT,
-            region=const.REGION,
+            endpoint=self._endpoints.iot_endpoint,
+            region=self._endpoints.region,
             now=datetime.now(UTC),
         )
         parts = urlsplit(url)
@@ -201,8 +258,19 @@ class ShadowClient:
         )
         client.ws_set_options(path=f"{parts.path}?{parts.query}")
         # The IoT ATS endpoint chains to Amazon Root CA 1, which system trust
-        # stores already carry. Only the vendor REST host needs the extra CAs.
-        client.tls_set()
+        # stores already carry. Only the vendor REST host needs the extra CAs,
+        # so this is a plain default context - NOT the TWCA one.
+        #
+        # Built in a worker thread and handed to paho finished. paho's
+        # tls_set() constructs the context inline on the calling thread: it
+        # does ssl.SSLContext(...) and then, because ca_certs is None,
+        # context.load_default_certs() - which Home Assistant instruments as
+        # a blocking call. connect() is async and runs on the event loop, and
+        # this path executes on every connect including every supervisor
+        # reconnect.
+        client.tls_set_context(
+            await asyncio.to_thread(ssl.create_default_context)
+        )
         # paho retries indefinitely at a fixed short interval by default. Cap
         # the backoff so an expired credential does not become a hot loop.
         client.reconnect_delay_set(min_delay=1, max_delay=120)
@@ -211,46 +279,129 @@ class ShadowClient:
         client.on_subscribe = self._on_subscribe
         client.on_message = self._on_message
 
-        _LOGGER.debug(
-            "connecting to %s as %s", const.IOT_ENDPOINT, self._client_id
-        )
-        client.connect_async(const.IOT_ENDPOINT, 443, keepalive=30)
+        _LOGGER.debug("connecting to %s", self._endpoints.iot_endpoint)
+        client.connect_async(self._endpoints.iot_endpoint, 443, keepalive=30)
         client.loop_start()
         self._client = client
 
         try:
-            await asyncio.wait_for(self._connected.wait(), timeout)
-        except TimeoutError as err:
-            await self.disconnect()
-            raise ZephyrTransportError(
-                f"MQTT connection to {const.IOT_ENDPOINT} timed out"
-            ) from err
-
-        try:
-            await asyncio.wait_for(self._subscribed.wait(), timeout)
-        except TimeoutError as err:
-            await self.disconnect()
-            raise ZephyrTransportError(
-                "MQTT connected but shadow subscriptions did not complete in time"
-            ) from err
-
-        if self._subscribe_error is not None:
-            error, self._subscribe_error = self._subscribe_error, None
-            await self.disconnect()
-            raise error
+            try:
+                await asyncio.wait_for(self._connected.wait(), timeout)
+            except TimeoutError as err:
+                raise ZephyrTransportError(
+                    f"MQTT connection to {self._endpoints.iot_endpoint} timed out"
+                ) from err
+            try:
+                await asyncio.wait_for(self._subscribed.wait(), timeout)
+            except TimeoutError as err:
+                raise ZephyrTransportError(
+                    "MQTT connected but shadow subscriptions did not "
+                    "complete in time"
+                ) from err
+            if self._subscribe_error is not None:
+                error, self._subscribe_error = self._subscribe_error, None
+                raise error
+        except BaseException:
+            # Covers the ZephyrTransportError raises above, ZephyrPolicyError,
+            # AND CancelledError: whatever interrupts the handshake, the paho
+            # client and its network thread must be torn down before the
+            # exception leaves - nothing outside holds a reference yet.
+            try:
+                await self.disconnect()
+            except Exception:  # noqa: BLE001
+                # The teardown failure must not REPLACE the handshake
+                # failure - the caller's terminal-vs-retry decision keys on
+                # the original exception's type. An OSError out of
+                # loop_stop() standing in for a ZephyrPolicyError would tell
+                # the supervisor to retry forever against a policy the
+                # identity will never have.
+                _LOGGER.exception("teardown after a failed handshake")
+            raise
 
     async def disconnect(self) -> None:
         if self._client is None:
             return
-        self._client.loop_stop()
-        self._client.disconnect()
-        self._client = None
+        client, self._client = self._client, None
+        # Clear before the await, not after: a slow teardown (loop_stop
+        # joins a thread parked in recv) could otherwise let a NEWER
+        # connection complete inside that window and have its events
+        # clobbered here, leaving the object connected-but-unsubscribed.
         self._connected.clear()
+        self._subscribed.clear()
+        # Off the loop: loop_stop() JOINS paho's network thread (see
+        # paho/mqtt/client.py), and that thread is frequently inside a
+        # synchronous socket recv. A thread join on the event loop was
+        # tolerable once at shutdown; this now runs on every ~50-minute
+        # supervisor rebuild, per hood.
+        #
+        # Shielded: disconnect() runs inside connect()'s `except
+        # BaseException` cleanup. A SECOND cancellation arriving while this
+        # teardown work item is still queued on the executor would cancel it
+        # before the executor picks it up, leaking a paho client whose
+        # network thread is already running - the exact leak this cleanup
+        # exists to prevent, one level down.
+        teardown = asyncio.ensure_future(
+            asyncio.to_thread(self._teardown, client)
+        )
+        try:
+            await asyncio.shield(teardown)
+        except asyncio.CancelledError:
+            # shield surfaces OUR cancellation immediately while the work
+            # item runs on; returning now would release the hood lock with
+            # paho's thread still alive, letting a new connect overlap the
+            # old client. Best-effort: see the teardown through, THEN
+            # honour the cancel. (A second cancel during this wait still
+            # wins - unavoidable, and strictly rarer.)
+            with contextlib.suppress(BaseException):
+                await teardown
+            raise
+
+    @staticmethod
+    def _teardown(client: mqtt.Client) -> None:
+        # disconnect() BEFORE loop_stop(). The network thread is what writes
+        # the DISCONNECT packet; stopping it first means the packet is queued
+        # and never sent, and the broker only notices via keepalive timeout.
+        try:
+            client.disconnect()
+        finally:
+            # In a finally, so a disconnect() that raises cannot skip it.
+            # loop_stop() is what JOINS paho's network thread - this
+            # function exists to stop that thread leaking, and letting a
+            # failed DISCONNECT packet cancel the join is exactly the leak
+            # it guards against. Ordering above is preserved.
+            client.loop_stop()
 
     def _publish(self, topic: str, payload: dict[str, Any]) -> None:
-        if self._client is None:
-            raise ZephyrTransportError("not connected")
+        """Hand one message to paho. Callers must use _publish_or_disconnect.
+
+        Raises _PublishQueued (never seen outside this module) when paho
+        accepted the message with no socket to write it on.
+        """
+        # is_connected() reflects post-CONNACK state (paho sets it in
+        # _handle_connack BEFORE dispatching on_connect), so this is the real
+        # question - "is there a session that can carry this write?" - not
+        # "did we ever build a client object?". Refusing here is what keeps a
+        # write from being parked in paho's out-queue in the first place;
+        # connect() only returns after the _connected event, so the
+        # handshake-time request_state still passes.
+        if self._client is None or not self._client.is_connected():
+            # No thing name in the message: it identifies a home, and
+            # exception text ends up in logs users paste publicly.
+            #
+            # Raised, not torn down here: this method is synchronous and
+            # cannot await disconnect(). _publish_or_disconnect catches this
+            # refusal exactly like _PublishQueued and tears the connection
+            # down before re-raising - see the reasoning there.
+            raise ZephyrNotConnectedError("hood is not connected")
         info = self._client.publish(topic, json.dumps(payload), qos=1)
+        if info.rc == mqtt.MQTT_ERR_NO_CONN:
+            # The socket died between the check above and this call. paho
+            # inserts a qos>0 message into _out_messages BEFORE trying to
+            # send it and, on NO_CONN, leaves it there in the "needs
+            # publishing" state - so paho's own auto-reconnect would deliver
+            # this write minutes later and actuate the hood with no caller
+            # waiting. Signal the async layer to tear the connection down.
+            raise _PublishQueued
         if info.rc != mqtt.MQTT_ERR_SUCCESS:
             # Name the operation (get/update), not the full topic - the full
             # topic contains the thing name, which is personal data.
@@ -259,9 +410,58 @@ class ShadowClient:
                 f"publish to shadow/{operation} failed: rc={info.rc}"
             )
 
+    async def _publish_or_disconnect(
+        self, topic: str, payload: dict[str, Any]
+    ) -> None:
+        """Publish, and destroy the connection rather than leave a write queued.
+
+        A refused write must never actuate hardware later. Tearing the
+        connection down discards the queued message with the paho client
+        object itself - every reconnect path here builds a FRESH mqtt.Client
+        (connect() replaces it, disconnect() drops the reference), so nothing
+        inherits the out-queue and the write can never fire.
+
+        Both callers route through this, so `request_state` gets the same
+        guarantee on both refusal paths: a GET stranded in the out-queue
+        would come back as a state report long after the caller gave up, and
+        a GET refused against a dead client leaves the same orphaned session
+        a refused write does.
+        """
+        try:
+            self._publish(topic, payload)
+        except (_PublishQueued, ZephyrNotConnectedError):
+            # BOTH refusals tear down, and for related reasons.
+            #
+            # _PublishQueued: paho accepted the message with no socket to
+            # write it on, and discarding the client object is the only way
+            # to un-schedule the write its auto-reconnect would deliver.
+            #
+            # The dead-client precheck: a refused write marks this
+            # connection dead on both sides. The teardown kills paho's
+            # auto-reconnect, so the old session can never come back and
+            # fight the supervisor's rebuild - both hold the same client ID,
+            # and AWS IoT evicts one for the other, forever. It also makes
+            # Hood's reference-drop consistent on EVERY path: Hood._publish
+            # drops its ShadowClient on ZephyrNotConnectedError assuming the
+            # teardown already happened, so refusing without one orphaned a
+            # live paho thread nothing held a reference to any more.
+            #
+            # Only a refused WRITE forces the supervisor rebuild path. A
+            # transient blip with nothing being published tears nothing down
+            # and paho's own reconnect still recovers it.
+            #
+            # Best-effort teardown; the caller still gets the refusal below
+            # either way, and the write must not be reported as accepted.
+            with contextlib.suppress(Exception):
+                await self.disconnect()
+            # `from None`: the internal signal carries no information the
+            # caller can use, and chaining it into the traceback only adds a
+            # frame naming this module's internals.
+            raise ZephyrNotConnectedError("hood is not connected") from None
+
     async def request_state(self) -> None:
         """Ask for the full shadow. The reply lands on get/accepted."""
-        self._publish(self.topics.get, {})
+        await self._publish_or_disconnect(self.topics.get, {})
 
     async def publish_state(self, fields: dict[str, Any]) -> None:
         """WRITE PATH - actuates hardware.
@@ -280,5 +480,7 @@ class ShadowClient:
         should reach this until the write path has been validated.
         """
         if not fields:
-            raise ValueError("refusing to publish an empty reported state")
-        self._publish(self.topics.update, {"state": {"reported": fields}})
+            raise ZephyrWriteError("refusing to publish an empty reported state")
+        await self._publish_or_disconnect(
+            self.topics.update, {"state": {"reported": fields}}
+        )

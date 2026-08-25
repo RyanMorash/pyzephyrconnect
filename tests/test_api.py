@@ -1,5 +1,8 @@
+import json
 import ssl
+import time
 from importlib import resources
+from unittest.mock import AsyncMock, MagicMock
 
 import aiohttp
 import pytest
@@ -7,10 +10,33 @@ import pytest
 from conftest import FakeResponse, FakeSession
 from pyzephyrconnect import const
 from pyzephyrconnect.api import CERT_BUNDLE, ZephyrApi, build_ssl_context
-from pyzephyrconnect.exceptions import ZephyrAuthError, ZephyrCertificateError, ZephyrError
+from pyzephyrconnect.auth import ZephyrTokens
+from pyzephyrconnect.const import DEFAULT_ENDPOINTS, Endpoints
+from pyzephyrconnect.exceptions import (
+    ZephyrAuthError,
+    ZephyrCertificateError,
+    ZephyrDataError,
+    ZephyrError,
+    ZephyrTransportError,
+)
 
-TOKEN = "id-token-value"
 THING = "aaaaaaaabbbbbbbbccccccccddddddddeeeeeeee"
+
+
+def _fake_auth(session, endpoints=DEFAULT_ENDPOINTS):
+    auth = MagicMock()
+    auth.session = session
+    auth.endpoints = endpoints
+    auth.async_get_tokens = AsyncMock(
+        return_value=ZephyrTokens(
+            username="u@example.com",
+            id_token="ID-TOKEN",
+            refresh_token="R",
+            identity_id="us-west-2:abc",
+            expires_at=time.time() + 3600,
+        )
+    )
+    return auth
 
 
 TWCA_SUBJECT_COMMON_NAMES = {
@@ -75,21 +101,21 @@ async def test_get_own_devices_sends_a_bare_token_and_empty_body():
     session = FakeSession(
         FakeResponse({"message": "Success", "devices": [{"thingName": THING}]})
     )
-    api = ZephyrApi(session)
-    devices = await api.get_own_devices(TOKEN)
+    api = ZephyrApi(_fake_auth(session))
+    devices = await api.get_own_devices()
 
     assert devices == [{"thingName": THING}]
     call = session.calls[0]
     assert call["url"] == const.DEVICE_API_LIST
-    assert call["headers"]["Authorization"] == TOKEN
+    assert call["headers"]["Authorization"] == "ID-TOKEN"
     assert not call["headers"]["Authorization"].startswith("Bearer")
     assert call["data"] == b""
 
 
 async def test_discover_device_posts_the_thing_name():
     session = FakeSession(FakeResponse({"maxFanSpeed": 6}))
-    api = ZephyrApi(session)
-    result = await api.discover_device(TOKEN, THING)
+    api = ZephyrApi(_fake_auth(session))
+    result = await api.discover_device(THING)
 
     assert result == {"maxFanSpeed": 6}
     assert session.calls[0]["url"] == const.DEVICE_API_DISCOVER
@@ -99,7 +125,7 @@ async def test_discover_device_posts_the_thing_name():
 async def test_requests_pass_the_pinned_ssl_context():
     ctx = build_ssl_context()
     session = FakeSession(FakeResponse({"devices": []}))
-    await ZephyrApi(session, ctx).get_own_devices(TOKEN)
+    await ZephyrApi(_fake_auth(session), ssl_context=ctx).get_own_devices()
     assert session.calls[0]["ssl"] is ctx
 
 
@@ -115,12 +141,12 @@ async def test_certificate_failure_raises_an_actionable_error():
             )
 
     with pytest.raises(ZephyrCertificateError, match="twca.pem"):
-        await ZephyrApi(ExplodingSession()).get_own_devices(TOKEN)
+        await ZephyrApi(_fake_auth(ExplodingSession())).get_own_devices()
 
 
 async def test_missing_devices_key_returns_empty_list():
     session = FakeSession(FakeResponse({"message": "Success"}))
-    assert await ZephyrApi(session).get_own_devices(TOKEN) == []
+    assert await ZephyrApi(_fake_auth(session)).get_own_devices() == []
 
 
 async def test_403_response_raises_zephyr_auth_error():
@@ -130,12 +156,142 @@ async def test_403_response_raises_zephyr_auth_error():
     specifically (a ZephyrError subclass), not the generic base."""
     session = FakeSession(FakeResponse({}, status=403))
     with pytest.raises(ZephyrAuthError) as excinfo:
-        await ZephyrApi(session).get_own_devices(TOKEN)
+        await ZephyrApi(_fake_auth(session)).get_own_devices()
     assert isinstance(excinfo.value, ZephyrError)
 
 
 async def test_other_4xx_response_raises_generic_zephyr_error():
     session = FakeSession(FakeResponse({}, status=400))
     with pytest.raises(ZephyrError) as excinfo:
-        await ZephyrApi(session).get_own_devices(TOKEN)
+        await ZephyrApi(_fake_auth(session)).get_own_devices()
     assert not isinstance(excinfo.value, ZephyrAuthError)
+
+
+async def test_authorization_header_is_a_bare_token():
+    """PROTOCOL.md section 4: the API rejects a 'Bearer ' prefix. This is
+    trivially easy to break while refactoring onto AbstractAuth."""
+    session = FakeSession(FakeResponse({"devices": []}))
+    api = ZephyrApi(_fake_auth(session))
+    await api.get_own_devices()
+
+    assert session.calls[0]["headers"]["Authorization"] == "ID-TOKEN"
+    assert not session.calls[0]["headers"]["Authorization"].startswith("Bearer")
+
+
+async def test_getowndevices_sends_a_zero_length_body():
+    """PROTOCOL.md section 4: Content-Length 0, not '{}'."""
+    session = FakeSession(FakeResponse({"devices": []}))
+    api = ZephyrApi(_fake_auth(session))
+    await api.get_own_devices()
+
+    assert session.calls[0]["data"] == b""
+
+
+async def test_every_request_asks_auth_for_a_current_token():
+    """Refresh lives in the request path now, so a token that went stale
+    between calls is renewed without the consumer doing anything."""
+    session = FakeSession(
+        FakeResponse({"devices": []}), FakeResponse({"thingName": "t"})
+    )
+    auth = _fake_auth(session)
+    api = ZephyrApi(auth)
+    await api.get_own_devices()
+    await api.discover_device("t")
+
+    assert auth.async_get_tokens.await_count == 2
+
+
+async def test_endpoint_override_reaches_the_url_requested():
+    session = FakeSession(FakeResponse({"devices": []}))
+    auth = _fake_auth(
+        session, endpoints=Endpoints(device_api_base="https://staging.example/prod")
+    )
+    await ZephyrApi(auth).get_own_devices()
+
+    assert session.calls[0]["url"] == "https://staging.example/prod/getowndevices"
+
+
+class _RaisingSession:
+    def __init__(self, exc):
+        self._exc = exc
+
+    def post(self, url, **kwargs):
+        raise self._exc
+
+
+async def test_transient_network_failure_wraps_in_transport_error():
+    """New clause in _post: aiohttp.ClientError/TimeoutError must surface as
+    ZephyrTransportError so a consumer catching ZephyrError catches
+    everything on the setup and poll paths."""
+    api = ZephyrApi(_fake_auth(_RaisingSession(aiohttp.ClientConnectionError())))
+    with pytest.raises(ZephyrTransportError):
+        await api.get_own_devices()
+
+
+async def test_certificate_failure_still_wins_over_the_transport_clause():
+    """ClientConnectorCertificateError subclasses ClientError; the cert
+    clause is listed first and must keep winning - the diagnosis it carries
+    is the valuable one."""
+    exc = aiohttp.ClientConnectorCertificateError(
+        connection_key=MagicMock(), certificate_error=ssl.SSLError("boom")
+    )
+    api = ZephyrApi(_fake_auth(_RaisingSession(exc)))
+    with pytest.raises(ZephyrCertificateError):
+        await api.get_own_devices()
+
+
+async def test_non_json_body_raises_zephyr_transport_error():
+    """A vendor maintenance page or WAF interstitial returns a 200 with a
+    non-JSON body. json.JSONDecodeError is a ValueError and aiohttp does not
+    wrap it - left unhandled it would escape _post() as a raw ValueError
+    instead of the ZephyrError subclasses consumers are told to catch."""
+    session = FakeSession(
+        FakeResponse(None, json_exc=json.JSONDecodeError("bad", "<html>", 0))
+    )
+    with pytest.raises(ZephyrTransportError):
+        await ZephyrApi(_fake_auth(session)).get_own_devices()
+
+
+async def test_empty_body_raises_zephyr_data_error():
+    """aiohttp returns None for an empty 200 body. get_own_devices() calls
+    .get('devices') on the result, which would AttributeError on None if
+    _post() did not reject the shape first."""
+    session = FakeSession(FakeResponse(None))
+    with pytest.raises(ZephyrDataError):
+        await ZephyrApi(_fake_auth(session)).get_own_devices()
+
+
+async def test_non_dict_body_raises_zephyr_data_error():
+    """A bare list or string body is equally unusable to every caller of
+    _post(), even though it decoded as valid JSON."""
+    session = FakeSession(FakeResponse(["unexpected", "list"]))
+    with pytest.raises(ZephyrDataError):
+        await ZephyrApi(_fake_auth(session)).get_own_devices()
+
+
+async def test_ssl_context_is_built_once_and_cached(monkeypatch):
+    import pyzephyrconnect.api as api_module
+
+    calls = []
+    real = api_module.build_ssl_context
+    monkeypatch.setattr(
+        api_module, "build_ssl_context", lambda: calls.append(1) or real()
+    )
+    session = FakeSession(
+        FakeResponse({"devices": []}), FakeResponse({"devices": []})
+    )
+    api = ZephyrApi(_fake_auth(session))
+    await api.get_own_devices()
+    await api.get_own_devices()
+
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("shape", [1, "x", {"a": 1}])
+async def test_a_non_list_devices_value_returns_empty_list(shape):
+    """`len(devices)` runs before anything validates the shape, so a scalar
+    here raised a raw TypeError out of the debug log line - outside the
+    "consumers catch ZephyrError" contract, and before the client-side
+    guard downstream ever gets a look."""
+    session = FakeSession(FakeResponse({"devices": shape}))
+    assert await ZephyrApi(_fake_auth(session)).get_own_devices() == []

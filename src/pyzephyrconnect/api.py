@@ -8,6 +8,7 @@ needs no special construction.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import ssl
 from importlib import resources
@@ -15,8 +16,14 @@ from typing import Any
 
 import aiohttp
 
-from . import const
-from .exceptions import ZephyrAuthError, ZephyrCertificateError, ZephyrError
+from .auth import AbstractAuth
+from .exceptions import (
+    ZephyrAuthError,
+    ZephyrCertificateError,
+    ZephyrDataError,
+    ZephyrError,
+    ZephyrTransportError,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -54,15 +61,34 @@ def build_ssl_context() -> ssl.SSLContext:
 
 
 class ZephyrApi:
-    """Client for the vendor's two REST endpoints."""
+    """Client for the vendor's two REST endpoints.
+
+    The auth object owns the session and the token, so this class is
+    agnostic to how credentials are obtained - which is what lets a consumer
+    supply its own AbstractAuth. The SSL context (system trust plus the TWCA
+    workaround anchors) is applied per request, so a shared session needs no
+    special construction.
+    """
 
     def __init__(
         self,
-        session: aiohttp.ClientSession,
+        auth: AbstractAuth,
+        *,
         ssl_context: ssl.SSLContext | None = None,
     ) -> None:
-        self._session = session
-        self._ssl = ssl_context if ssl_context is not None else build_ssl_context()
+        self._auth = auth
+        # Deliberately NOT built here. build_ssl_context() calls
+        # SSLContext.load_default_certs and load_verify_locations, both of
+        # which Home Assistant instruments as blocking calls and reports when
+        # they run on the event loop - and this constructor runs on the loop
+        # inside async_setup_entry. Built lazily in a worker thread instead.
+        self._ssl = ssl_context
+
+    async def _get_ssl(self) -> ssl.SSLContext:
+        """The SSL context, built off the event loop on first use."""
+        if self._ssl is None:
+            self._ssl = await asyncio.to_thread(build_ssl_context)
+        return self._ssl
 
     def _headers(self, id_token: str) -> dict[str, str]:
         # Bare token, no "Bearer " prefix - the API rejects the prefixed form.
@@ -72,10 +98,15 @@ class ZephyrApi:
             "Accept": "application/json",
         }
 
-    async def _post(self, url: str, id_token: str, **kwargs: Any) -> Any:
+    async def _post(self, url: str, **kwargs: Any) -> Any:
+        tokens = await self._auth.async_get_tokens()
+        ssl_context = await self._get_ssl()
         try:
-            async with self._session.post(
-                url, headers=self._headers(id_token), ssl=self._ssl, **kwargs
+            async with self._auth.session.post(
+                url,
+                headers=self._headers(tokens.id_token),
+                ssl=ssl_context,
+                **kwargs,
             ) as response:
                 if response.status == 403:
                     raise ZephyrAuthError(
@@ -84,8 +115,27 @@ class ZephyrApi:
                 if response.status >= 400:
                     raise ZephyrError(f"{url} returned HTTP {response.status}")
                 # The API sends text/plain for some responses.
-                return await response.json(content_type=None)
+                try:
+                    body = await response.json(content_type=None)
+                except (ValueError, UnicodeDecodeError) as err:
+                    # json.JSONDecodeError is a ValueError, and aiohttp does
+                    # not wrap it. A vendor maintenance page or WAF
+                    # interstitial returns non-JSON HTML here - transient,
+                    # not a data-shape bug the caller should treat as fatal.
+                    raise ZephyrTransportError(
+                        f"{url} returned an unparseable body"
+                    ) from err
+                if not isinstance(body, dict):
+                    # aiohttp returns None for an empty 200 body; a bare
+                    # list or string is equally unusable to every caller of
+                    # this method.
+                    raise ZephyrDataError(
+                        f"{url} returned an unexpected body shape"
+                    )
+                return body
         except aiohttp.ClientConnectorCertificateError as err:
+            # Must stay ABOVE the ClientError clause - it is a subclass, and
+            # the certificate diagnosis is the valuable one.
             raise ZephyrCertificateError(
                 f"TLS verification failed for {url}. The presented chain is "
                 f"trusted by neither the system CA store nor the bundled "
@@ -94,23 +144,34 @@ class ZephyrApi:
                 "its certificate chain again - recapture it and update the "
                 "TWCA bundle if needed. Do not disable verification."
             ) from err
+        except (aiohttp.ClientError, TimeoutError) as err:
+            # DNS failure, connection reset, timeout: retryable transport
+            # noise. Left unwrapped it escapes the "consumers catch
+            # ZephyrError" contract from async_setup() and async_poll().
+            raise ZephyrTransportError(
+                f"request to {url} failed: {err}"
+            ) from err
 
-    async def get_own_devices(self, id_token: str) -> list[dict[str, Any]]:
+    async def get_own_devices(self) -> list[dict[str, Any]]:
         """Return the caller's devices.
 
         Note: the response includes precise device coordinates. Treat the
         payload as personal data and never log it.
         """
         # Empty body, not "{}" - matches the captured request exactly.
-        payload = await self._post(const.DEVICE_API_LIST, id_token, data=b"")
+        payload = await self._post(self._auth.endpoints.device_api_list, data=b"")
         devices = payload.get("devices") or []
+        if not isinstance(devices, list):
+            # A scalar here would TypeError on len() below - and the
+            # client-side guard runs too late to help.
+            _LOGGER.warning("getowndevices returned an unexpected shape")
+            return []
         _LOGGER.debug("getowndevices returned %d device(s)", len(devices))
         return devices
 
-    async def discover_device(
-        self, id_token: str, thing_name: str
-    ) -> dict[str, Any]:
+    async def discover_device(self, thing_name: str) -> dict[str, Any]:
         """Return capabilities merged with current state for one thing."""
         return await self._post(
-            const.DEVICE_API_DISCOVER, id_token, json={"thingName": thing_name}
+            self._auth.endpoints.device_api_discover,
+            json={"thingName": thing_name},
         )

@@ -129,11 +129,11 @@ def test_redacted_diff_still_shows_real_values_for_ordinary_keys():
 
 async def test_async_stop_runs_even_when_a_post_start_step_raises(monkeypatch):
     """main() must disconnect the shadow client on every path once
-    async_start() has begun, not only on happy-path returns. Here
-    shadow.request_state() (invoked inside client.async_start()) raises,
-    so the failure surfaces before probe ever prints state - this also
-    covers the harder case where the shadow was already registered on
-    the client before the exception, not just a clean failure to start."""
+    hood.async_start() has begun, not only on happy-path returns. Here
+    shadow.request_state() (invoked inside Hood._start()) raises, so the
+    failure surfaces before probe ever prints state - this also covers the
+    harder case where the shadow was already registered on the hood before
+    the exception, not just a clean failure to start."""
     from datetime import UTC, datetime, timedelta
     from pathlib import Path
     from unittest.mock import AsyncMock, MagicMock
@@ -141,19 +141,28 @@ async def test_async_stop_runs_even_when_a_post_start_step_raises(monkeypatch):
     from pyzephyrconnect import client as client_module
     from pyzephyrconnect import probe
     from pyzephyrconnect.auth import Credentials
+    from pyzephyrconnect.const import DEFAULT_ENDPOINTS
 
     fixtures = Path(__file__).parent / "fixtures"
     discover = json.loads((fixtures / "discoverdevice.json").read_text())
     thing = discover["thingName"]
 
+    # A double for the AbstractAuth surface ZephyrClient now drives -
+    # CredentialsAuth was replaced with token-based auth in Tasks 6 and 10,
+    # so the pre-refactor authenticate()/attach_policy()/id_token surface no
+    # longer exists.
     auth = MagicMock()
-    auth.authenticate = AsyncMock()
-    auth.attach_policy = AsyncMock()
-    auth.id_token = "ID"
-    auth.mqtt_client_id = "client-id"
-    auth.credentials = Credentials(
-        "k", "s", "t", datetime.now(UTC) + timedelta(hours=1)
+    auth.endpoints = DEFAULT_ENDPOINTS
+    auth.identity_id = "us-west-2:abc"
+    auth.mqtt_client_id = "us-west-2:abc-ha"
+    auth.credentials_expired = False
+    auth.async_get_tokens = AsyncMock()
+    auth.async_get_credentials = AsyncMock(
+        return_value=Credentials(
+            "k", "s", "t", datetime.now(UTC) + timedelta(hours=1)
+        )
     )
+    auth.async_attach_policy = AsyncMock()
 
     api = MagicMock()
     api.get_own_devices = AsyncMock(return_value=[{"thingName": thing}])
@@ -164,7 +173,12 @@ async def test_async_stop_runs_even_when_a_post_start_step_raises(monkeypatch):
     shadow.disconnect = AsyncMock()
     shadow.request_state = AsyncMock(side_effect=RuntimeError("boom"))
 
-    monkeypatch.setattr(client_module, "ZephyrAuth", MagicMock(return_value=auth))
+    # from_credentials() constructs a CredentialsAuth internally; patching
+    # the class is how the double gets injected without touching probe.py's
+    # call site.
+    monkeypatch.setattr(
+        client_module, "CredentialsAuth", MagicMock(return_value=auth)
+    )
     monkeypatch.setattr(client_module, "ZephyrApi", MagicMock(return_value=api))
     monkeypatch.setattr(
         client_module, "ShadowClient", MagicMock(return_value=shadow)
@@ -175,4 +189,67 @@ async def test_async_stop_runs_even_when_a_post_start_step_raises(monkeypatch):
     with pytest.raises(RuntimeError, match="boom"):
         await probe.main([])
 
+    # client.async_stop() (called in probe's finally) cancels and awaits
+    # the refresh supervisor _make_shadow started, so no stray task is left
+    # behind for this test to reap.
     shadow.disconnect.assert_awaited_once()
+
+
+async def test_thing_mismatch_exits_2_without_touching_the_device(monkeypatch):
+    """An operator typo in --thing must fail closed rather than silently
+    fall back to actuating whichever hood happens to be first on the
+    account - that fallback is exactly what let a `--thing` typo write to
+    the wrong physical hardware."""
+    from datetime import UTC, datetime, timedelta
+    from pathlib import Path
+    from unittest.mock import AsyncMock, MagicMock
+
+    from pyzephyrconnect import client as client_module
+    from pyzephyrconnect import probe
+    from pyzephyrconnect.auth import Credentials
+    from pyzephyrconnect.const import DEFAULT_ENDPOINTS
+
+    fixtures = Path(__file__).parent / "fixtures"
+    discover = json.loads((fixtures / "discoverdevice.json").read_text())
+    thing = discover["thingName"]
+
+    auth = MagicMock()
+    auth.endpoints = DEFAULT_ENDPOINTS
+    auth.identity_id = "us-west-2:abc"
+    auth.mqtt_client_id = "us-west-2:abc-ha"
+    auth.credentials_expired = False
+    auth.async_get_tokens = AsyncMock()
+    auth.async_get_credentials = AsyncMock(
+        return_value=Credentials(
+            "k", "s", "t", datetime.now(UTC) + timedelta(hours=1)
+        )
+    )
+    auth.async_attach_policy = AsyncMock()
+
+    api = MagicMock()
+    api.get_own_devices = AsyncMock(return_value=[{"thingName": thing}])
+    api.discover_device = AsyncMock(return_value=discover)
+
+    shadow = MagicMock()
+    shadow.connect = AsyncMock()
+    shadow.disconnect = AsyncMock()
+    shadow.request_state = AsyncMock()
+    shadow.publish_state = AsyncMock()
+
+    monkeypatch.setattr(
+        client_module, "CredentialsAuth", MagicMock(return_value=auth)
+    )
+    monkeypatch.setattr(client_module, "ZephyrApi", MagicMock(return_value=api))
+    monkeypatch.setattr(
+        client_module, "ShadowClient", MagicMock(return_value=shadow)
+    )
+    monkeypatch.setenv("ZEPHYR_USER", "user@example.com")
+    monkeypatch.setenv("ZEPHYR_PASS", "hunter2")
+
+    exit_code = await probe.main(
+        ["--thing", "does-not-match-anything", "--set", "light=1", "--confirm"]
+    )
+
+    assert exit_code == 2
+    shadow.connect.assert_not_awaited()
+    shadow.publish_state.assert_not_awaited()

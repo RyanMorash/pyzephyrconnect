@@ -8,7 +8,9 @@ the protocol was reverse-engineered.
 
 ## Install
 
-    pip install pyzephyrconnect
+```bash
+pip install pyzephyrconnect
+```
 
 ## Read state
 
@@ -17,21 +19,53 @@ import aiohttp
 from pyzephyrconnect import ZephyrClient
 
 async with aiohttp.ClientSession() as session:
-    client = ZephyrClient("you@example.com", "password", session)
-    for caps in await client.async_setup():
-        print(caps.model, caps.max_fan_speed)
-        await client.async_start(caps.thing_name)
-        print(client.state(caps.thing_name))
+    client = ZephyrClient.from_credentials("you@example.com", "password", session)
+    try:
+        for hood in await client.async_setup():
+            print(hood.capabilities.model, hood.capabilities.max_fan_speed)
+            await hood.async_start()
+            print(hood.state)
+    finally:
+        await client.async_stop()
 ```
+
+## Persisting tokens
+
+The library never persists credentials - storage is yours. Supply tokens
+from a previous session and a callback to save new ones, and a restart
+skips the SRP login entirely:
+
+```python
+from pyzephyrconnect import ZephyrClient, ZephyrTokens, ZephyrDataError
+
+try:
+    tokens = ZephyrTokens.from_dict(saved) if saved else None
+except ZephyrDataError:
+    # from_dict validates rather than coercing, so a corrupted or partial
+    # record raises here instead of failing much later as a SECRET_HASH
+    # Cognito rejects. Discard it - a full SRP login rebuilds it.
+    tokens = None
+
+client = ZephyrClient.from_credentials(
+    username, password, session,
+    tokens=tokens,
+    token_updater=lambda t: save(t.as_dict()),
+)
+```
+
+To keep the password out of the library completely, subclass `AbstractAuth`
+and implement `async_get_tokens()`.
 
 ## Probe CLI
 
 The write path actuates a physical fan and light. The CLI writes one field
 at a time, refuses anything outside an allowlist, and requires `--confirm`:
 
-    export ZEPHYR_USER=you@example.com
-    python -m pyzephyrconnect --watch
-    python -m pyzephyrconnect --set light=1 --confirm
+```bash
+export ZEPHYR_USER=you@example.com
+python -m pyzephyrconnect --watch
+python -m pyzephyrconnect --set light=1 --confirm
+```
 
 Destructive writes need `--force` as well. `resetgreasefilter` zeroes a usage
 counter that cannot be reconstructed.
