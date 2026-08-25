@@ -1,7 +1,7 @@
 # Design: align pyzephyrconnect with Home Assistant library best practices
 
 Date: 2026-08-24
-Status: approved, amended after protocol review
+Status: approved, amended after three protocol/consumer review passes
 
 ## Context
 
@@ -126,6 +126,15 @@ invokes `token_updater` so the consumer can persist the new state.
 `renew_access_token()` performs JWKS verification, which is a blocking
 network call — it stays wrapped in `asyncio.to_thread`, as today.
 
+Refresh is serialised by an `asyncio.Lock` with a re-check inside it. Token
+freshness is checked on every REST request and by the supervisor, so an
+expired token can be demanded by several callers at once, and the user pool
+rate-limits repeated logins (`PROTOCOL.md` §3.1).
+
+`credentials_expired` is a plain non-mutating property. The supervisor needs
+to ask whether credentials want replacing without `async_get_credentials()`
+renewing them as a side effect and making the answer always "no".
+
 A consumer that does not want the library to see a password subclasses
 `AbstractAuth` directly and implements `async_get_tokens()` however it likes.
 
@@ -139,6 +148,11 @@ A persisted `identity_id` that is stale or wrong makes
 `get_credentials_for_identity` fail. On any such failure the cached value is
 discarded, `get_id` is called again, and the exchange is retried once. Only a
 second failure raises `ZephyrAuthError`.
+
+A refetched identity is written back into the stored tokens and pushed to
+`token_updater`. `mqtt_client_id` derives from it, so keeping the dead value
+would pin the MQTT client ID to an identity the IoT policy does not cover —
+the silent-drop failure, arrived at from the recovery path meant to prevent it.
 
 ### Refresh and the MQTT socket
 
@@ -159,8 +173,14 @@ library therefore owns the transport lifecycle rather than delegating it:
   every connect attempt.
 - `ZephyrClient` runs a supervisor task that renews credentials and rebuilds
   each shadow socket inside `REFRESH_MARGIN_SECONDS` of expiry, then re-issues
-  `request_state()`. Started by the first `Hood.async_start()`, cancelled by
-  `ZephyrClient.async_stop()`.
+  `request_state()`. Started by the first `Hood.async_start()`, cancelled and
+  **awaited** by `ZephyrClient.async_stop()` — cancelling without awaiting can
+  strand a hood halfway through a reconnect.
+- Its retry boundary is inside the loop, not around it. A transient failure
+  must not end supervision, because the consequence is not a logged error but
+  push dying silently an hour later. Auth and policy errors are terminal, are
+  stored, and are re-raised from the next `async_poll()` so they can reach a
+  reauth flow.
 - The supervisor distinguishes recoverable from terminal failures. A
   `ZephyrPolicyError` — a denied subscribe, meaning the IoT policy is not
   attached — is terminal: it is surfaced to the consumer and the supervisor
@@ -200,9 +220,14 @@ class Endpoints:
 DEFAULT_ENDPOINTS = Endpoints()
 ```
 
-`const.py` retains the raw values as the dataclass defaults. `Endpoints` is
-threaded through `ZephyrClient`, `ZephyrApi`, `CredentialsAuth` and
-`ShadowClient`. Behaviour is unchanged when the default is used.
+`const.py` retains the raw values as the dataclass defaults. `Endpoints` lives
+on the auth object and is read from there by everything else — `ZephyrClient`
+takes no separate `endpoints` argument. A second source would let REST and
+MQTT address different clouds with nothing complaining.
+
+`ZephyrClient` must pass its endpoints explicitly when constructing each
+`ShadowClient`. Omitting it falls back to `DEFAULT_ENDPOINTS`, which applies
+an override to REST while silently leaving MQTT on production.
 
 The TWCA supplementary trust anchors are unaffected: they are added on top of
 the system trust store, so overriding `device_api_base` to a host with a
@@ -259,6 +284,28 @@ rejected.
 The two destructive methods get no additional confirmation gate. The
 consumer owns its own confirmation UX, and a second library-level gate would
 be friction without safety.
+
+One raw entry point survives: `Hood.async_set_fields(fields)` enforces
+`WRITABLE_FIELDS` and is the chokepoint every typed method delegates through.
+It exists because the probe CLI writes *arbitrary* allowlisted fields in order
+to map semantics that are not yet established, which a fixed method surface
+cannot express. The spec's intent holds — no caller can write a non-writable
+field — while the diagnostic path keeps working.
+
+Lifecycle and writes share a per-hood `asyncio.Lock`. The supervisor's rebuild
+briefly has no socket, and a write landing in that window is not a
+disconnected hood; it waits rather than raising. `async_start()` is idempotent
+under the same lock, since overwriting a live `ShadowClient` orphans a paho
+network thread.
+
+The IoT policy is attached through a `prepare` callable each `Hood` runs
+before its first connect, latched once per client. It cannot live in
+`async_start()` unlatched: that now runs on every reconnect, and the binding
+persists on the identity (`PROTOCOL.md` §3.3). It cannot be omitted at all —
+without it every message is silently dropped.
+
+`connected` is per-hood, derived rather than latched on the client. A single
+flag reported whichever shadow changed state last.
 
 `ZephyrClient.async_setup()` returns `list[Hood]` instead of
 `list[HoodCapabilities]`. `ZephyrClient.async_set_state`,
@@ -394,6 +441,15 @@ respect.
 9. **The REST contract is exact.** Bare ID token with no `Bearer` prefix, and
    a zero-length body for `getowndevices` — not `{}`. Both are easy to break
    while refactoring `ZephyrApi` onto `AbstractAuth`.
-10. **Endpoint overrides do not weaken TLS.** The TWCA certificates are
+10. **Every SSL context must be built off the event loop.** Home Assistant
+    instruments `SSLContext.load_default_certs` and `load_verify_locations`
+    and reports them when they run on the loop. Two paths hit this: the
+    library's own `build_ssl_context()`, and paho's `tls_set()`, which
+    constructs a context inline on the calling thread. Both build in a worker
+    thread; the MQTT path uses `tls_set_context()` with a finished context.
+11. **The MQTT path uses plain system trust, not the TWCA bundle.** The IoT
+    ATS endpoint chains to Amazon Root CA 1. Only the vendor REST host needs
+    the supplementary anchors.
+12. **Endpoint overrides do not weaken TLS.** The TWCA certificates are
     supplementary anchors on top of the system store, so a redirected host
     verifies against normal system trust. `verify_mode` stays `CERT_REQUIRED`.

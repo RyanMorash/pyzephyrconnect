@@ -1307,6 +1307,18 @@ async def test_every_request_asks_auth_for_a_current_token():
     assert auth.async_get_tokens.await_count == 2
 
 
+async def test_an_endpoint_override_reaches_mqtt_too():
+    """Overriding endpoints must not silently apply to REST only - the MQTT
+    host is a separate wiring path and failing to thread it there leaves the
+    override half-applied with nothing complaining."""
+    endpoints = Endpoints(iot_endpoint="staging-ats.iot.us-west-2.amazonaws.com")
+    client = ZephyrClient(_auth_double(endpoints=endpoints))
+    hoods = await client.async_setup()
+    shadow = client._make_shadow(hoods[0])
+
+    assert shadow._endpoints.iot_endpoint.startswith("staging-ats")
+
+
 async def test_endpoint_override_reaches_the_url_requested():
     session = FakeSession(FakeResponse({"devices": []}))
     auth = _fake_auth(
@@ -1488,6 +1500,18 @@ async def test_connect_asks_the_provider_for_fresh_credentials(monkeypatch):
     assert len(calls) == 2
 
 
+async def test_tls_context_is_not_built_on_the_event_loop():
+    """paho's tls_set() calls load_default_certs() inline, which Home
+    Assistant reports as a blocking call on the loop. Hand it a finished
+    context instead."""
+    shadow = _shadow()
+    await _connect(shadow)
+
+    client = shadow._client
+    client.tls_set.assert_not_called()
+    client.tls_set_context.assert_called_once()
+
+
 async def test_publish_empty_state_raises_a_library_error():
     """ValueError escapes a consumer catching ZephyrError."""
     shadow = _shadow()
@@ -1553,6 +1577,28 @@ In `src/pyzephyrconnect/shadow.py`, change the constructor and `connect`:
 
 Replace the remaining `const.IOT_ENDPOINT` and `const.REGION` references in the method body with `self._endpoints.iot_endpoint` and `self._endpoints.region`.
 
+Also replace the `client.tls_set()` call further down the method:
+
+```python
+        # The IoT ATS endpoint chains to Amazon Root CA 1, which system trust
+        # stores already carry. Only the vendor REST host needs the extra CAs,
+        # so this is a plain default context - NOT the TWCA one.
+        #
+        # Built in a worker thread and handed to paho finished. paho's
+        # tls_set() constructs the context inline on the calling thread: it
+        # does ssl.SSLContext(...) and then, because ca_certs is None,
+        # context.load_default_certs() - which Home Assistant instruments as
+        # a blocking call. connect() is async and runs on the event loop, and
+        # this path executes on every connect including every supervisor
+        # reconnect.
+        client.tls_set_context(
+            await asyncio.to_thread(ssl.create_default_context)
+        )
+```
+
+`ssl.create_default_context()` gives `CERT_REQUIRED` plus hostname checking,
+matching what `tls_set()` produced.
+
 Fix the disconnect ordering, which now runs on a ~50-minute reconnect cycle
 rather than once at shutdown:
 
@@ -1577,7 +1623,7 @@ In `publish_state`, change the guard:
             raise ZephyrWriteError("refusing to publish an empty reported state")
 ```
 
-Add `from collections.abc import Awaitable, Callable` and import `DEFAULT_ENDPOINTS`, `Endpoints`, `ZephyrWriteError`.
+Add `from collections.abc import Awaitable, Callable`, `import ssl`, and import `DEFAULT_ENDPOINTS`, `Endpoints`, `ZephyrWriteError`.
 
 Leave `_on_connect`, `_on_subscribe`, `_record_subscribe_result` and the delta handling untouched. Denied subscribes must keep raising `ZephyrPolicyError`, because Task 10's supervisor treats it as terminal.
 
@@ -2285,14 +2331,13 @@ Rewrite `src/pyzephyrconnect/client.py`. Key structure:
 class ZephyrClient:
     """One authenticated account and the hoods under it."""
 
-    def __init__(
-        self,
-        auth: AbstractAuth,
-        *,
-        endpoints: Endpoints = DEFAULT_ENDPOINTS,
-    ) -> None:
+    def __init__(self, auth: AbstractAuth) -> None:
         self._auth = auth
-        self._endpoints = endpoints
+        # Deliberately NOT a separate constructor argument. The auth object
+        # already carries the endpoints and ZephyrApi reads them from there,
+        # so a second source would let REST and MQTT point at different
+        # clouds with nothing complaining.
+        self._endpoints = auth.endpoints
         self._api = ZephyrApi(auth)
         self._hoods: dict[str, Hood] = {}
         self._connected = False
@@ -2312,7 +2357,6 @@ class ZephyrClient:
         tokens: ZephyrTokens | None = None,
         token_updater: Callable[[ZephyrTokens], None] | None = None,
         endpoints: Endpoints = DEFAULT_ENDPOINTS,
-        ssl_context: ssl.SSLContext | None = None,
     ) -> ZephyrClient:
         """Convenience path: build a CredentialsAuth and a client from it.
 
@@ -2327,8 +2371,7 @@ class ZephyrClient:
                 tokens=tokens,
                 token_updater=token_updater,
                 endpoints=endpoints,
-            ),
-            endpoints=endpoints,
+            )
         )
 
     @property
@@ -2394,12 +2437,31 @@ class ZephyrClient:
         self._policy_attached = True
 ```
 
-`_make_shadow(hood)` builds a `ShadowClient` wired to this client's message
-handler, the auth's `mqtt_client_id`, `self._auth.async_get_credentials` as the
-credentials provider, and `hood.handle_connection_change` as the connection
-callback. It then starts the supervisor if one is not already running, clearing
-`_supervisor_error` as it does so — otherwise a stored error from a previous
-supervisor outlives the condition that caused it and every later poll raises.
+`_make_shadow(hood)` builds the `ShadowClient`. Every argument matters, and the
+last one is easy to omit:
+
+```python
+    def _make_shadow(self, hood: Hood) -> ShadowClient:
+        shadow = ShadowClient(
+            hood.thing_name,
+            self._auth.mqtt_client_id,
+            lambda topic, payload: self._handle_message(hood, topic, payload),
+            hood.handle_connection_change,
+            self._auth.async_get_credentials,
+            # Without this the ShadowClient falls back to DEFAULT_ENDPOINTS,
+            # so an endpoint override would reach REST but silently leave
+            # MQTT pointed at production.
+            endpoints=self._endpoints,
+        )
+        self._ensure_supervisor()
+        return shadow
+```
+
+The message callback closes over `hood`, so a shadow message is folded into
+the right appliance's state. `_ensure_supervisor()` starts the supervisor if
+one is not already running and clears `_supervisor_error` as it does so —
+otherwise a stored error outlives the condition that caused it and every
+later poll raises.
 
 It does **not** attach the IoT policy: that is `_ensure_policy`, passed to each
 `Hood` as its `prepare` callable so it runs before the first connect and is
