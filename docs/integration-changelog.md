@@ -1,0 +1,308 @@
+# pyzephyrconnect API changes — for the Home Assistant integration
+
+**Audience:** the agent maintaining `ha_zephyr` (`custom_components/zephyr_connect`).
+
+**Status of the library:** `pyzephyrconnect` has never been released. There are
+no tags and PyPI 404s. These changes therefore land as the initial `0.1.0`,
+not as a breaking `0.2.0` — there is no previous version to fall back to, no
+version gate to write, and no compatibility shim to detect. Every change below
+is unconditional.
+
+**First step:** the integration currently requires
+`pyzephyrconnect @ git+https://github.com/RyanMorash/pyzephyrconnect@main`.
+Once this work lands and `v0.1.0` is tagged, pin the tag rather than tracking
+a moving branch:
+
+```json
+"requirements": ["pyzephyrconnect @ git+https://github.com/RyanMorash/pyzephyrconnect@v0.1.0"]
+```
+
+---
+
+## Why this changed
+
+The library was reviewed against Home Assistant's three library-authoring
+pages (`api_lib_index`, `api_lib_auth`, `api_lib_data_models`). Packaging and
+release engineering already complied. Four architectural things did not:
+
+1. The library held the username and password for the process lifetime and
+   re-ran a full SRP login on every restart. The auth page says never to store
+   auth data in the library.
+2. Every endpoint was a hardcoded module constant. The auth page requires that
+   developers be able to specify API locations.
+3. Writes went through a raw dict of vendor field names, with the write
+   allowlist enforced only in a CLI. The data-models page puts control methods
+   on the model object.
+4. Every state field defaulted to `0`, so a missing alarm read as "no alarm"
+   and a missing power reading read as "off".
+
+---
+
+## 1. Client construction
+
+`ZephyrClient` no longer takes credentials directly.
+
+```python
+# before
+client = ZephyrClient(username, password, session)
+
+# after
+client = ZephyrClient.from_credentials(username, password, session)
+```
+
+### Token persistence (new capability)
+
+The library no longer stores credentials, and it can now skip the SRP login
+entirely on restart if you hand it tokens from a previous session:
+
+```python
+from pyzephyrconnect import ZephyrClient, ZephyrTokens
+
+saved = entry.data.get("tokens")
+client = ZephyrClient.from_credentials(
+    entry.data[CONF_USERNAME],
+    entry.data[CONF_PASSWORD],
+    async_get_clientsession(hass),
+    tokens=ZephyrTokens.from_dict(saved) if saved else None,
+    token_updater=lambda t: hass.config_entries.async_update_entry(
+        entry, data={**entry.data, "tokens": t.as_dict()}
+    ),
+)
+```
+
+`ZephyrTokens.as_dict()` returns JSON-serializable primitives only, so it is
+safe to store in a config entry. It carries `username`, `id_token`,
+`refresh_token`, `identity_id` and `expires_at` (epoch seconds).
+
+Notes:
+
+- The `username` field is not optional. Cognito's `SECRET_HASH` is
+  `HMAC-SHA256(client_secret, username + client_id)`, recomputed on every
+  refresh — tokens without it cannot be refreshed.
+- A rejected or expired refresh token falls back to a full SRP login
+  automatically. It does not raise.
+- If you would rather the library never saw the password at all, subclass
+  `AbstractAuth`, implement `async_get_tokens()`, and pass the instance to
+  `ZephyrClient(auth)` directly.
+
+### `identity_id` is unchanged
+
+`client.identity_id` still returns the full `us-west-2:uuid` string and is
+still the right unique ID for the config entry.
+
+---
+
+## 2. `async_setup()` returns `Hood` objects
+
+```python
+# before
+capabilities: list[HoodCapabilities] = await client.async_setup()
+
+# after
+hoods: list[Hood] = await client.async_setup()
+```
+
+`Hood` bundles capabilities, state, lifecycle and controls for one appliance.
+`hood.capabilities` is the same `HoodCapabilities` object you had before.
+
+### Per-thing client methods moved onto `Hood`
+
+Every method that took a `thing_name` is gone; the `Hood` knows its own.
+
+| Removed from `ZephyrClient` | Replacement |
+|---|---|
+| `client.async_start(thing_name)` | `hood.async_start()` |
+| `client.async_poll(thing_name)` | `hood.async_poll()` |
+| `client.state(thing_name)` | `hood.state` |
+| `client.capabilities(thing_name)` | `hood.capabilities` |
+| `client.add_listener(thing_name, cb)` | `hood.add_listener(cb)` |
+| `client.async_set_state(thing_name, fields)` | typed methods — see §3 |
+
+`hood.add_listener(cb)` still returns an unsubscribe callable, and the
+callback still receives a `HoodState` on the event loop (never from paho's
+network thread).
+
+Unchanged on `ZephyrClient`: `async_setup()`, `async_stop()`, `connected`,
+`identity_id`.
+
+---
+
+## 3. Writes are typed methods now
+
+`async_set_state` is gone. Vendor field spellings no longer appear in consumer
+code.
+
+| Before | After |
+|---|---|
+| `async_set_state(thing, {"power": 1})` | `await hood.async_set_power(True)` |
+| `async_set_state(thing, {"power": 0})` | `await hood.async_set_power(False)` |
+| `async_set_state(thing, {"light": n})` | `await hood.async_set_light(n)` |
+| `async_set_state(thing, {"fan": n})` | `await hood.async_set_fan(n)` |
+| `async_set_state(thing, {"setcleanairfunction": 1})` | `await hood.async_set_clean_air(True)` |
+| `async_set_state(thing, {"setcleanairfunction": 0})` | `await hood.async_set_clean_air(False)` |
+| `async_set_state(thing, {"setdelaytimer": n})` | `await hood.async_set_delay_timer(n)` |
+| `async_set_state(thing, {"resetgreasefilter": 1})` | `await hood.async_reset_grease_filter()` |
+| `async_set_state(thing, {"setrecirculating": n})` | `await hood.async_set_recirculating(bool)` |
+
+`async_set_delay_timer` still takes **seconds**, as `setdelaytimer` always did.
+
+### New: range validation
+
+`async_set_light` and `async_set_fan` now validate against the hood's own
+advertised maximums and raise `ZephyrWriteError` **before publishing**
+anything. Negative values are always rejected. If a hood does not advertise a
+maximum (some models omit the key), the write is permitted rather than
+blanket-refused.
+
+This means a bad value now surfaces as an exception instead of a silent no-op
+on hardware.
+
+### Escape hatch
+
+`hood.async_set_fields({field: value})` writes arbitrary fields from
+`const.WRITABLE_FIELDS` and raises `ZephyrWriteError` for anything else. It
+exists for the diagnostic probe CLI, which maps unknown field semantics. The
+integration should use the typed methods.
+
+---
+
+## 4. `async_refresh_if_needed()` is gone — do not replace it
+
+The library now supervises its own credential lifecycle. Delete the call; do
+not substitute anything for it.
+
+Why this mattered: the MQTT connection is a WebSocket whose URL embeds a SigV4
+signature over credentials that expire in one hour. AWS IoT drops the session
+at expiry, and paho then reconnects to the same now-invalid URL indefinitely.
+Keeping that alive was previously the consumer's job via
+`async_refresh_if_needed()`. It is now a supervisor task inside `ZephyrClient`
+that renews credentials and rebuilds each hood's socket before expiry, started
+by the first `hood.async_start()` and cancelled by `client.async_stop()`.
+
+**Implication worth reviewing:** if your coordinator's polling interval was
+kept alive specifically so that credentials would not lapse, that reason no
+longer applies. Whether the periodic tick still earns its keep for other
+reasons — a safety-net re-read when push has been briefly unhealthy, or
+degraded HTTPS polling while MQTT is down — is your call. `hood.async_poll()`
+and `client.connected` both still exist for that.
+
+---
+
+## 5. Absent is no longer zero
+
+This is the change most likely to alter entity behaviour.
+
+### `HoodState`
+
+These fields are now `| None`, and are `None` when the device did not report
+them or reported something unparseable:
+
+`power`, `light`, `fan`, `is_online`, `act`, `delay_timer`, `set_delay_timer`,
+`set_recirculating`, `set_clean_air_function`, `clean_grease_filters`,
+`clean_charcoal_filters`, `alarm_fan`, `alarm_fault_code`,
+`alarm_grease_filter`, `fan_warning`, `fault_codes`.
+
+These four are **unchanged** and still default to `0`, because zero is their
+genuine starting value and the filter-life percentage needs a number:
+
+`use_grease_filter_time`, `use_charcoal_filter_time`, `use_light_time`,
+`use_fan_time`.
+
+**Watch for boolean coercion.** `bool(None)` is `False`, so any
+`bool(state.alarm_fault_code)` or `state.alarm_fan or state.fan_warning`
+expression will silently continue to report "no problem" for a field that is
+actually unknown. That is the exact failure this change exists to eliminate,
+so those need to become explicit — returning `None` from an `is_on` property
+makes Home Assistant show the entity as unknown, which is usually what you
+want for a fault sensor with no data.
+
+### `HoodCapabilities`
+
+The numeric capability fields are now `int | None`:
+`max_fan_speed`, `max_light_level`, `max_grease_filter_hours`,
+`max_charcoal_filter_hours`.
+
+- **Absent** → `None`. Not an error. Other Zephyr models legitimately omit
+  keys the reference device returns, and gating entity creation on
+  capabilities is what lets this work on untested hoods.
+- **Present but malformed** → raises the new `ZephyrDataError`. This runs once
+  at setup, so it fails loudly rather than producing a wrong capability set.
+
+Existing gates like `caps.max_charcoal_filter_hours > 0` will now raise
+`TypeError` on `None`. They need a `None` check first.
+
+String fields (`model`, `serial`, `mac`, `manufacturer`, warranties) still
+default to `""`, and the `supports_*` booleans still default to `False` —
+absent means "not advertised", which is the correct reading for a feature flag.
+
+### `raw` is unchanged
+
+`HoodState.raw` and `HoodCapabilities.raw` keep exactly their current shape and
+contents. Anything reading them — diagnostics in particular — needs no change.
+
+---
+
+## 6. New exceptions
+
+All three subclass `ZephyrError`, so a handler catching `ZephyrError` catches
+them.
+
+| Exception | Raised when |
+|---|---|
+| `ZephyrNotConnectedError` | A write or push read happened before `hood.async_start()` |
+| `ZephyrWriteError` | A field is not writable, a value is out of range, or the payload is empty |
+| `ZephyrDataError` | A capability field was present but unparseable |
+
+**This fixes a live bug.** `client.async_set_state` previously raised a bare
+`RuntimeError` when called before `async_start()` for that thing — which is
+not a `ZephyrError`, so a handler catching `ZephyrAuthError`/`ZephyrError`
+around a write let it escape uncaught. It is now `ZephyrNotConnectedError` and
+is caught by an existing `ZephyrError` handler.
+
+Unchanged: `ZephyrError`, `ZephyrAuthError`, `ZephyrCertificateError`,
+`ZephyrPolicyError`, `ZephyrTransportError`.
+
+---
+
+## 7. Smaller things
+
+- **`py.typed` is now shipped.** The library was already fully annotated but
+  was invisible to type checkers under PEP 561. mypy will now actually check
+  integration code against these signatures — expect it to surface the `None`
+  handling from §5 for you.
+- **`boto3` is now a declared dependency.** It was always imported directly
+  and resolved only transitively through `pycognito`. No action needed.
+- **Endpoints are injectable.** `ZephyrClient.from_credentials(...,
+  endpoints=Endpoints(device_api_base="https://staging.example/prod"))`. The
+  defaults are the current production values, so omitting it changes nothing.
+  Useful for tests that would otherwise monkeypatch module globals.
+
+---
+
+## Protocol invariants — unchanged, and load-bearing
+
+None of these changed, but they are easy to break accidentally and each one
+fails silently rather than loudly:
+
+- Shadow writes go to `state.reported`, never `state.desired`. AWS accepts a
+  `desired` write and the hardware ignores it.
+- `update/delta` messages are ignored by the library. Nothing writes
+  `desired`, so any delta is stale or foreign, and merging one produces a
+  phantom state change.
+- The MQTT client ID is `identity_id + "-ha"`, region prefix included. It is
+  what lets this coexist with the vendor phone app instead of evicting it.
+- The IoT policy is attached before connecting. An open connection does not
+  pick up newly attached permissions; without it, connect/subscribe/publish
+  all succeed and every message is silently dropped.
+- The vendor REST API takes a bare ID token with no `Bearer ` prefix.
+- `thingName`, `SN`, `MAC` and `location` are personal data — `location`
+  carries precise coordinates. Keep them redacted in diagnostics and out of
+  logs.
+
+## Still open, unrelated to this change
+
+`VALIDATION.md` in the library repo states that nothing in the integration may
+write to the shadow until hardware validation of the write path is complete.
+Several write platforms exist in the integration today. That contradiction is a
+product decision, not an API one, and is out of scope for this changelog — but
+it should be resolved deliberately rather than by default.
