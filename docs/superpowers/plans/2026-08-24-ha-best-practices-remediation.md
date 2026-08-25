@@ -917,6 +917,18 @@ async def test_stale_identity_id_is_discarded_and_refetched_once(fake_aws):
     assert identity.get_credentials_for_identity.call_count == 2
 
 
+async def test_concurrent_callers_trigger_only_one_login(fake_aws):
+    """ZephyrApi asks for tokens on every request and the supervisor asks too,
+    so an expired token can be requested by several callers at once. The pool
+    rate-limits (PROTOCOL.md section 3.1)."""
+    import asyncio
+
+    auth = CredentialsAuth("user@example.com", "pw", MagicMock())
+    await asyncio.gather(*(auth.async_get_tokens() for _ in range(5)))
+
+    assert fake_aws["cognito"].authenticate.call_count == 1
+
+
 async def test_identity_id_is_read_not_reconstructed(fake_aws):
     """Consumers use this as a config entry's permanent unique ID, so it must
     come from the tokens rather than by stripping a suffix off a value
@@ -992,6 +1004,10 @@ class CredentialsAuth(AbstractAuth):
         self._token_updater = token_updater
         self._user: Cognito | None = None
         self._credentials: Credentials | None = None
+        # Serialises refresh. Without it, concurrent callers each run a full
+        # SRP login against a pool that rate-limits (PROTOCOL.md section 3.1),
+        # and ZephyrApi asks for tokens on every single request.
+        self._lock = asyncio.Lock()
 
     @property
     def identity_id(self) -> str:
@@ -1120,7 +1136,16 @@ class CredentialsAuth(AbstractAuth):
     async def async_get_tokens(self) -> ZephyrTokens:
         if self._tokens is not None and not self._tokens.expired:
             return self._tokens
+        async with self._lock:
+            # Re-check under the lock: whoever held it may have refreshed
+            # while we waited, and a second login would be wasted and
+            # rate-limitable.
+            if self._tokens is not None and not self._tokens.expired:
+                return self._tokens
+            return await self._acquire()
 
+    async def _acquire(self) -> ZephyrTokens:
+        """Refresh or log in. Caller holds self._lock."""
         stored = self._tokens
         user: Cognito | None = None
 
@@ -1171,7 +1196,13 @@ class CredentialsAuth(AbstractAuth):
         and are bound to a live socket, so there is nothing worth storing.
         """
         await self.async_get_tokens()
-        if self._credentials is None or self._credentials.expired:
+        if not self.credentials_expired:
+            assert self._credentials is not None
+            return self._credentials
+        async with self._lock:
+            if not self.credentials_expired:
+                assert self._credentials is not None
+                return self._credentials
             tokens = self._tokens
             assert tokens is not None
             identity_id, credentials = await asyncio.to_thread(
@@ -1187,7 +1218,7 @@ class CredentialsAuth(AbstractAuth):
                 if self._token_updater is not None:
                     self._token_updater(self._tokens)
             self._credentials = credentials
-        return self._credentials
+            return self._credentials
 
     @property
     def credentials_expired(self) -> bool:
@@ -1211,7 +1242,7 @@ class CredentialsAuth(AbstractAuth):
         await asyncio.to_thread(self._attach, tokens.identity_id, credentials)
 ```
 
-Add `from collections.abc import Callable` to the imports. Delete the old `ZephyrAuth` class entirely.
+Add `from collections.abc import Callable`, `from dataclasses import replace` and `import asyncio` to the imports. Delete the old `ZephyrAuth` class entirely.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -1573,7 +1604,7 @@ git commit -m "feat: re-presign the shadow WebSocket URL on every connect"
 
 **Interfaces:**
 - Consumes: `HoodCapabilities`, `HoodState`, `ShadowClient`, `ZephyrWriteError`, `ZephyrNotConnectedError`, `const.WRITABLE_FIELDS`, `const.DANGEROUS_FIELDS`.
-- Produces: `Hood`, constructed by `ZephyrClient` in Task 10 as `Hood(capabilities, shadow_factory, poll)` where `shadow_factory: Callable[[Hood], ShadowClient]` and `poll: Callable[[str], Awaitable[HoodState]]`.
+- Produces: `Hood`, constructed by `ZephyrClient` in Task 10 as `Hood(capabilities, shadow_factory, poll, prepare)` where `shadow_factory: Callable[[Hood], ShadowClient]`, `poll: Callable[[str], Awaitable[HoodState]]` and `prepare: Callable[[], Awaitable[None]]` (attaches the IoT policy before the first connect). Also exposes `connected -> bool` and `handle_connection_change(bool)`.
 
 Public surface:
 
@@ -1696,6 +1727,72 @@ async def test_writing_before_start_raises_a_library_error():
         await hood.async_set_light(1)
 
 
+async def test_policy_is_attached_before_the_socket_opens():
+    """The single most dangerous failure in this protocol: without the policy,
+    connect, subscribe and publish all succeed and every message is silently
+    dropped, with no exception and no log line (PROTOCOL.md section 3.3)."""
+    order = []
+    shadow = MagicMock()
+    shadow.connect = AsyncMock(side_effect=lambda: order.append("connect"))
+    shadow.request_state = AsyncMock()
+    hood = Hood(
+        _caps(),
+        shadow_factory=lambda _h: shadow,
+        poll=AsyncMock(),
+        prepare=AsyncMock(side_effect=lambda: order.append("prepare")),
+    )
+    await hood.async_start()
+
+    assert order == ["prepare", "connect"]
+
+
+async def test_starting_twice_does_not_orphan_a_client():
+    """The first paho client keeps its network thread running, so overwriting
+    it leaks a thread and a socket per call."""
+    made = []
+
+    def factory(_h):
+        shadow = MagicMock()
+        shadow.connect = AsyncMock()
+        shadow.request_state = AsyncMock()
+        made.append(shadow)
+        return shadow
+
+    hood = Hood(_caps(), factory, AsyncMock(), AsyncMock())
+    await hood.async_start()
+    await hood.async_start()
+
+    assert len(made) == 1
+
+
+async def test_a_write_during_a_reconnect_waits_rather_than_failing():
+    """The supervisor rebuilds the socket about every 50 minutes. A write
+    landing in that window is not a disconnected hood, and must not surface
+    to the user as a failed command."""
+    import asyncio
+
+    hood, shadow = _hood()
+    await hood.async_start()
+
+    release = asyncio.Event()
+
+    async def slow_connect():
+        await release.wait()
+
+    shadow.connect = AsyncMock(side_effect=slow_connect)
+    reconnect = asyncio.create_task(hood.async_reconnect())
+    await asyncio.sleep(0)
+
+    write = asyncio.create_task(hood.async_set_light(1))
+    await asyncio.sleep(0)
+    assert not write.done()          # waiting on the lock, not raising
+
+    release.set()
+    await reconnect
+    await write
+    shadow.publish_state.assert_awaited_with({"light": 1})
+
+
 async def test_listeners_are_notified_and_removable():
     hood, _ = _hood()
     seen = []
@@ -1749,13 +1846,19 @@ class Hood:
         capabilities: HoodCapabilities,
         shadow_factory: Callable[[Hood], ShadowClient],
         poll: Callable[[str], Awaitable[HoodState]],
+        prepare: Callable[[], Awaitable[None]],
     ) -> None:
         self._capabilities = capabilities
         self._shadow_factory = shadow_factory
         self._poll = poll
+        # Runs before the first connect. Attaches the IoT policy; see _start.
+        self._prepare = prepare
         self._shadow: ShadowClient | None = None
         self._state: HoodState | None = None
         self._listeners: list[StateListener] = []
+        self._connected = False
+        # Serialises start/stop/reconnect against writes.
+        self._lock = asyncio.Lock()
 
     @property
     def thing_name(self) -> str:
@@ -1772,26 +1875,65 @@ class Hood:
 
     # -- lifecycle -----------------------------------------------------
 
+    @property
+    def connected(self) -> bool:
+        """Whether THIS hood's shadow connection is up.
+
+        Per-hood, not per-account: with several hoods one dropping must not
+        report the others as down.
+        """
+        return self._connected
+
+    def handle_connection_change(self, connected: bool) -> None:
+        """Called by ShadowClient from the event loop."""
+        self._connected = connected
+
     async def async_start(self) -> None:
         """Open this hood's shadow connection and request current state."""
-        shadow = self._shadow_factory(self)
-        await shadow.connect()
-        self._shadow = shadow
-        await shadow.request_state()
+        async with self._lock:
+            await self._start()
 
     async def async_stop(self) -> None:
-        if self._shadow is not None:
-            await self._shadow.disconnect()
-            self._shadow = None
+        async with self._lock:
+            await self._stop()
 
     async def async_reconnect(self) -> None:
         """Rebuild the socket after a credential refresh.
 
         The presigned URL is derived from credentials that expire, so a
         refresh without a reconnect leaves a socket AWS IoT will drop.
+
+        Holds the lock across both halves so a write arriving mid-rebuild
+        waits rather than failing with a spurious ZephyrNotConnectedError.
         """
-        await self.async_stop()
-        await self.async_start()
+        async with self._lock:
+            await self._stop()
+            await self._start()
+
+    # Lock-free bodies. Callers above hold self._lock; asyncio.Lock is not
+    # reentrant, so async_reconnect cannot call the public methods.
+
+    async def _start(self) -> None:
+        if self._shadow is not None:
+            # Already connected. Rebuilding here would orphan the previous
+            # paho client with its network thread still running.
+            return
+        # MUST precede connect(). An already-open MQTT connection does not
+        # pick up newly attached permissions, and the failure is silent:
+        # connect, subscribe and publish all succeed and every message is
+        # dropped (PROTOCOL.md section 3.3). Latched by the client, so a
+        # reconnect does not re-attach - the binding persists on the identity.
+        await self._prepare()
+        shadow = self._shadow_factory(self)
+        await shadow.connect()
+        self._shadow = shadow
+        await shadow.request_state()
+
+    async def _stop(self) -> None:
+        if self._shadow is not None:
+            await self._shadow.disconnect()
+            self._shadow = None
+        self._connected = False
 
     async def async_poll(self) -> HoodState:
         """Read state over HTTPS. Used at setup and while push is down.
@@ -1854,6 +1996,10 @@ class Hood:
         device acts on. state.desired writes are accepted by AWS IoT and
         silently ignored by the hardware.
         """
+        async with self._lock:
+            await self._publish(fields)
+
+    async def _publish(self, fields: dict[str, int]) -> None:
         if self._shadow is None:
             raise ZephyrNotConnectedError(
                 f"async_start() has not been called for {self.thing_name}"
@@ -1934,7 +2080,7 @@ git commit -m "feat: add the Hood object and make the write allowlist structural
   - `ZephyrClient.from_credentials(username, password, session, *, tokens=None, token_updater=None, endpoints=DEFAULT_ENDPOINTS) -> ZephyrClient`
   - `async_setup() -> list[Hood]`
   - `async_stop() -> None`
-  - `connected -> bool`
+  - `connected -> bool` (derived: any hood connected)
   - `identity_id -> str`
   - Removed: `async_set_state`, `async_start(thing_name)`, `async_poll(thing_name)`, `state(thing_name)`, `capabilities(thing_name)`, `add_listener(thing_name, cb)`, `async_refresh_if_needed()`.
 
@@ -2152,6 +2298,9 @@ class ZephyrClient:
         self._connected = False
         self._supervisor: asyncio.Task | None = None
         self._supervisor_error: ZephyrError | None = None
+        # The IoT policy binding persists on the identity, so attach once per
+        # client rather than on every reconnect (PROTOCOL.md section 3.3).
+        self._policy_attached = False
 
     @classmethod
     def from_credentials(
@@ -2183,10 +2332,6 @@ class ZephyrClient:
         )
 
     @property
-    def connected(self) -> bool:
-        return self._connected
-
-    @property
     def identity_id(self) -> str:
         """Cognito identity ID. Stable per account; a natural unique key.
 
@@ -2209,7 +2354,9 @@ class ZephyrClient:
                 continue
             payload = await self._api.discover_device(thing_name)
             caps = HoodCapabilities.from_discover(payload)
-            hood = Hood(caps, self._make_shadow, self._poll_state)
+            hood = Hood(
+                caps, self._make_shadow, self._poll_state, self._ensure_policy
+            )
             hood.handle_state(self._state_from_discover(payload))
             self._hoods[thing_name] = hood
         return list(self._hoods.values())
@@ -2217,13 +2364,46 @@ class ZephyrClient:
     async def async_stop(self) -> None:
         if self._supervisor is not None:
             self._supervisor.cancel()
+            # Await it. Cancelling without awaiting can leave a hood halfway
+            # through async_reconnect() with no socket and no supervisor, and
+            # lets the task be collected with an unretrieved CancelledError.
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._supervisor
             self._supervisor = None
         for hood in self._hoods.values():
             await hood.async_stop()
-        self._connected = False
+
+    @property
+    def connected(self) -> bool:
+        """True while at least one hood has a live push connection.
+
+        Derived from the hoods rather than a single latched flag, which with
+        more than one hood reported whichever shadow changed state last.
+        """
+        return any(hood.connected for hood in self._hoods.values())
+
+    async def _ensure_policy(self) -> None:
+        """Attach the IoT policy. Idempotent, and latched after the first run.
+
+        Passed to each Hood as its `prepare` callable, so it always runs
+        before the first connect and never on a reconnect.
+        """
+        if self._policy_attached:
+            return
+        await self._auth.async_attach_policy()
+        self._policy_attached = True
 ```
 
-`_make_shadow(hood)` builds a `ShadowClient` wired to this client's message handler, the auth's `mqtt_client_id`, and `self._auth.async_get_credentials` as the provider, then starts the supervisor if it is not already running.
+`_make_shadow(hood)` builds a `ShadowClient` wired to this client's message
+handler, the auth's `mqtt_client_id`, `self._auth.async_get_credentials` as the
+credentials provider, and `hood.handle_connection_change` as the connection
+callback. It then starts the supervisor if one is not already running, clearing
+`_supervisor_error` as it does so — otherwise a stored error from a previous
+supervisor outlives the condition that caused it and every later poll raises.
+
+It does **not** attach the IoT policy: that is `_ensure_policy`, passed to each
+`Hood` as its `prepare` callable so it runs before the first connect and is
+latched thereafter.
 
 `_poll_state(thing_name)` re-raises a stored terminal supervisor error before
 doing anything else, so an auth failure that stopped the supervisor becomes a
@@ -2294,7 +2474,23 @@ The supervisor:
         return True
 ```
 
-Add `SUPERVISOR_INTERVAL_SECONDS = 60` to `const.py`.
+Add `SUPERVISOR_INTERVAL_SECONDS = 60` to `const.py`, and `import contextlib`
+to `client.py`.
+
+### Three behaviours to document rather than change
+
+- **`token_updater` runs on the event loop.** Persisting usually means a
+  storage write, so the docstring must state that the callback has to be
+  non-blocking; a consumer needing I/O should schedule it.
+- **paho's own auto-reconnect races the supervisor.** After credential expiry
+  paho retries the presigned URL on a 1→120s backoff and fails every time
+  until the supervisor rebuilds it. Noisy but self-correcting, and worth
+  keeping: for an ordinary network drop the URL is still valid and paho's
+  reconnect is the faster fix.
+- **`expires_at` uses the AWS credential expiry as the token expiry.** Both
+  are one hour from the same exchange so they track, but that is an
+  assumption. If they ever diverge, read the `exp` claim from the ID token
+  instead.
 
 - [ ] **Step 4: Run the full suite**
 
