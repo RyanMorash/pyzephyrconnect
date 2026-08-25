@@ -306,3 +306,68 @@ async def test_publish_empty_state_raises_a_library_error(fake_paho):
     await _connect(shadow)
     with pytest.raises(ZephyrWriteError):
         await shadow.publish_state({})
+
+
+async def test_teardown_disconnects_before_stopping_the_network_thread(fake_paho):
+    """disconnect() BEFORE loop_stop(): the network thread is what writes the
+    DISCONNECT packet, so stopping it first would queue the packet and never
+    send it."""
+    shadow = _shadow()
+    await _connect(shadow)
+    await shadow.disconnect()
+
+    calls = [c for c in fake_paho.method_calls if c[0] in ("disconnect", "loop_stop")]
+    names = [c[0] for c in calls]
+    assert names.index("disconnect") < names.index("loop_stop")
+
+
+async def test_cancelled_handshake_tears_down_the_paho_client(fake_paho):
+    """A cancellation arriving mid-handshake must still tear down the paho
+    client and its network thread via the shielded teardown in disconnect()
+    - not leave it dangling because the outer connect() task was cancelled."""
+    fake_paho.connect_async.side_effect = None  # nothing fires; connect blocks
+
+    shadow = _shadow()
+    task = asyncio.create_task(shadow.connect(timeout=30))
+    # connect() awaits asyncio.to_thread() (for the TLS context) before
+    # constructing the paho client; that resolves on a real background
+    # thread, which needs more than a handful of bare sleep(0) yields to
+    # land. Poll until the client exists so the cancel below lands mid
+    # handshake (awaiting _connected.wait()) rather than before self._client
+    # is even assigned.
+    for _ in range(2000):
+        if shadow._client is not None:
+            break
+        await asyncio.sleep(0)
+    assert shadow._client is not None, "connect() never reached client construction"
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert fake_paho.disconnect.called
+    assert fake_paho.loop_stop.called
+    assert shadow._client is None
+
+
+async def test_disconnect_is_idempotent(fake_paho):
+    shadow = _shadow()
+    await _connect(shadow)
+
+    await shadow.disconnect()
+    await shadow.disconnect()  # must not raise
+
+    assert fake_paho.loop_stop.call_count == 1
+
+
+async def test_connect_over_a_live_client_tears_the_old_one_down_first(fake_paho):
+    """connect() is the ~50-minute reconnect path; connecting over a live
+    client must tear the old one down first instead of leaking its network
+    thread and reusing stale readiness events."""
+    shadow = _shadow()
+    await _connect(shadow)
+    first_client = shadow._client
+
+    await _connect(shadow)  # fixture fires connect again
+
+    assert first_client.loop_stop.called

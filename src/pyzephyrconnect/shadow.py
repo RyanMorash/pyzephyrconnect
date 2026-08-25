@@ -197,6 +197,13 @@ class ShadowClient:
         URL AWS IoT has already stopped accepting.
         """
         self._loop = asyncio.get_running_loop()
+        if self._client is not None:
+            # connect() is the ~50-minute reconnect path; connecting over a
+            # live client would leak its network thread and reuse stale
+            # readiness events.
+            await self.disconnect()
+        self._connected.clear()
+        self._subscribed.clear()
         credentials = await self._credentials_provider()
         url = build_presigned_url(
             credentials.access_key,
@@ -273,14 +280,25 @@ class ShadowClient:
         if self._client is None:
             return
         client, self._client = self._client, None
+        # Clear before the await, not after: a slow teardown (loop_stop
+        # joins a thread parked in recv) could otherwise let a NEWER
+        # connection complete inside that window and have its events
+        # clobbered here, leaving the object connected-but-unsubscribed.
+        self._connected.clear()
+        self._subscribed.clear()
         # Off the loop: loop_stop() JOINS paho's network thread (see
         # paho/mqtt/client.py), and that thread is frequently inside a
         # synchronous socket recv. A thread join on the event loop was
         # tolerable once at shutdown; this now runs on every ~50-minute
         # supervisor rebuild, per hood.
-        await asyncio.to_thread(self._teardown, client)
-        self._connected.clear()
-        self._subscribed.clear()
+        #
+        # Shielded: disconnect() runs inside connect()'s `except
+        # BaseException` cleanup. A SECOND cancellation arriving while this
+        # teardown work item is still queued on the executor would cancel it
+        # before the executor picks it up, leaking a paho client whose
+        # network thread is already running - the exact leak this cleanup
+        # exists to prevent, one level down.
+        await asyncio.shield(asyncio.to_thread(self._teardown, client))
 
     @staticmethod
     def _teardown(client: mqtt.Client) -> None:
