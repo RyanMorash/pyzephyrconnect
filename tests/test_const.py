@@ -38,9 +38,9 @@ def test_writable_fields_cover_the_validation_sequence():
 def test_defaults_reproduce_the_current_constants():
     e = DEFAULT_ENDPOINTS
     assert e.region == "us-west-2"
-    assert e.iot_endpoint.endswith("-ats.iot.us-west-2.amazonaws.com")
-    assert e.device_api_list.endswith("/getowndevices")
-    assert e.device_api_discover.endswith("/discoverdevice")
+    assert e.iot_endpoint == "a1nqxu0hki9zw3-ats.iot.us-west-2.amazonaws.com"
+    assert e.device_api_list == "https://zephyr-prod-app.gemteks.com/prod/getowndevices"
+    assert e.device_api_discover == "https://zephyr-prod-app.gemteks.com/prod/discoverdevice"
     assert e.provider == "cognito-idp.us-west-2.amazonaws.com/us-west-2_McuoKpkna"
 
 

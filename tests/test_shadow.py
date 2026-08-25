@@ -346,15 +346,21 @@ async def test_cancelled_handshake_tears_down_the_paho_client(fake_paho):
     task = asyncio.create_task(shadow.connect(timeout=30))
     # connect() awaits asyncio.to_thread() (for the TLS context) before
     # constructing the paho client; that resolves on a real background
-    # thread, which needs more than a handful of bare sleep(0) yields to
-    # land. Poll until the client exists so the cancel below lands mid
-    # handshake (awaiting _connected.wait()) rather than before self._client
-    # is even assigned.
-    for _ in range(2000):
-        if shadow._client is not None:
-            break
-        await asyncio.sleep(0)
-    assert shadow._client is not None, "connect() never reached client construction"
+    # thread, which needs actual wall-clock time to land - not just a
+    # handful of bare sleep(0) yields, which burn microseconds and can
+    # exhaust their budget before the worker thread ever runs on a loaded
+    # CI runner. Poll with a real deadline until the client exists so the
+    # cancel below lands mid handshake (awaiting _connected.wait()) rather
+    # than before self._client is even assigned.
+    deadline = asyncio.get_running_loop().time() + 5.0
+    while shadow._client is None:
+        assert asyncio.get_running_loop().time() < deadline, (
+            "connect() never reached client construction"
+        )
+        # Real sleep, not sleep(0): the client is built after an
+        # asyncio.to_thread() hop, and a bare yield gives the worker
+        # thread no wall-clock time on a loaded CI runner.
+        await asyncio.sleep(0.01)
     task.cancel()
 
     with pytest.raises(asyncio.CancelledError):
