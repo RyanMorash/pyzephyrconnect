@@ -285,3 +285,13 @@ async def test_ssl_context_is_built_once_and_cached(monkeypatch):
     await api.get_own_devices()
 
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("shape", [1, "x", {"a": 1}])
+async def test_a_non_list_devices_value_returns_empty_list(shape):
+    """`len(devices)` runs before anything validates the shape, so a scalar
+    here raised a raw TypeError out of the debug log line - outside the
+    "consumers catch ZephyrError" contract, and before the client-side
+    guard downstream ever gets a look."""
+    session = FakeSession(FakeResponse({"devices": shape}))
+    assert await ZephyrApi(_fake_auth(session)).get_own_devices() == []

@@ -10,6 +10,7 @@ with no error anywhere.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import ssl
@@ -305,7 +306,21 @@ class ShadowClient:
         # before the executor picks it up, leaking a paho client whose
         # network thread is already running - the exact leak this cleanup
         # exists to prevent, one level down.
-        await asyncio.shield(asyncio.to_thread(self._teardown, client))
+        teardown = asyncio.ensure_future(
+            asyncio.to_thread(self._teardown, client)
+        )
+        try:
+            await asyncio.shield(teardown)
+        except asyncio.CancelledError:
+            # shield surfaces OUR cancellation immediately while the work
+            # item runs on; returning now would release the hood lock with
+            # paho's thread still alive, letting a new connect overlap the
+            # old client. Best-effort: see the teardown through, THEN
+            # honour the cancel. (A second cancel during this wait still
+            # wins - unavoidable, and strictly rarer.)
+            with contextlib.suppress(BaseException):
+                await teardown
+            raise
 
     @staticmethod
     def _teardown(client: mqtt.Client) -> None:

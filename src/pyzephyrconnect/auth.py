@@ -264,7 +264,14 @@ class AbstractAuth(ABC):
                 # a raw botocore exception here escapes the "consumers catch
                 # ZephyrError" contract exactly at boot. Classify: rejection
                 # is terminal, a network blip is retryable.
-                raise self._classify(err) from err
+                #
+                # from None, deliberately: the classified error carries the
+                # type name and AWS code; chaining the original would render
+                # its message - which can embed request parameters and
+                # identifiers - in supervisor ERROR tracebacks that users
+                # paste into public issues. (Same reasoning at every
+                # classification site in this module.)
+                raise self._classify(err) from None
             if identity_id != stored_identity:
                 # The stored identity was stale and _exchange refetched it.
                 # This MUST take effect: mqtt_client_id derives from it, and
@@ -464,15 +471,18 @@ class AbstractAuth(ABC):
                 "UnauthorizedException",
                 "ResourceNotFoundException",
             }:
-                raise self._classify(err) from err
+                # from None - see async_get_credentials.
+                raise self._classify(err) from None
             # No identity ID in the message: it is a stable account
             # identifier, and exception text reaches ERROR logs users paste
             # into public issues.
+            # from None - see async_get_credentials. The scrubbing above is
+            # the whole point of this branch; chaining would undo it.
             raise ZephyrPolicyError(
                 f"Could not attach {const.POLICY_NAME} to this identity. "
                 "Without it the MQTT connection succeeds but every message is "
                 "silently dropped."
-            ) from err
+            ) from None
 
 
 @dataclass(frozen=True, slots=True)
@@ -626,7 +636,8 @@ class CredentialsAuth(AbstractAuth):
                 _LOGGER.debug("refresh failed (%s)", type(err).__name__)
                 classified = self._classify(err)
                 if not isinstance(classified, ZephyrAuthError):
-                    raise classified from err
+                    # from None - see async_get_credentials.
+                    raise classified from None
             else:
                 token_username = stored.username
 
@@ -637,7 +648,8 @@ class CredentialsAuth(AbstractAuth):
                 # Classify - a DNS failure or pool throttling here must NOT
                 # become ZephyrAuthError, which the supervisor treats as
                 # terminal and the consumer maps to a reauth prompt.
-                raise self._classify(err) from err
+                # from None - see async_get_credentials.
+                raise self._classify(err) from None
 
         self._user = user
         try:
@@ -649,7 +661,8 @@ class CredentialsAuth(AbstractAuth):
         except ZephyrError:
             raise
         except Exception as err:  # noqa: BLE001
-            raise self._classify(err) from err
+            # from None - see async_get_credentials.
+            raise self._classify(err) from None
 
         self._credentials = credentials
         self._credentials_for = identity_id

@@ -1,5 +1,6 @@
 import logging
 import time
+import traceback
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
@@ -735,3 +736,54 @@ async def test_refresh_path_replays_the_stored_identity_without_refetching(fake_
     await auth.async_get_tokens()
 
     assert fake_aws["identity"].get_id.call_count == 0
+
+
+def _sentinel_client_error(code, operation):
+    """A botocore error whose MESSAGE carries a value that must never be
+    rendered. botocore echoes request parameters and identifiers back in
+    Message, and str(ClientError) interpolates it."""
+    return ClientError(
+        {"Error": {"Code": code, "Message": "context: SECRET-SENTINEL"}},
+        operation,
+    )
+
+
+async def test_srp_classification_traceback_omits_the_botocore_message(fake_aws):
+    """_classify scrubs the raw message on purpose. Chaining the original
+    with `from err` puts it straight back: the supervisor's
+    _LOGGER.exception renders the whole chain at ERROR, and that is what
+    users paste into public issues. `from None` is what keeps the
+    scrubbing real - while the type name and AWS code survive, so the
+    failure is still diagnosable."""
+    fake_aws["cognito"].authenticate.side_effect = _sentinel_client_error(
+        "TooManyRequestsException", "InitiateAuth"
+    )
+    auth = CredentialsAuth("u", "p", MagicMock())
+
+    with pytest.raises(ZephyrTransportError) as excinfo:
+        await auth.async_get_tokens()
+
+    rendered = "".join(traceback.format_exception(excinfo.value))
+    assert "SECRET-SENTINEL" not in rendered
+    # Diagnosability is pinned too - scrubbing must not become silence.
+    assert "TooManyRequestsException" in rendered
+    assert "ClientError" in rendered
+
+
+async def test_attach_policy_error_traceback_omits_the_botocore_message(fake_aws):
+    """Same reasoning at the ZephyrPolicyError site: its message is
+    deliberately identifier-free, and a chained cause would render the
+    identity ID and request context the wording exists to withhold."""
+    fake_aws["iot"].attach_policy.side_effect = _sentinel_client_error(
+        "AccessDeniedException", "AttachPolicy"
+    )
+    auth = CredentialsAuth("u", "p", MagicMock())
+
+    with pytest.raises(ZephyrPolicyError) as excinfo:
+        await auth.async_attach_policy()
+
+    rendered = "".join(traceback.format_exception(excinfo.value))
+    assert "SECRET-SENTINEL" not in rendered
+    assert IDENTITY not in rendered
+    # The actionable guidance still reaches the log.
+    assert "silently dropped" in rendered

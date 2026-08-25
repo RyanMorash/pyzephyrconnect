@@ -161,6 +161,11 @@ class ZephyrApi:
         # Empty body, not "{}" - matches the captured request exactly.
         payload = await self._post(self._auth.endpoints.device_api_list, data=b"")
         devices = payload.get("devices") or []
+        if not isinstance(devices, list):
+            # A scalar here would TypeError on len() below - and the
+            # client-side guard runs too late to help.
+            _LOGGER.warning("getowndevices returned an unexpected shape")
+            return []
         _LOGGER.debug("getowndevices returned %d device(s)", len(devices))
         return devices
 

@@ -29,9 +29,9 @@ async with aiohttp.ClientSession() as session:
 
 ## Persisting tokens
 
-The library never stores credentials. Supply tokens from a previous
-session and a callback to save new ones, and a restart skips the SRP
-login entirely:
+The library never persists credentials - storage is yours. Supply tokens
+from a previous session and a callback to save new ones, and a restart
+skips the SRP login entirely:
 
 ```python
 from pyzephyrconnect import ZephyrClient, ZephyrTokens

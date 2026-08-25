@@ -457,3 +457,45 @@ async def test_a_raising_teardown_still_drops_the_client_reference(fake_paho):
         await shadow.connect(timeout=0.01)
 
     assert shadow._client is None
+
+
+async def test_a_cancelled_disconnect_completes_the_teardown_before_raising(
+    fake_paho, monkeypatch
+):
+    """asyncio.shield protects the WORK from cancellation, but it delivers
+    CancelledError to the CALLER immediately. A bare `await shield(...)`
+    therefore returns while paho's thread is still being reaped: the hood
+    lock releases and a reconnect can overlap the old client, which the
+    broker resolves by evicting one of them (same client ID). disconnect()
+    must see the teardown through, THEN honour the cancel."""
+    shadow = _shadow()
+    await _connect(shadow)
+
+    order: list[str] = []
+    gate = asyncio.get_running_loop().create_future()
+
+    def gated_to_thread(fn, *args, **kwargs):
+        # Stands in for the worker thread: the teardown does not run until
+        # the test opens the gate, so "still in flight" is deterministic.
+        async def run():
+            await gate
+            fn(*args, **kwargs)
+            order.append("teardown-done")
+
+        return run()
+
+    monkeypatch.setattr(shadow_module.asyncio, "to_thread", gated_to_thread)
+
+    task = asyncio.create_task(shadow.disconnect())
+    await asyncio.sleep(0.01)  # park on the shield
+    task.cancel()
+    await asyncio.sleep(0.01)  # deliver the cancel
+    assert not order, "teardown ran before the gate opened"
+
+    gate.set_result(None)
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    order.append("cancel-raised")
+
+    assert order == ["teardown-done", "cancel-raised"]
+    assert fake_paho.loop_stop.called

@@ -52,8 +52,11 @@ client = ZephyrClient.from_credentials(username, password, session)
 
 ### Token persistence (new capability)
 
-The library no longer stores credentials, and it can now skip the SRP login
-entirely on restart if you hand it tokens from a previous session:
+The library no longer persists credentials itself (the built-in
+`CredentialsAuth` still holds them in memory for the refresh fallback;
+subclass `AbstractAuth` to keep the password out of the library entirely),
+and it can now skip the SRP login entirely on restart if you hand it tokens
+from a previous session:
 
 ```python
 from pyzephyrconnect import ZephyrClient, ZephyrTokens
