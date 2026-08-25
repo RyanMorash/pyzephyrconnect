@@ -113,13 +113,74 @@ def test_accessor_raises_before_any_tokens_are_acquired():
         _ = auth.identity_id
 
 
-async def test_attach_policy_wraps_a_failed_attach_in_zephyr_policy_error(
+def _iot_error(code):
+    return ClientError({"Error": {"Code": code, "Message": "no"}}, "AttachPolicy")
+
+
+async def test_attach_policy_wraps_a_refused_attach_in_zephyr_policy_error(
     fake_aws,
 ):
-    fake_aws["iot"].attach_policy.side_effect = Exception("AccessDenied")
+    """A genuine authorization refusal stays terminal - retrying cannot
+    grant a permission the identity does not have."""
+    fake_aws["iot"].attach_policy.side_effect = _iot_error("AccessDeniedException")
+    auth = CredentialsAuth("u", "p", MagicMock())
+
+    with pytest.raises(ZephyrPolicyError) as excinfo:
+        await auth.async_attach_policy()
+
+    # Still identifier-free: the message reaches ERROR logs users paste
+    # into public issues, and the identity ID is a stable account handle.
+    assert IDENTITY not in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "code", ["AccessDeniedException", "UnauthorizedException", "ResourceNotFoundException"]
+)
+async def test_the_terminal_attach_codes_stay_policy_errors(fake_aws, code):
+    fake_aws["iot"].attach_policy.side_effect = _iot_error(code)
     auth = CredentialsAuth("u", "p", MagicMock())
 
     with pytest.raises(ZephyrPolicyError):
+        await auth.async_attach_policy()
+
+
+async def test_a_throttled_attach_stays_retryable(fake_aws):
+    """The supervisor keys terminal-vs-retry on the exception TYPE. A
+    throttled IoT endpoint during a supervisor rebuild is transient, and
+    wrapping it as a policy error permanently stops every hood over a blip
+    that would have cleared on the next tick."""
+    fake_aws["iot"].attach_policy.side_effect = _iot_error(
+        "TooManyRequestsException"
+    )
+    auth = CredentialsAuth("u", "p", MagicMock())
+
+    with pytest.raises(ZephyrTransportError):
+        await auth.async_attach_policy()
+
+
+async def test_an_unreachable_attach_endpoint_stays_retryable(fake_aws):
+    """Not every failure is a ClientError - a socket error never reaches
+    botocore's error shape at all, and it is the most obviously transient
+    case there is."""
+    fake_aws["iot"].attach_policy.side_effect = OSError("connection reset")
+    auth = CredentialsAuth("u", "p", MagicMock())
+
+    with pytest.raises(ZephyrTransportError):
+        await auth.async_attach_policy()
+
+
+async def test_a_rejected_credential_at_attach_surfaces_as_an_auth_error(
+    fake_aws,
+):
+    """_classify's own split still applies underneath: a rejected
+    credential means the user must reauth, which is neither a retry nor a
+    policy problem."""
+    fake_aws["iot"].attach_policy.side_effect = _iot_error(
+        "NotAuthorizedException"
+    )
+    auth = CredentialsAuth("u", "p", MagicMock())
+
+    with pytest.raises(ZephyrAuthError):
         await auth.async_attach_policy()
 
 

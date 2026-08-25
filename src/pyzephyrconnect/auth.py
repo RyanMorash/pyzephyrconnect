@@ -407,6 +407,15 @@ class AbstractAuth(ABC):
         )
 
     def _attach(self, identity_id: str, creds: Credentials) -> None:
+        """Bind the policy, classifying the failure rather than assuming one.
+
+        Only a genuine authorization/policy refusal is terminal. Every other
+        failure - a throttled or unreachable IoT endpoint during a
+        supervisor rebuild, a rejected credential - goes through _classify,
+        because a blanket ZephyrPolicyError here keys the supervisor's
+        terminal-vs-retry decision to "stop" and permanently kills every
+        hood over what is usually a transient blip.
+        """
         client = boto3.client(
             "iot",
             region_name=self.endpoints.region,
@@ -427,6 +436,21 @@ class AbstractAuth(ABC):
                 policyName=const.POLICY_NAME, target=identity_id
             )
         except Exception as err:  # noqa: BLE001
+            code = ""
+            if isinstance(err, ClientError):
+                code = err.response.get("Error", {}).get("Code", "")
+            if code not in {
+                # The only codes that mean the ATTACH ITSELF was refused:
+                # the caller may not attach, or the policy is not there.
+                # Those are terminal - retrying cannot grant a permission
+                # the identity does not have. Everything else (throttling,
+                # socket, DNS, a rejected credential) is about the request,
+                # not the authorization, and must stay retryable.
+                "AccessDeniedException",
+                "UnauthorizedException",
+                "ResourceNotFoundException",
+            }:
+                raise self._classify(err) from err
             # No identity ID in the message: it is a stable account
             # identifier, and exception text reaches ERROR logs users paste
             # into public issues.

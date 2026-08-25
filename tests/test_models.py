@@ -161,6 +161,51 @@ def test_capabilities_malformed_numeric_raises():
         HoodCapabilities.from_discover({"maxFanSpeed": "six"})
 
 
+def test_capabilities_reject_a_non_integral_float():
+    """int() truncates 6.5 to 6 silently. A hood that reports a fractional
+    speed count is malformed, and the truncated value would gate entity
+    creation - wrongly, and for the life of the config entry."""
+    with pytest.raises(ZephyrDataError):
+        HoodCapabilities.from_discover({"maxFanSpeed": 6.5})
+
+
+def test_capabilities_reject_a_boolean():
+    """int(True) is 1, which reads as a hood with exactly one fan speed.
+    A JSON true is never a capability count."""
+    with pytest.raises(ZephyrDataError):
+        HoodCapabilities.from_discover({"maxFanSpeed": True})
+
+
+def test_capabilities_accept_an_integral_float():
+    """JSON has one number type; 6.0 is the same fact as 6, not a
+    malformed payload. The strictness above must not reject it."""
+    caps = HoodCapabilities.from_discover({"maxFanSpeed": 6.0})
+    assert caps.max_fan_speed == 6
+
+
+def test_capabilities_accept_a_numeric_string():
+    """The vendor quotes some numbers and not others - pinned, because the
+    reference device depends on it."""
+    caps = HoodCapabilities.from_discover({"maxFanSpeed": "6"})
+    assert caps.max_fan_speed == 6
+
+
+def test_capabilities_empty_string_still_reads_as_absent():
+    """The absent path is untouched by the stricter parse: "" is how this
+    vendor spells a key it has no value for."""
+    caps = HoodCapabilities.from_discover({"maxFanSpeed": ""})
+    assert caps.max_fan_speed is None
+
+
+def test_state_parsing_stays_lenient_about_the_same_values():
+    """HoodState's parser is deliberately LENIENT - it runs on every push
+    and must never raise into the hot path, where an exception would drop
+    the whole state update. The capability parser's new strictness must not
+    have leaked into it: these values still coerce rather than raise."""
+    assert HoodState.from_reported({"fan": 3.5}).fan == 3
+    assert HoodState.from_reported({"power": True}).power == 1
+
+
 def test_scalar_fault_code_degrades_to_none_and_warns(caplog):
     """A non-list faultCode must not raise from the hot push path - tuple(5)
     would TypeError inside _handle_message and the state update would be

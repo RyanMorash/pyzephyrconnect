@@ -271,7 +271,16 @@ class ShadowClient:
             # AND CancelledError: whatever interrupts the handshake, the paho
             # client and its network thread must be torn down before the
             # exception leaves - nothing outside holds a reference yet.
-            await self.disconnect()
+            try:
+                await self.disconnect()
+            except Exception:  # noqa: BLE001
+                # The teardown failure must not REPLACE the handshake
+                # failure - the caller's terminal-vs-retry decision keys on
+                # the original exception's type. An OSError out of
+                # loop_stop() standing in for a ZephyrPolicyError would tell
+                # the supervisor to retry forever against a policy the
+                # identity will never have.
+                _LOGGER.exception("teardown after a failed handshake")
             raise
 
     async def disconnect(self) -> None:

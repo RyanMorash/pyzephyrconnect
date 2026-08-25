@@ -82,6 +82,13 @@ class ZephyrClient:
         # reconnect is silently dropped - the exact failure the attach
         # exists to prevent.
         self._policy_attached_for: str | None = None
+        # The latch above is read-modify-write across an await, so it needs
+        # a lock: two hoods starting concurrently both pass the check and
+        # both attach, and if an identity refetch lands between them the
+        # interleaved writes can record the OLD identity as attached-for
+        # while the NEW one never got the policy - the silent
+        # message-drop failure the attach exists to prevent.
+        self._policy_lock = asyncio.Lock()
 
     @classmethod
     def from_credentials(
@@ -246,12 +253,23 @@ class ZephyrClient:
 
         Passed to each Hood as its `prepare` callable, so it always runs
         before the first connect and never on a reconnect.
+
+        Serialised: hoods start concurrently, and the latch is a
+        read-modify-write spanning an await. The identity is re-read INSIDE
+        the lock, so a waiter that queued behind an attach for identity A
+        latches whichever identity is current when its own attach runs -
+        never A over a newer B.
         """
-        identity = self._auth.identity_id
-        if self._policy_attached_for == identity:
-            return
-        await self._auth.async_attach_policy()
-        self._policy_attached_for = identity
+        async with self._policy_lock:
+            # Re-read, not the value captured before the lock: an identity
+            # refetch can land while this call is queued, and latching the
+            # stale one would record the new identity as attached-for
+            # without it ever having received the policy.
+            identity = self._auth.identity_id
+            if self._policy_attached_for == identity:
+                return
+            await self._auth.async_attach_policy()
+            self._policy_attached_for = identity
 
     def _make_shadow(self, hood: Hood) -> ShadowClient:
         shadow = ShadowClient(

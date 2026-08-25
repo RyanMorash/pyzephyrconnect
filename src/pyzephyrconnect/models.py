@@ -69,6 +69,19 @@ class HoodCapabilities:
         def as_int(key: str) -> int | None:
             if (value := payload.get(key)) is None or value == "":
                 return None
+            # int() would take both of these silently: a JSON true becomes
+            # 1 (a hood with "one fan speed"), and 6.5 truncates to 6. Both
+            # are present-but-malformed, which this parser is contracted to
+            # raise on rather than turn into a plausible-looking wrong
+            # capability that gates entity creation for the life of the
+            # config entry. Integral floats (6.0) and numeric strings ("6")
+            # remain accepted - those are the same fact in another shape.
+            if isinstance(value, bool) or (
+                isinstance(value, float) and not value.is_integer()
+            ):
+                raise ZephyrDataError(
+                    f"capability {key!r} was present but unparseable: {value!r}"
+                )
             try:
                 return int(value)
             except (TypeError, ValueError) as err:

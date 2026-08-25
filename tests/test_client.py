@@ -453,6 +453,74 @@ async def test_the_policy_is_attached_once_per_identity(wired):
     assert auth.async_attach_policy.await_count == 2
 
 
+async def test_concurrent_ensure_policy_calls_attach_exactly_once(wired):
+    """Hoods start concurrently. The latch is a read-modify-write spanning
+    an await, so without a lock both callers pass the check and both attach
+    - and the interleaved writes can record an identity that never received
+    the policy, which is the silent message-drop failure."""
+    auth = wired["auth"]
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_attach():
+        # Hold the attach open so the second caller is guaranteed to reach
+        # _ensure_policy while the first is still inside it. Without this
+        # the AsyncMock resolves without ever yielding and the race the
+        # lock exists to close never occurs.
+        started.set()
+        await release.wait()
+
+    auth.async_attach_policy = AsyncMock(side_effect=slow_attach)
+    client = _client()
+    await client.async_setup()
+
+    first = asyncio.create_task(client._ensure_policy())
+    await started.wait()
+    second = asyncio.create_task(client._ensure_policy())
+    # Let the second task run up to the lock it must now be waiting on.
+    await asyncio.sleep(0)
+    release.set()
+    await asyncio.gather(first, second)
+
+    assert auth.async_attach_policy.await_count == 1
+    assert client._policy_attached_for == "us-west-2:abc"
+
+
+async def test_an_identity_refetch_during_an_attach_is_not_latched_stale(wired):
+    """The identity is re-read INSIDE the lock. A waiter that queued behind
+    an attach for A must latch whichever identity is current when its OWN
+    attach runs - latching A over a newer B would mark the new identity as
+    attached-for while the policy never reached it."""
+    auth = wired["auth"]
+    started = asyncio.Event()
+    release = asyncio.Event()
+    attached_for: list[str] = []
+
+    async def slow_attach():
+        attached_for.append(auth.identity_id)
+        started.set()
+        await release.wait()
+
+    auth.async_attach_policy = AsyncMock(side_effect=slow_attach)
+    client = _client()
+    await client.async_setup()
+
+    first = asyncio.create_task(client._ensure_policy())
+    await started.wait()
+    second = asyncio.create_task(client._ensure_policy())
+    await asyncio.sleep(0)
+    # The refetch lands while the second caller is parked on the lock, so
+    # it must NOT be short-circuited by the latch the first call is about
+    # to write for the old identity.
+    auth.identity_id = "us-west-2:new"
+    started.clear()
+    release.set()
+    await asyncio.gather(first, second)
+
+    assert attached_for == ["us-west-2:abc", "us-west-2:new"]
+    assert client._policy_attached_for == "us-west-2:new"
+
+
 async def test_the_mqtt_client_id_is_per_connection(wired):
     """AWS IoT treats two live connections with the same client ID as one
     session and evicts one for the other, so N hoods sharing the bare

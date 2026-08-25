@@ -9,7 +9,11 @@ import pytest
 
 from pyzephyrconnect import shadow as shadow_module
 from pyzephyrconnect.auth import Credentials
-from pyzephyrconnect.exceptions import ZephyrPolicyError, ZephyrWriteError
+from pyzephyrconnect.exceptions import (
+    ZephyrPolicyError,
+    ZephyrTransportError,
+    ZephyrWriteError,
+)
 from pyzephyrconnect.shadow import ShadowClient, ShadowTopics
 
 THING = "aaaaaaaabbbbbbbbccccccccddddddddeeeeeeee"
@@ -405,3 +409,51 @@ async def test_connect_over_a_live_client_tears_the_old_one_down_first(fake_paho
     await _connect(shadow)  # fixture fires connect again
 
     assert first_client.loop_stop.called
+
+
+async def test_a_raising_teardown_does_not_mask_a_policy_failure(fake_paho, caplog):
+    """The supervisor keys terminal-vs-retry on the exception TYPE. A
+    teardown that raises on the way out of a failed handshake must not
+    REPLACE the handshake failure: an OSError from loop_stop() standing in
+    for a ZephyrPolicyError would tell the supervisor to retry forever
+    against a policy the identity will never have."""
+    denied = MagicMock()
+    denied.is_failure = True
+
+    def fire_connack_then_deny_subscribe(*args, **kwargs):
+        fake_paho.on_connect(fake_paho, None, {}, 0, None)
+        for _ in range(6):
+            fake_paho.on_subscribe(fake_paho, None, 1, [denied], None)
+
+    fake_paho.connect_async.side_effect = fire_connack_then_deny_subscribe
+    fake_paho.loop_stop.side_effect = OSError("network thread already gone")
+
+    with pytest.raises(ZephyrPolicyError, match="attach"):
+        await _connect(_make())
+
+    # The teardown failure is not lost either - it is logged, not silent.
+    assert "teardown after a failed handshake" in caplog.text
+
+
+async def test_a_raising_teardown_does_not_mask_a_handshake_timeout(fake_paho):
+    """Same masking, retryable side: the timeout is what tells the caller to
+    retry, and an OSError in its place is unclassifiable."""
+    fake_paho.connect_async.side_effect = None  # nothing fires; connect times out
+    fake_paho.disconnect.side_effect = OSError("socket already gone")
+
+    with pytest.raises(ZephyrTransportError, match="timed out"):
+        await _make().connect(timeout=0.01)
+
+
+async def test_a_raising_teardown_still_drops_the_client_reference(fake_paho):
+    """Swallowing the teardown error must not leave a half-torn-down client
+    behind: disconnect() clears _client before the await, so the next
+    connect() builds a fresh one instead of reusing a dead handle."""
+    fake_paho.connect_async.side_effect = None
+    fake_paho.disconnect.side_effect = OSError("socket already gone")
+
+    shadow = _shadow()
+    with pytest.raises(ZephyrTransportError):
+        await shadow.connect(timeout=0.01)
+
+    assert shadow._client is None
