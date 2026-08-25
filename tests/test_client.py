@@ -52,12 +52,24 @@ def _auth_double(endpoints=DEFAULT_ENDPOINTS, order=None):
     auth.identity_id = "us-west-2:abc"
     auth.mqtt_client_id = "us-west-2:abc-ha"
     auth.credentials_expired = False          # explicit bool, never a Mock
+    # Explicit int for the same reason: the supervisor compares this against
+    # each hood's recorded generation, and a bare Mock attribute compares
+    # unequal to everything - every tick would then look like a stale socket.
+    auth.credentials_generation = 0
     auth.async_get_tokens = AsyncMock()
-    auth.async_get_credentials = AsyncMock(
-        return_value=Credentials(
-            "k", "s", "t", datetime.now(UTC) + timedelta(hours=1)
-        )
+    credentials = Credentials(
+        "k", "s", "t", datetime.now(UTC) + timedelta(hours=1)
     )
+
+    def _exchange():
+        # A real exchange replaces the cached credentials, and both sites
+        # that do so bump the generation. Modelling that here is what lets
+        # these tests distinguish "the cache was replaced" from "the cache
+        # looked expired" - the whole point of the counter.
+        auth.credentials_generation += 1
+        return credentials
+
+    auth.async_get_credentials = AsyncMock(side_effect=_exchange)
     auth.async_attach_policy = AsyncMock(
         side_effect=lambda: recorder.append("attach_policy")
     )
@@ -88,13 +100,33 @@ def wired(monkeypatch):
     api.discover_device = AsyncMock(return_value=discover)
 
     shadow = MagicMock()
-    shadow.connect = AsyncMock(side_effect=lambda *a, **k: order.append("connect"))
     shadow.disconnect = AsyncMock()
     shadow.request_state = AsyncMock()
     shadow.publish_state = AsyncMock()
 
+    # The real ShadowClient calls its credentials provider on every connect,
+    # because that is when the presigned URL is (re)built. The double has to
+    # as well: that call is what records the hood's presigned generation, and
+    # a double that skips it leaves every started hood looking permanently
+    # stale to the supervisor.
+    wiring: dict[str, Any] = {}
+
+    def build_shadow(*args, **kwargs):
+        # args[4] is the per-hood credentials provider ZephyrClient wires in.
+        wiring["provider"] = args[4]
+        return shadow
+
+    async def connect(*args, **kwargs):
+        order.append("connect")
+        if (provider := wiring.get("provider")) is not None:
+            await provider()
+
+    shadow.connect = AsyncMock(side_effect=connect)
+
     monkeypatch.setattr(client_module, "ZephyrApi", MagicMock(return_value=api))
-    monkeypatch.setattr(client_module, "ShadowClient", MagicMock(return_value=shadow))
+    monkeypatch.setattr(
+        client_module, "ShadowClient", MagicMock(side_effect=build_shadow)
+    )
 
     _WIRED["auth"] = auth
     try:
@@ -573,15 +605,27 @@ async def test_two_hoods_sharing_an_8char_prefix_get_different_client_ids(wired)
 
 
 async def test_the_shadow_gets_the_credentials_provider_not_a_credential(wired):
-    """The presigned URL is rebuilt on every connect, so the shadow needs
-    the method - handing it one snapshot pins the socket to credentials that
-    expire in an hour."""
+    """The presigned URL is rebuilt on every connect, so the shadow needs a
+    callable - handing it one snapshot pins the socket to credentials that
+    expire in an hour.
+
+    It is a per-hood wrapper rather than async_get_credentials itself: the
+    connect that presigns the URL is exactly the moment that must record
+    which credential generation the signature belongs to, so the supervisor
+    can rebuild on a mismatch instead of trusting expiry."""
     client = _client()
     hoods = await client.async_setup()
     client._make_shadow(hoods[0])
 
-    args = client_module.ShadowClient.call_args.args
-    assert args[4] is wired["auth"].async_get_credentials
+    provider = client_module.ShadowClient.call_args.args[4]
+    assert provider is not wired["auth"].async_get_credentials
+
+    creds = await provider()
+    assert isinstance(creds, Credentials)
+    wired["auth"].async_get_credentials.assert_awaited()
+    assert (
+        hoods[0]._presigned_generation == wired["auth"].credentials_generation
+    )
 
 
 async def test_an_endpoint_override_reaches_mqtt_too(wired):
@@ -886,6 +930,93 @@ async def test_refresh_does_not_ask_a_method_that_renews_as_a_side_effect(wired)
     assert wired["shadow"].connect.await_count == 2      # rebuilt
 
 
+async def test_a_rest_driven_refresh_still_rebuilds_the_socket(wired):
+    """Expiry alone lies, and this is the scenario where it does.
+
+    ZephyrApi calls async_get_tokens() on every REST request, and
+    CredentialsAuth._acquire replaces the cached AWS credentials as a side
+    effect - so an ordinary poll can refresh them minutes before the
+    supervisor ticks. A rebuild keyed on `credentials_expired` then sees a
+    perfectly fresh cache and skips, while the live socket still carries a
+    signature presigned against the credentials that were just discarded.
+    AWS IoT drops that session at the OLD expiry and paho retries the dead
+    URL until the NEXT one, ~50 minutes of silent push loss."""
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+    assert wired["shadow"].connect.await_count == 1
+
+    # A REST call refreshed the credentials. Nothing about the cache looks
+    # wrong - only the generation records that the socket no longer matches.
+    wired["auth"].credentials_generation += 1
+    wired["auth"].credentials_expired = False
+
+    assert await client._refresh_once() is True
+    assert wired["shadow"].disconnect.await_count == 1
+    assert wired["shadow"].connect.await_count == 2
+    assert wired["shadow"].request_state.await_count == 2
+
+    # The reconnect re-presigned under the current generation, so the next
+    # tick must leave a healthy socket alone rather than churning it.
+    assert await client._refresh_once() is False
+    assert wired["shadow"].connect.await_count == 2
+    assert wired["shadow"].disconnect.await_count == 1
+
+
+async def test_a_hood_started_after_the_refresh_is_not_rebuilt(wired):
+    """The generation is recorded per hood, not per client.
+
+    Hoods start at different moments - a second hood added while the first
+    is running presigns under whatever credentials are current then. Keying
+    the rebuild on a client-wide "credentials changed" flag would drop that
+    healthy socket for nothing."""
+    first = json.loads((FIXTURES / "discoverdevice.json").read_text())
+    second = json.loads((FIXTURES / "discoverdevice.json").read_text())
+    second["thingName"] = OTHER
+    wired["api"].get_own_devices = AsyncMock(
+        return_value=[{"thingName": THING}, {"thingName": OTHER}]
+    )
+    wired["api"].discover_device = AsyncMock(
+        side_effect=lambda thing: first if thing == THING else second
+    )
+
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()             # presigned under generation N
+    wired["auth"].credentials_generation += 1
+    await hoods[1].async_start()             # presigns under the new one
+
+    reconnected: list[str] = []
+
+    async def record_first():
+        reconnected.append("first")
+
+    async def record_second():
+        reconnected.append("second")
+
+    hoods[0].async_reconnect = record_first
+    hoods[1].async_reconnect = record_second
+
+    assert await client._refresh_once() is True
+    assert reconnected == ["first"]
+
+
+async def test_a_generation_mismatch_does_not_start_a_hood_that_never_ran(wired):
+    """needs_represign requires a live socket, not just consumer intent.
+
+    The supervisor loops over every hood on the account, so a credential
+    change must not bring up push for a hood the consumer never started -
+    the same guard async_reconnect carries, made explicit one level up so
+    the decision does not depend on a no-op deeper down."""
+    client = _client()
+    hoods = await client.async_setup()        # discovered, never started
+    wired["auth"].credentials_generation += 1
+
+    assert hoods[0].needs_represign(wired["auth"].credentials_generation) is False
+    assert await client._refresh_once() is False
+    assert wired["shadow"].connect.await_count == 0
+
+
 async def test_refresh_reopens_a_wanted_hood_whose_socket_is_gone(wired):
     """Recovery: a hood whose rebuild failed last cycle is still wanted, and
     async_ensure_running is what brings it back on the next tick."""
@@ -916,6 +1047,12 @@ async def test_one_hoods_failure_does_not_strand_the_others(wired):
     client = _client()
     hoods = await client.async_setup()
     assert len(hoods) == 2
+    # Started, so both hoods hold a socket presigned under the CURRENT
+    # generation - the refresh below moves it and puts both in the rebuild
+    # branch. Without live sockets they would take the recovery branch
+    # instead and this test would pass vacuously.
+    await hoods[0].async_start()
+    await hoods[1].async_start()
     wired["auth"].credentials_expired = True
 
     calls: list[str] = []

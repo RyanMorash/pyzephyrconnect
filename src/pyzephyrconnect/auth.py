@@ -120,9 +120,10 @@ class AbstractAuth(ABC):
     the AWS credential cache, the MQTT client ID and the IoT policy attach
     are all concrete here, built on the one abstract method. That is what
     makes the class implementable by a consumer - ZephyrClient consumes
-    async_get_credentials, credentials_expired, mqtt_client_id and
-    async_attach_policy, so if those lived only on CredentialsAuth, a custom
-    subclass would satisfy the type checker and AttributeError at runtime.
+    async_get_credentials, credentials_expired, credentials_generation,
+    mqtt_client_id and async_attach_policy, so if those lived only on
+    CredentialsAuth, a custom subclass would satisfy the type checker and
+    AttributeError at runtime.
 
     Only the ID token crosses the abstract boundary. The AWS credentials
     derived from it last an hour and are bound to a live socket; nothing
@@ -139,6 +140,16 @@ class AbstractAuth(ABC):
         self.session = session
         self.endpoints = endpoints
         self._credentials: Credentials | None = None
+        # Monotonic counter identifying the CURRENT AWS credentials.
+        # Incremented at every site that assigns a fresh self._credentials,
+        # and read by the refresh supervisor: a socket presigned under an
+        # older generation carries a SigV4 signature that dies at the OLD
+        # expiry, no matter how fresh the cache looks now. Expiry alone
+        # cannot express that - ZephyrApi calls async_get_tokens() on every
+        # REST request and CredentialsAuth._acquire replaces the cached
+        # credentials as a side effect, so a REST call can refresh them
+        # without any socket being re-presigned.
+        self.credentials_generation: int = 0
         # Identity the cached _credentials were minted for. An AbstractAuth
         # instance is documented as one account, but nothing stops a
         # subclass from swapping in a different account's tokens underneath
@@ -264,6 +275,9 @@ class AbstractAuth(ABC):
                 self._on_identity_refetched(identity_id)
             self._credentials = credentials
             self._credentials_for = identity_id
+            # Every socket presigned before this line is now a generation
+            # behind and still signed against the credentials just replaced.
+            self.credentials_generation += 1
             return self._credentials
 
     async def async_attach_policy(self) -> None:
@@ -639,6 +653,11 @@ class CredentialsAuth(AbstractAuth):
 
         self._credentials = credentials
         self._credentials_for = identity_id
+        # This is the site that makes expiry alone a lie: ZephyrApi calls
+        # async_get_tokens() on every REST request, so an ordinary poll can
+        # land here and replace the credentials while the live MQTT sockets
+        # keep the signatures of the ones just discarded.
+        self.credentials_generation += 1
         # The tokens built two lines below carry the authoritative identity
         # from THIS exchange, so any older override is stale. Keeping it
         # lets identity_id/mqtt_client_id diverge from the tokens after two

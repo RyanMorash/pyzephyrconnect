@@ -47,6 +47,11 @@ class Hood:
         # _shadow None while the hood SHOULD still be running, and keying
         # recovery on _shadow alone demotes it to "never started" forever.
         self._should_run = False
+        # Which AWS credential generation this hood's live socket was
+        # presigned under, recorded by the credentials provider ZephyrClient
+        # wires in (so a reconnect updates it without anyone remembering
+        # to). None until the first presign.
+        self._presigned_generation: int | None = None
         # Serialises start/stop/reconnect against writes.
         self._lock = asyncio.Lock()
 
@@ -106,6 +111,32 @@ class Hood:
                 return
             await self._stop()
             await self._start()
+
+    def note_presigned_generation(self, generation: int) -> None:
+        """Record the credential generation this socket's URL is signed under.
+
+        Called by the provider ZephyrClient hands to ShadowClient, which
+        invokes it on every connect attempt - so a reconnect re-records the
+        current generation and no caller has to remember to.
+        """
+        self._presigned_generation = generation
+
+    def needs_represign(self, current: int) -> bool:
+        """True when the live socket is signed under stale credentials.
+
+        The supervisor's rebuild trigger. Keyed on the generation rather
+        than on `credentials_expired`, because a REST call refreshing the
+        credential cache leaves the cache looking fresh while this socket
+        still holds a signature AWS IoT drops at the OLD expiry.
+
+        Requires an actual socket: a generation mismatch must never bring up
+        a hood that was never started or was deliberately stopped.
+        """
+        return (
+            self._should_run
+            and self._shadow is not None
+            and self._presigned_generation != current
+        )
 
     async def async_ensure_running(self) -> None:
         """Reopen the socket if the consumer wants this hood up and it is not.

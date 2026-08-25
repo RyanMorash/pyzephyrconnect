@@ -33,7 +33,7 @@ import aiohttp
 
 from . import const
 from .api import ZephyrApi
-from .auth import AbstractAuth, CredentialsAuth, ZephyrTokens
+from .auth import AbstractAuth, Credentials, CredentialsAuth, ZephyrTokens
 from .const import DEFAULT_ENDPOINTS, Endpoints
 from .exceptions import ZephyrAuthError, ZephyrError, ZephyrPolicyError
 from .hood import Hood
@@ -272,6 +272,14 @@ class ZephyrClient:
             self._policy_attached_for = identity
 
     def _make_shadow(self, hood: Hood) -> ShadowClient:
+        async def provider() -> Credentials:
+            creds = await self._auth.async_get_credentials()
+            # Record which credential generation this socket's URL is signed
+            # under - the supervisor reconnects on mismatch, because expiry
+            # alone lies when a REST call refreshed the cache first.
+            hood.note_presigned_generation(self._auth.credentials_generation)
+            return creds
+
         shadow = ShadowClient(
             hood.thing_name,
             # Per-CONNECTION client ID. AWS IoT treats two live connections
@@ -290,7 +298,11 @@ class ZephyrClient:
             f"{self._auth.mqtt_client_id}-{hood.thing_name}",
             lambda topic, payload: self._handle_message(hood, topic, payload),
             hood.handle_connection_change,
-            self._auth.async_get_credentials,
+            # The per-hood wrapper, not async_get_credentials itself:
+            # ShadowClient calls this on every connect, which is exactly
+            # when the presigned URL is (re)built, so the generation it
+            # records self-updates on reconnects.
+            provider,
             # Without this the ShadowClient falls back to DEFAULT_ENDPOINTS,
             # so an endpoint override would reach REST but silently leave
             # MQTT pointed at production.
@@ -479,23 +491,39 @@ class ZephyrClient:
         so testing its result would always report "not expired" and the
         socket would never be rebuilt.
 
+        But expiry is only the trigger to RENEW, never the test for which
+        sockets are stale - it answers "does the cache need replacing?", not
+        "is this socket still signed under what the cache holds?". ZephyrApi
+        calls async_get_tokens() on every REST request and CredentialsAuth
+        replaces the cached credentials as a side effect, so an ordinary
+        poll can refresh them minutes before this runs; the cache then looks
+        fresh, this method skips the rebuild, and every live socket keeps a
+        signature AWS IoT drops at the OLD expiry - paho then retries dead
+        URLs for up to a full interval until the NEXT expiry. Each hood
+        therefore records the credential generation its URL was presigned
+        under and is rebuilt on mismatch (Hood.needs_represign).
+
         Per-hood try/except, terminal errors excepted: one hood's transient
         connect failure must neither abort the loop (stranding later hoods
         on expiring signatures) nor be swallowed as handled - the hood keeps
         its consumer intent and async_ensure_running retries it every tick,
         which is also how a hood whose rebuild failed LAST cycle recovers.
         """
-        rebuilt = False
         if self._auth.credentials_expired:
             _LOGGER.debug("credentials near expiry; refreshing")
             # Renews the Cognito tokens and re-exchanges for AWS credentials.
             await self._auth.async_get_credentials()
-            rebuilt = True
+        current = self._auth.credentials_generation
+        rebuilt = False
         for hood in self._hoods.values():
             try:
-                if rebuilt:
-                    # No-ops for never-started hoods - guard is in Hood.
+                if hood.needs_represign(current):
+                    # The socket's presigned URL belongs to an older
+                    # credential generation - rebuilt regardless of how
+                    # fresh the credential cache looks (a REST-driven
+                    # refresh replaces credentials without touching sockets).
                     await hood.async_reconnect()
+                    rebuilt = True
                 else:
                     # Recovery: reopens a wanted hood whose socket is gone.
                     await hood.async_ensure_running()

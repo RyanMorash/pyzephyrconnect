@@ -219,6 +219,28 @@ library therefore owns the transport lifecycle rather than delegating it:
   binding persists on the identity, so re-attaching is redundant work on a
   path that already has a latency budget.
 
+The rebuild is keyed on a credential *generation*, not on expiry (found in PR
+review round 4). `AbstractAuth` carries a monotonic `credentials_generation`
+that is incremented at every site assigning fresh `self._credentials` — the
+exchange in `async_get_credentials` and `CredentialsAuth._acquire` — and the
+per-hood credentials provider `ZephyrClient` wires into each `ShadowClient`
+records the current generation on the `Hood` whenever a URL is presigned
+(`Hood.note_presigned_generation`, called on every connect, so reconnects
+self-update). The supervisor renews when `credentials_expired`, then rebuilds
+exactly those hoods where `Hood.needs_represign(current)` — wanted, holding a
+socket, and presigned under an older generation. Expiry alone was insufficient
+because it answers the wrong question: it asks whether the *cache* needs
+replacing, not whether a *socket* still matches it. `ZephyrApi` calls
+`async_get_tokens()` on every REST request and `_acquire` replaces the cached
+AWS credentials as a side effect, so an ordinary poll can refresh them minutes
+before the supervisor ticks; the supervisor then saw fresh credentials, skipped
+the rebuild, and left every live socket holding a SigV4 signature AWS IoT drops
+at the *old* expiry — paho retrying dead presigned URLs for up to ~50 minutes
+until the next expiry finally tripped the guard. `async_ensure_running()` could
+not recover it either, because `_shadow` was still set. The generation makes
+the socket's actual signing epoch, rather than the freshness of the cache, the
+thing the decision reads.
+
 `async_refresh_if_needed()` is deleted. There is no released version to keep
 compatible, and the consumer should not have to remember to call it.
 

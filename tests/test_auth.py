@@ -312,15 +312,19 @@ class _StaticAuth(AbstractAuth):
 
 async def test_a_minimal_subclass_satisfies_the_whole_client_contract(fake_aws):
     """ZephyrClient consumes async_get_credentials, credentials_expired,
-    mqtt_client_id and async_attach_policy. If any of those live only on
-    CredentialsAuth, a custom AbstractAuth satisfies the type checker and
-    AttributeErrors at runtime - which is exactly the consumer the abstract
-    class exists for."""
+    credentials_generation, mqtt_client_id and async_attach_policy. If any of
+    those live only on CredentialsAuth, a custom AbstractAuth satisfies the
+    type checker and AttributeErrors at runtime - which is exactly the
+    consumer the abstract class exists for."""
     auth = _StaticAuth(_stored_tokens(3600), MagicMock())
 
     creds = await auth.async_get_credentials()
     assert creds.secret_key == "SECRET"
     assert auth.credentials_expired is False
+    # An int the supervisor can compare, on the ABSTRACT class: the socket
+    # rebuild is keyed on it, so a subclass without one silently disables
+    # every reconnect.
+    assert isinstance(auth.credentials_generation, int)
     assert auth.mqtt_client_id == f"{IDENTITY}-ha"
     await auth.async_attach_policy()
     fake_aws["iot"].attach_policy.assert_called_once()
@@ -559,6 +563,33 @@ async def test_acquire_populates_the_credentials_cache_so_get_credentials_skips_
         fake_aws["identity"].get_credentials_for_identity.call_count
         == calls_after_acquire
     )
+
+
+async def test_replacing_the_cached_credentials_moves_the_generation(fake_aws):
+    """The counter must move at EVERY site that replaces _credentials.
+
+    _acquire is the one that made expiry an unreliable rebuild trigger:
+    ZephyrApi asks for tokens on every REST request, so a poll lands here
+    and swaps the credentials out from under sockets presigned against the
+    old ones - leaving a cache that looks fresh and signatures that are not.
+    A cached read must NOT move it, or every supervisor tick would rebuild."""
+    auth = CredentialsAuth("user@example.com", "pw", MagicMock())
+    assert auth.credentials_generation == 0
+
+    await auth.async_get_tokens()             # the REST-driven refresh path
+    after_acquire = auth.credentials_generation
+    assert after_acquire > 0
+
+    await auth.async_get_credentials()        # served from the cache
+    assert auth.credentials_generation == after_acquire
+
+    # Tokens still fresh, credentials gone: this drops through to the
+    # exchange inside async_get_credentials - the OTHER assignment site,
+    # which has to move the counter too or a supervisor-driven renewal
+    # would leave every socket looking current.
+    auth._credentials = None
+    await auth.async_get_credentials()
+    assert auth.credentials_generation == after_acquire + 1
 
 
 async def test_second_stale_identity_clears_a_leftover_override(fake_aws):
