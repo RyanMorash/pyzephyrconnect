@@ -17,12 +17,29 @@ import aiohttp
 from pyzephyrconnect import ZephyrClient
 
 async with aiohttp.ClientSession() as session:
-    client = ZephyrClient("you@example.com", "password", session)
-    for caps in await client.async_setup():
-        print(caps.model, caps.max_fan_speed)
-        await client.async_start(caps.thing_name)
-        print(client.state(caps.thing_name))
+    client = ZephyrClient.from_credentials("you@example.com", "password", session)
+    for hood in await client.async_setup():
+        print(hood.capabilities.model, hood.capabilities.max_fan_speed)
+        await hood.async_start()
+        print(hood.state)
 ```
+
+## Persisting tokens
+
+The library never stores credentials. Supply tokens from a previous
+session and a callback to save new ones, and a restart skips the SRP
+login entirely:
+
+```python
+client = ZephyrClient.from_credentials(
+    username, password, session,
+    tokens=ZephyrTokens.from_dict(saved) if saved else None,
+    token_updater=lambda t: save(t.as_dict()),
+)
+```
+
+To keep the password out of the library completely, subclass `AbstractAuth`
+and implement `async_get_tokens()`.
 
 ## Probe CLI
 

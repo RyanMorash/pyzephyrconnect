@@ -127,27 +127,13 @@ def test_redacted_diff_still_shows_real_values_for_ordinary_keys():
     assert "location" not in _REDACT or "location" not in changes
 
 
-@pytest.mark.xfail(
-    raises=TypeError,
-    strict=True,
-    reason=(
-        "probe.py still drives the pre-Task-10 client surface: "
-        "ZephyrClient(username, password, session), async_start(thing), "
-        "state(thing), async_set_state(thing, fields). Task 10 replaced all "
-        "of it with ZephyrClient(auth)/from_credentials() and Hood objects, "
-        "so main() now dies at construction with a TypeError before it can "
-        "reach the teardown this test pins. Task 11 rewrites probe.py; "
-        "delete this marker there - strict=True makes it fail loudly the "
-        "moment the port lands, so the behaviour cannot be quietly dropped."
-    ),
-)
 async def test_async_stop_runs_even_when_a_post_start_step_raises(monkeypatch):
     """main() must disconnect the shadow client on every path once
-    async_start() has begun, not only on happy-path returns. Here
-    shadow.request_state() (invoked inside client.async_start()) raises,
-    so the failure surfaces before probe ever prints state - this also
-    covers the harder case where the shadow was already registered on
-    the client before the exception, not just a clean failure to start."""
+    hood.async_start() has begun, not only on happy-path returns. Here
+    shadow.request_state() (invoked inside Hood._start()) raises, so the
+    failure surfaces before probe ever prints state - this also covers the
+    harder case where the shadow was already registered on the hood before
+    the exception, not just a clean failure to start."""
     from datetime import UTC, datetime, timedelta
     from pathlib import Path
     from unittest.mock import AsyncMock, MagicMock
@@ -155,19 +141,28 @@ async def test_async_stop_runs_even_when_a_post_start_step_raises(monkeypatch):
     from pyzephyrconnect import client as client_module
     from pyzephyrconnect import probe
     from pyzephyrconnect.auth import Credentials
+    from pyzephyrconnect.const import DEFAULT_ENDPOINTS
 
     fixtures = Path(__file__).parent / "fixtures"
     discover = json.loads((fixtures / "discoverdevice.json").read_text())
     thing = discover["thingName"]
 
+    # A double for the AbstractAuth surface ZephyrClient now drives -
+    # CredentialsAuth was replaced with token-based auth in Tasks 6 and 10,
+    # so the pre-refactor authenticate()/attach_policy()/id_token surface no
+    # longer exists.
     auth = MagicMock()
-    auth.authenticate = AsyncMock()
-    auth.attach_policy = AsyncMock()
-    auth.id_token = "ID"
-    auth.mqtt_client_id = "client-id"
-    auth.credentials = Credentials(
-        "k", "s", "t", datetime.now(UTC) + timedelta(hours=1)
+    auth.endpoints = DEFAULT_ENDPOINTS
+    auth.identity_id = "us-west-2:abc"
+    auth.mqtt_client_id = "us-west-2:abc-ha"
+    auth.credentials_expired = False
+    auth.async_get_tokens = AsyncMock()
+    auth.async_get_credentials = AsyncMock(
+        return_value=Credentials(
+            "k", "s", "t", datetime.now(UTC) + timedelta(hours=1)
+        )
     )
+    auth.async_attach_policy = AsyncMock()
 
     api = MagicMock()
     api.get_own_devices = AsyncMock(return_value=[{"thingName": thing}])
@@ -178,8 +173,9 @@ async def test_async_stop_runs_even_when_a_post_start_step_raises(monkeypatch):
     shadow.disconnect = AsyncMock()
     shadow.request_state = AsyncMock(side_effect=RuntimeError("boom"))
 
-    # ZephyrAuth was a transitional alias that Task 10 removed; the auth
-    # class client.py names now is CredentialsAuth.
+    # from_credentials() constructs a CredentialsAuth internally; patching
+    # the class is how the double gets injected without touching probe.py's
+    # call site.
     monkeypatch.setattr(
         client_module, "CredentialsAuth", MagicMock(return_value=auth)
     )
@@ -193,4 +189,7 @@ async def test_async_stop_runs_even_when_a_post_start_step_raises(monkeypatch):
     with pytest.raises(RuntimeError, match="boom"):
         await probe.main([])
 
+    # client.async_stop() (called in probe's finally) cancels and awaits
+    # the refresh supervisor _make_shadow started, so no stray task is left
+    # behind for this test to reap.
     shadow.disconnect.assert_awaited_once()

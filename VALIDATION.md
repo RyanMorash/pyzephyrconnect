@@ -113,8 +113,9 @@ raises `ZephyrPolicyError` on a denied subscribe, so you should see a
 clear error rather than silence — if you get silence instead, that is a
 bug worth reporting.
 
-**`ZephyrAuthError`.** Credentials wrong or the ID token expired.
-Tokens last one hour; the library refreshes at ~50 min.
+**`ZephyrAuthError`.** Credentials wrong, or both the refresh token and a
+fresh SRP login failed. Tokens last one hour; the library refreshes them in
+the request path and rebuilds the MQTT socket before they expire.
 
 **`ZephyrCertificateError`.** The vendor's chain is no longer trusted by
 either the system CA store or the bundled TWCA anchors — likely a vendor

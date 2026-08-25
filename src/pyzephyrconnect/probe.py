@@ -121,24 +121,25 @@ async def main(argv: list[str] | None = None) -> int:
     password = os.environ.get("ZEPHYR_PASS") or getpass.getpass("password: ")
 
     async with aiohttp.ClientSession() as session:
-        client = ZephyrClient(username, password, session)
-        capabilities = await client.async_setup()
-        if not capabilities:
+        client = ZephyrClient.from_credentials(username, password, session)
+        hoods = await client.async_setup()
+        if not hoods:
             print("no devices on this account", file=sys.stderr)
             return 1
 
-        caps = next(
-            (c for c in capabilities if c.thing_name == args.thing),
-            capabilities[0],
+        hood = next(
+            (h for h in hoods if h.thing_name == args.thing),
+            hoods[0],
         )
+        caps = hood.capabilities
         print(f"device: {caps.model} (fan 0-{caps.max_fan_speed}, "
               f"light 0-{caps.max_light_level})")
 
         try:
-            await client.async_start(caps.thing_name)
+            await hood.async_start()
             await asyncio.sleep(2)
 
-            before = dict(client.state(caps.thing_name).raw)
+            before = dict(hood.state.raw)
             print("current state:")
             print(json.dumps(_redacted(before), indent=2, sort_keys=True))
 
@@ -149,15 +150,15 @@ async def main(argv: list[str] | None = None) -> int:
                         await asyncio.sleep(args.seconds)
                     except asyncio.CancelledError:
                         pass
-                    after = dict(client.state(caps.thing_name).raw)
+                    after = dict(hood.state.raw)
                     _report(diff_states(_redacted(before), _redacted(after)))
                 return 0
 
             print(f"\nWRITING {field}={value} to a physical appliance.")
-            await client.async_set_state(caps.thing_name, {field: value})
+            await hood.async_set_fields({field: value})
 
             await asyncio.sleep(5)
-            after = dict(client.state(caps.thing_name).raw)
+            after = dict(hood.state.raw)
             _report(diff_states(_redacted(before), _redacted(after)))
             return 0
         finally:
