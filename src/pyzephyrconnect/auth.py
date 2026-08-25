@@ -133,10 +133,11 @@ class AbstractAuth(ABC):
     the AWS credential cache, the MQTT client ID and the IoT policy attach
     are all concrete here, built on the one abstract method. That is what
     makes the class implementable by a consumer - ZephyrClient consumes
-    async_get_credentials, credentials_expired, credentials_generation,
-    mqtt_client_id and async_attach_policy, so if those lived only on
-    CredentialsAuth, a custom subclass would satisfy the type checker and
-    AttributeError at runtime.
+    async_get_credentials, async_get_presign_credentials,
+    credentials_expired, credentials_generation, mqtt_client_id and
+    async_attach_policy, so if those lived only on CredentialsAuth, a
+    custom subclass would satisfy the type checker and AttributeError at
+    runtime.
 
     Only the ID token crosses the abstract boundary. The AWS credentials
     derived from it last an hour and are bound to a live socket; nothing
@@ -299,6 +300,23 @@ class AbstractAuth(ABC):
             # behind and still signed against the credentials just replaced.
             self.credentials_generation += 1
             return self._credentials
+
+    async def async_get_presign_credentials(self) -> tuple[Credentials, int]:
+        """The current credentials AND the generation they belong to.
+
+        Read as a consistent pair: the two attribute reads below are
+        consecutive sync statements on the event loop, atomic with respect
+        to any concurrent coroutine - unlike reading the generation after
+        an await, which can pair a newer counter with older credentials
+        and leave a socket the supervisor believes is current dying at the
+        older credentials' expiry.
+        """
+        while True:
+            creds = await self.async_get_credentials()
+            if self._credentials is creds:
+                return creds, self.credentials_generation
+            # Replaced mid-flight by a concurrent refresh; loop converges
+            # on the newer pair immediately.
 
     async def async_attach_policy(self) -> None:
         """Bind the IoT policy to this identity.

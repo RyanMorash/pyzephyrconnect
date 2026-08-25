@@ -3,7 +3,8 @@ import json
 import logging
 import ssl
 from datetime import UTC, datetime, timedelta
-from unittest.mock import MagicMock
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -15,7 +16,11 @@ from pyzephyrconnect.exceptions import (
     ZephyrTransportError,
     ZephyrWriteError,
 )
+from pyzephyrconnect.hood import Hood
+from pyzephyrconnect.models import HoodCapabilities
 from pyzephyrconnect.shadow import ShadowClient, ShadowTopics
+
+FIXTURES = Path(__file__).parent / "fixtures"
 
 THING = "aaaaaaaabbbbbbbbccccccccddddddddeeeeeeee"
 CREDS = Credentials("k", "s", "t", datetime.now(UTC) + timedelta(hours=1))
@@ -530,6 +535,83 @@ async def test_a_write_is_refused_before_paho_can_queue_it(fake_paho):
     # The message names a home if it names the thing; it ends up in logs
     # users paste publicly.
     assert THING not in str(excinfo.value)
+
+
+async def test_the_dead_client_precheck_tears_the_connection_down_too(fake_paho):
+    """The precheck refusal is a teardown path, not just a raise.
+
+    Hood._publish drops its ShadowClient reference on
+    ZephyrNotConnectedError because the shadow is documented to have
+    destroyed its own connection first. A refusal WITHOUT a teardown
+    orphaned a live paho client nothing holds a reference to any more, and
+    its auto-reconnect keeps the old session alive under the same client ID
+    the supervisor's replacement uses - AWS IoT then evicts one for the
+    other, forever."""
+    sc = _make()
+    await _connect(sc)
+    fake_paho.is_connected.return_value = False
+
+    with pytest.raises(ZephyrNotConnectedError):
+        await sc.publish_state({"light": 1})
+
+    assert fake_paho.disconnect.called
+    assert fake_paho.loop_stop.called
+    assert sc._client is None
+
+
+async def test_a_state_request_refused_by_the_precheck_tears_down_too(fake_paho):
+    """request_state routes through the same wrapper, so it gets the same
+    semantics: the refusal that proves the session is dead is also what
+    stops paho resurrecting it behind the supervisor's back."""
+    sc = _make()
+    await _connect(sc)
+    fake_paho.is_connected.return_value = False
+
+    with pytest.raises(ZephyrNotConnectedError):
+        await sc.request_state()
+
+    assert fake_paho.loop_stop.called
+    assert sc._client is None
+
+
+async def test_a_hood_rebuilds_with_a_fresh_client_after_a_precheck_refusal(
+    fake_paho,
+):
+    """End to end over a real Hood and a real ShadowClient.
+
+    The two halves have to agree: the shadow tears its connection down, and
+    the hood drops its reference to it. If either side skips its half the
+    hood is stuck - _shadow set but hollow means async_ensure_running
+    declines to rebuild, and a live orphaned paho client means the rebuild
+    fights the old session for their shared client ID."""
+    caps = HoodCapabilities.from_discover(
+        json.loads((FIXTURES / "discoverdevice.json").read_text())
+    )
+    made: list[ShadowClient] = []
+
+    def factory(_hood):
+        made.append(_shadow())
+        return made[-1]
+
+    hood = Hood(caps, factory, AsyncMock(), AsyncMock())
+    await hood.async_start()
+    assert len(made) == 1
+
+    fake_paho.is_connected.return_value = False
+
+    with pytest.raises(ZephyrNotConnectedError):
+        await hood.async_set_light(1)
+
+    assert made[0]._client is None         # the dead session is really gone
+    assert hood._shadow is None            # ...and nothing points at it
+    assert hood._should_run is True        # the consumer still wants it up
+
+    # The rebuilt socket is live again, as a real one would be.
+    fake_paho.is_connected.return_value = True
+    await hood.async_ensure_running()      # the next supervisor tick
+
+    assert len(made) == 2                  # a FRESH client, not the hollow one
+    assert hood._shadow is made[1]
 
 
 async def test_a_refused_write_tears_the_connection_down_so_it_cannot_fire_later(

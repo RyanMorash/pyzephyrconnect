@@ -88,6 +88,13 @@ class ZephyrClient:
         # while the NEW one never got the policy - the silent
         # message-drop failure the attach exists to prevent.
         self._policy_lock = asyncio.Lock()
+        # async_setup's one-run guard is also a read-modify-write across
+        # awaits (the credential exchange and the discovery loop), so it
+        # needs the same treatment: two concurrent calls both passed the
+        # sentinel check, both discovered, and interleaved their writes to
+        # _hoods. Serialised here, the documented contract holds under
+        # concurrency too - see async_setup.
+        self._setup_lock = asyncio.Lock()
 
     @classmethod
     def from_credentials(
@@ -144,57 +151,75 @@ class ZephyrClient:
         return any(hood.connected for hood in self._hoods.values())
 
     async def async_setup(self) -> list[Hood]:
-        """Authenticate and discover every hood on the account."""
-        if self._setup_complete:
-            # Re-running setup would replace started Hood objects while
-            # their sockets and the supervisor still reference the old ones.
-            # One client = one setup; build a new client to re-discover.
-            # Checked before the credential exchange below so a repeat call
-            # fails fast instead of paying for a needless network round trip.
-            raise ZephyrError("async_setup() has already run on this client")
-        # Start every (re)attempt from empty: a previous attempt that raised
-        # partway through the loop below left entries behind, and appending
-        # to them would return duplicate and stale hoods. Discarding them is
-        # safe precisely because nothing has started them - async_setup only
-        # builds Hood objects, so there is no socket or paho thread to leak.
-        self._hoods = {}
-        # The full chain, not just tokens: this performs the identity
-        # exchange, which is what makes auth.identity_id readable - the
-        # config-flow ordering "async_setup(), then read identity_id for
-        # the unique ID" depends on it. Also exactly what the pre-refactor
-        # authenticate() verified at setup.
-        await self._auth.async_get_credentials()
-        devices = await self._api.get_own_devices()
-        if not isinstance(devices, list):
-            # get_own_devices is typed to return a list, but this is the
-            # last line of defense against a vendor response shape change -
-            # iterating a dict would silently walk its keys instead of
-            # raising, and a scalar would blow up with a bare TypeError.
-            _LOGGER.warning("getowndevices returned an unexpected shape; no devices")
-            devices = []
-        for device in devices:
-            if not isinstance(device, dict):
-                # Same defense, per-entry: a malformed list element must not
-                # reach device.get() below and raise AttributeError.
-                _LOGGER.warning("skipping a malformed device entry")
-                continue
-            if not (thing_name := device.get("thingName")):
-                # A KeyError here would escape ZephyrError and reach the
-                # consumer as an unknown crash rather than a setup retry.
-                _LOGGER.warning("skipping a device with no thingName")
-                continue
-            payload = await self._api.discover_device(thing_name)
-            caps = HoodCapabilities.from_discover(payload)
-            hood = Hood(
-                caps, self._make_shadow, self._poll_state, self._ensure_policy
-            )
-            hood.handle_state(self._state_from_discover(payload))
-            self._hoods[thing_name] = hood
-        # Only once the loop has run to completion. Setting it earlier would
-        # latch a half-discovered account as done and make the failure
-        # unretryable.
-        self._setup_complete = True
-        return list(self._hoods.values())
+        """Authenticate and discover every hood on the account.
+
+        Serialised whole. The one-run guard below is checked before the
+        first await, so without the lock two concurrent calls both passed
+        it, both discovered, and interleaved their writes to _hoods. Under
+        the lock the documented contract holds under concurrency as well:
+        concurrent callers serialise; if the first succeeds the second
+        raises already-run; if the first FAILS the second is a clean retry.
+        """
+        async with self._setup_lock:
+            if self._setup_complete:
+                # Re-running setup would replace started Hood objects while
+                # their sockets and the supervisor still reference the old ones.
+                # One client = one setup; build a new client to re-discover.
+                # Checked before the credential exchange below so a repeat call
+                # fails fast instead of paying for a needless network round trip.
+                raise ZephyrError("async_setup() has already run on this client")
+            # Start every (re)attempt from empty: a previous attempt that raised
+            # partway through the loop below left entries behind, and appending
+            # to them would return duplicate and stale hoods. Discarding them is
+            # safe precisely because nothing has started them - async_setup only
+            # builds Hood objects, so there is no socket or paho thread to leak.
+            self._hoods = {}
+            # The full chain, not just tokens: this performs the identity
+            # exchange, which is what makes auth.identity_id readable - the
+            # config-flow ordering "async_setup(), then read identity_id for
+            # the unique ID" depends on it. Also exactly what the pre-refactor
+            # authenticate() verified at setup.
+            await self._auth.async_get_credentials()
+            devices = await self._api.get_own_devices()
+            if not isinstance(devices, list):
+                # get_own_devices is typed to return a list, but this is the
+                # last line of defense against a vendor response shape change -
+                # iterating a dict would silently walk its keys instead of
+                # raising, and a scalar would blow up with a bare TypeError.
+                _LOGGER.warning(
+                    "getowndevices returned an unexpected shape; no devices"
+                )
+                devices = []
+            for device in devices:
+                if not isinstance(device, dict):
+                    # Same defense, per-entry: a malformed list element must not
+                    # reach device.get() below and raise AttributeError.
+                    _LOGGER.warning("skipping a malformed device entry")
+                    continue
+                thing_name = device.get("thingName")
+                if not isinstance(thing_name, str) or not thing_name:
+                    # Truthiness alone is not enough: a list or a dict here is
+                    # truthy, reaches self._hoods[thing_name] below and raises an
+                    # unhashable TypeError - which escapes the ZephyrError
+                    # contract and reaches the consumer as an unknown crash
+                    # rather than a setup retry. A missing key does the same via
+                    # KeyError further down.
+                    _LOGGER.warning(
+                        "skipping a device with a missing or malformed thingName"
+                    )
+                    continue
+                payload = await self._api.discover_device(thing_name)
+                caps = HoodCapabilities.from_discover(payload)
+                hood = Hood(
+                    caps, self._make_shadow, self._poll_state, self._ensure_policy
+                )
+                hood.handle_state(self._state_from_discover(payload))
+                self._hoods[thing_name] = hood
+            # Only once the loop has run to completion. Setting it earlier would
+            # latch a half-discovered account as done and make the failure
+            # unretryable.
+            self._setup_complete = True
+            return list(self._hoods.values())
 
     async def async_stop(self) -> None:
         """Stop every hood and retire the supervisor.
@@ -286,11 +311,17 @@ class ZephyrClient:
 
     def _make_shadow(self, hood: Hood) -> ShadowClient:
         async def provider() -> Credentials:
-            creds = await self._auth.async_get_credentials()
+            # The PAIR, in one call. Fetching the credentials and then
+            # reading credentials_generation as a separate statement puts an
+            # await between them: a refresh landing in that window records
+            # generation N+1 against a URL signed under N, so the socket
+            # looks current to the supervisor and dies at the OLD
+            # credentials' expiry with nothing scheduled to re-presign it.
+            creds, generation = await self._auth.async_get_presign_credentials()
             # Record which credential generation this socket's URL is signed
             # under - the supervisor reconnects on mismatch, because expiry
             # alone lies when a REST call refreshed the cache first.
-            hood.note_presigned_generation(self._auth.credentials_generation)
+            hood.note_presigned_generation(generation)
             return creds
 
         shadow = ShadowClient(

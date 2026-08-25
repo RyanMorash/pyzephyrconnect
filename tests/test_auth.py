@@ -326,6 +326,12 @@ async def test_a_minimal_subclass_satisfies_the_whole_client_contract(fake_aws):
     # rebuild is keyed on it, so a subclass without one silently disables
     # every reconnect.
     assert isinstance(auth.credentials_generation, int)
+    # The presign pair, also on the ABSTRACT class: ZephyrClient's per-hood
+    # credentials provider calls this on every connect, so a subclass
+    # without it AttributeErrors at the first socket build.
+    pair_creds, pair_generation = await auth.async_get_presign_credentials()
+    assert pair_creds is creds
+    assert pair_generation == auth.credentials_generation
     assert auth.mqtt_client_id == f"{IDENTITY}-ha"
     await auth.async_attach_policy()
     fake_aws["iot"].attach_policy.assert_called_once()
@@ -591,6 +597,43 @@ async def test_replacing_the_cached_credentials_moves_the_generation(fake_aws):
     auth._credentials = None
     await auth.async_get_credentials()
     assert auth.credentials_generation == after_acquire + 1
+
+
+async def test_the_presign_pair_survives_a_refresh_landing_mid_fetch(fake_aws):
+    """The credentials and the generation must describe each other.
+
+    Fetching the credentials and then reading credentials_generation as a
+    separate statement puts an await between them. A refresh landing in that
+    window pairs the NEWER counter with the OLDER credentials, so the socket
+    presigned from them looks current to the supervisor and nothing
+    re-presigns it before those older credentials expire."""
+    auth = _StaticAuth(_stored_tokens(3600), MagicMock())
+    stale = await auth.async_get_credentials()
+    fresh = Credentials(
+        "NEW", "NEW-SECRET", "NEW-TOKEN", datetime.now(UTC) + timedelta(hours=1)
+    )
+    real_get = auth.async_get_credentials
+    calls = []
+
+    async def superseded():
+        calls.append(1)
+        if len(calls) == 1:
+            # Handed back the credentials that were current when this call
+            # started, while a concurrent refresh has already replaced the
+            # cache and moved the counter.
+            auth._credentials = fresh
+            auth.credentials_generation += 1
+            return stale
+        return await real_get()
+
+    auth.async_get_credentials = superseded
+
+    creds, generation = await auth.async_get_presign_credentials()
+
+    assert creds is fresh
+    assert creds is auth._credentials
+    assert generation == auth.credentials_generation
+    assert creds is not stale
 
 
 async def test_second_stale_identity_clears_a_leftover_override(fake_aws):

@@ -71,6 +71,17 @@ def _auth_double(endpoints=DEFAULT_ENDPOINTS, order=None):
         return credentials
 
     auth.async_get_credentials = AsyncMock(side_effect=_exchange)
+
+    async def _presign_pair():
+        # Mirrors AbstractAuth.async_get_presign_credentials: the credentials
+        # and the generation they belong to, taken as one consistent pair.
+        # Modelled rather than stubbed with a bare Mock, because the per-hood
+        # provider now records the generation THIS returns - a double that
+        # let the two drift would hide the very bug the pair API exists for.
+        creds = await auth.async_get_credentials()
+        return creds, auth.credentials_generation
+
+    auth.async_get_presign_credentials = AsyncMock(side_effect=_presign_pair)
     auth.async_attach_policy = AsyncMock(
         side_effect=lambda: recorder.append("attach_policy")
     )
@@ -248,6 +259,94 @@ async def test_a_malformed_device_entry_is_skipped_not_crashed(wired, caplog):
     assert len(hoods) == 1
     assert hoods[0].thing_name == THING
     assert "malformed device entry" in caplog.text
+
+
+async def test_a_malformed_thing_name_is_skipped_not_crashed(wired, caplog):
+    """Truthiness is not enough. A list or a dict passes `if not
+    thing_name`, reaches self._hoods[thing_name] and raises an unhashable
+    TypeError - which escapes the ZephyrError contract and reaches the
+    consumer as an unknown crash instead of a setup retry."""
+    wired["api"].get_own_devices = AsyncMock(
+        return_value=[
+            {"thingName": ["x"]},
+            {"thingName": {}},
+            {"thingName": THING},
+        ]
+    )
+    with caplog.at_level(logging.WARNING):
+        hoods = await _client().async_setup()
+
+    assert [hood.thing_name for hood in hoods] == [THING]
+    assert "malformed thingName" in caplog.text
+
+
+async def test_concurrent_setups_serialise_instead_of_interleaving(wired):
+    """The one-run guard is checked before the first await, so two
+    concurrent calls both passed it, both ran discovery, and interleaved
+    their writes to _hoods. Serialised, the documented contract holds under
+    concurrency too: the first call wins and the second raises already-run,
+    having performed no discovery of its own."""
+    calls = []
+
+    async def get_own_devices():
+        calls.append(1)
+        # A real round trip yields. Without one the first setup runs to
+        # completion before the second coroutine is ever scheduled, and the
+        # race this test exists for cannot be expressed at all.
+        await asyncio.sleep(0)
+        return [{"thingName": THING}]
+
+    wired["api"].get_own_devices = AsyncMock(side_effect=get_own_devices)
+    client = _client()
+
+    outcomes = await asyncio.gather(
+        client.async_setup(), client.async_setup(), return_exceptions=True
+    )
+
+    discovered = [out for out in outcomes if isinstance(out, list)]
+    refused = [out for out in outcomes if isinstance(out, ZephyrError)]
+    assert len(discovered) == 1
+    assert [hood.thing_name for hood in discovered[0]] == [THING]
+    assert len(refused) == 1
+    assert "already run" in str(refused[0])
+    assert len(calls) == 1
+
+
+async def test_a_concurrent_setup_behind_a_failed_one_is_a_clean_retry(wired):
+    """The other half of the serialised contract. The guard latches only on
+    success, so a caller queued behind a FAILED setup is a retry, not an
+    already-run refusal - two discoveries, and a client that ends up set
+    up."""
+    discover = json.loads((FIXTURES / "discoverdevice.json").read_text())
+    attempts = 0
+    order = []
+
+    async def get_own_devices():
+        nonlocal attempts
+        attempts += 1
+        mine = attempts
+        order.append(f"start{mine}")
+        await asyncio.sleep(0)
+        order.append(f"end{mine}")
+        if mine == 1:
+            raise ZephyrError("discovery failed")
+        return [{"thingName": THING}]
+
+    wired["api"].get_own_devices = AsyncMock(side_effect=get_own_devices)
+    wired["api"].discover_device = AsyncMock(return_value=discover)
+    client = _client()
+
+    first, second = await asyncio.gather(
+        client.async_setup(), client.async_setup(), return_exceptions=True
+    )
+
+    assert isinstance(first, ZephyrError)
+    assert "discovery failed" in str(first)
+    assert [hood.thing_name for hood in second] == [THING]
+    # The retry begins only once the failed attempt is over - overlapping
+    # discoveries are what let two setups interleave their writes to _hoods.
+    assert order == ["start1", "end1", "start2", "end2"]
+    assert client._setup_complete is True
 
 
 async def test_async_setup_refuses_to_run_twice(wired):
@@ -666,6 +765,45 @@ async def test_the_shadow_gets_the_credentials_provider_not_a_credential(wired):
     assert (
         hoods[0]._presigned_generation == wired["auth"].credentials_generation
     )
+
+
+async def test_the_recorded_generation_belongs_to_the_credentials_used(wired):
+    """The pair must come from ONE call, not a fetch followed by a separate
+    counter read.
+
+    With an await between them a concurrent refresh records generation N+1
+    against a URL signed under N: the socket then looks current to the
+    supervisor and nothing re-presigns it before the OLDER credentials
+    expire - the reverse direction of the bug the generation counter was
+    added for."""
+    creds = Credentials(
+        "pinned", "s", "t", datetime.now(UTC) + timedelta(hours=1)
+    )
+    used = []
+
+    async def presign_pair():
+        # The pair is taken atomically, and a refresh lands immediately
+        # after. What the hood records must be the generation that came WITH
+        # these credentials, not whatever the counter reads afterwards.
+        wired["auth"].credentials_generation = 9
+        return creds, 4
+
+    wired["auth"].async_get_presign_credentials = AsyncMock(
+        side_effect=presign_pair
+    )
+
+    async def connect(*args, **kwargs):
+        provider = client_module.ShadowClient.call_args.args[4]
+        used.append(await provider())
+
+    wired["shadow"].connect = AsyncMock(side_effect=connect)
+
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+
+    assert used == [creds]
+    assert hoods[0]._presigned_generation == 4
 
 
 async def test_an_endpoint_override_reaches_mqtt_too(wired):

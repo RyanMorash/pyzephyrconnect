@@ -387,6 +387,11 @@ class ShadowClient:
         if self._client is None or not self._client.is_connected():
             # No thing name in the message: it identifies a home, and
             # exception text ends up in logs users paste publicly.
+            #
+            # Raised, not torn down here: this method is synchronous and
+            # cannot await disconnect(). _publish_or_disconnect catches this
+            # refusal exactly like _PublishQueued and tears the connection
+            # down before re-raising - see the reasoning there.
             raise ZephyrNotConnectedError("hood is not connected")
         info = self._client.publish(topic, json.dumps(payload), qos=1)
         if info.rc == mqtt.MQTT_ERR_NO_CONN:
@@ -417,12 +422,34 @@ class ShadowClient:
         inherits the out-queue and the write can never fire.
 
         Both callers route through this, so `request_state` gets the same
-        guarantee: a GET stranded in the out-queue would come back as a state
-        report long after the caller gave up.
+        guarantee on both refusal paths: a GET stranded in the out-queue
+        would come back as a state report long after the caller gave up, and
+        a GET refused against a dead client leaves the same orphaned session
+        a refused write does.
         """
         try:
             self._publish(topic, payload)
-        except _PublishQueued:
+        except (_PublishQueued, ZephyrNotConnectedError):
+            # BOTH refusals tear down, and for related reasons.
+            #
+            # _PublishQueued: paho accepted the message with no socket to
+            # write it on, and discarding the client object is the only way
+            # to un-schedule the write its auto-reconnect would deliver.
+            #
+            # The dead-client precheck: a refused write marks this
+            # connection dead on both sides. The teardown kills paho's
+            # auto-reconnect, so the old session can never come back and
+            # fight the supervisor's rebuild - both hold the same client ID,
+            # and AWS IoT evicts one for the other, forever. It also makes
+            # Hood's reference-drop consistent on EVERY path: Hood._publish
+            # drops its ShadowClient on ZephyrNotConnectedError assuming the
+            # teardown already happened, so refusing without one orphaned a
+            # live paho thread nothing held a reference to any more.
+            #
+            # Only a refused WRITE forces the supervisor rebuild path. A
+            # transient blip with nothing being published tears nothing down
+            # and paho's own reconnect still recovers it.
+            #
             # Best-effort teardown; the caller still gets the refusal below
             # either way, and the write must not be reported as accepted.
             with contextlib.suppress(Exception):
