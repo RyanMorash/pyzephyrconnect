@@ -8,7 +8,9 @@ the protocol was reverse-engineered.
 
 ## Install
 
-    pip install pyzephyrconnect
+```bash
+pip install pyzephyrconnect
+```
 
 ## Read state
 
@@ -59,9 +61,11 @@ and implement `async_get_tokens()`.
 The write path actuates a physical fan and light. The CLI writes one field
 at a time, refuses anything outside an allowlist, and requires `--confirm`:
 
-    export ZEPHYR_USER=you@example.com
-    python -m pyzephyrconnect --watch
-    python -m pyzephyrconnect --set light=1 --confirm
+```bash
+export ZEPHYR_USER=you@example.com
+python -m pyzephyrconnect --watch
+python -m pyzephyrconnect --set light=1 --confirm
+```
 
 Destructive writes need `--force` as well. `resetgreasefilter` zeroes a usage
 counter that cannot be reconstructed.

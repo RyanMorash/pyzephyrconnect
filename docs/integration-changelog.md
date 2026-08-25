@@ -95,6 +95,8 @@ Notes:
   login — not to abort setup:
 
   ```python
+  from pyzephyrconnect import ZephyrDataError
+
   try:
       tokens = ZephyrTokens.from_dict(saved) if saved else None
   except ZephyrDataError:
