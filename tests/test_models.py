@@ -159,3 +159,25 @@ def test_capabilities_malformed_numeric_raises():
     should fail loudly rather than produce a wrong capability set."""
     with pytest.raises(ZephyrDataError):
         HoodCapabilities.from_discover({"maxFanSpeed": "six"})
+
+
+def test_scalar_fault_code_degrades_to_none_and_warns(caplog):
+    """A non-list faultCode must not raise from the hot push path - tuple(5)
+    would TypeError inside _handle_message and the state update would be
+    silently dropped into an ERROR log."""
+    state = HoodState.from_reported({"faultCode": 5})
+    assert state.fault_codes is None
+    assert "faultCode" in caplog.text
+
+
+def test_empty_string_int_field_reads_as_absent():
+    state = HoodState.from_reported({"power": ""})
+    assert state.power is None
+
+
+def test_malformed_counter_degrades_to_zero_and_warns(caplog):
+    """Counters must stay numeric for the filter-life percentage even when
+    the payload is garbage."""
+    state = HoodState.from_reported({"usefantime": "garbage"})
+    assert state.use_fan_time == 0
+    assert "usefantime" in caplog.text
