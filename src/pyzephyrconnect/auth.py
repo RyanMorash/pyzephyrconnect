@@ -11,8 +11,8 @@ import asyncio
 import logging
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
-from dataclasses import dataclass, field, replace  # noqa: F401 - replace: Task 6
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -424,136 +424,138 @@ class Credentials:
         return datetime.now(UTC) >= (self.expiration - margin)
 
 
-class ZephyrAuth:
-    """Owns the Cognito session and the derived AWS credentials."""
+class CredentialsAuth(AbstractAuth):
+    """Built-in auth: SRP login, with refresh-token reuse.
 
-    def __init__(self, username: str, password: str) -> None:
+    pycognito and boto3 are synchronous. Every blocking call is wrapped in
+    asyncio.to_thread so callers get a purely async surface. renew_access_token
+    also performs JWKS verification, which is a network call - it must stay
+    in the worker thread.
+    """
+
+    def __init__(
+        self,
+        username: str,
+        password: str,
+        session: aiohttp.ClientSession,
+        *,
+        tokens: ZephyrTokens | None = None,
+        token_updater: Callable[[ZephyrTokens], None] | None = None,
+        endpoints: Endpoints = DEFAULT_ENDPOINTS,
+    ) -> None:
+        super().__init__(session, endpoints)
         self._username = username
         self._password = password
+        self._tokens = tokens
+        self._token_updater = token_updater
         self._user: Cognito | None = None
-        self._identity_id: str | None = None
-        self._credentials: Credentials | None = None
+        # Restored tokens make identity_id readable immediately.
+        self._seen_tokens = tokens
+        # Serialises token acquisition. Without it, concurrent callers each
+        # run a full SRP login against a pool that rate-limits (PROTOCOL.md
+        # section 3.1), and ZephyrApi asks for tokens on every request.
+        # Distinct from the inherited _aws_lock guarding the exchange.
+        self._lock = asyncio.Lock()
 
-    @property
-    def id_token(self) -> str:
-        if self._user is None:
-            raise ZephyrAuthError("authenticate() has not been called")
-        return self._user.id_token
+    def _on_identity_refetched(self, identity_id: str) -> None:
+        """Persist a corrected identity into the stored tokens.
 
-    @property
-    def identity_id(self) -> str:
-        if self._identity_id is None:
-            raise ZephyrAuthError("authenticate() has not been called")
-        return self._identity_id
-
-    @property
-    def credentials(self) -> Credentials:
-        if self._credentials is None:
-            raise ZephyrAuthError("authenticate() has not been called")
-        return self._credentials
-
-    @property
-    def mqtt_client_id(self) -> str:
-        """Identity ID plus a stable suffix.
-
-        The IoT policy pins the client ID to the identity. Using the bare
-        identity ID makes this library and the phone app evict each other.
+        The base class already routes mqtt_client_id through its override;
+        this makes the correction survive a restart instead of being
+        rediscovered by a failed exchange every time.
         """
-        return f"{self.identity_id}{const.CLIENT_ID_SUFFIX}"
+        if self._tokens is not None:
+            self._tokens = replace(self._tokens, identity_id=identity_id)
+            if self._token_updater is not None:
+                self._token_updater(self._tokens)
 
     # -- blocking bodies, run in a worker thread ----------------------
 
-    def _srp_login(self) -> Cognito:
-        user = Cognito(
-            const.USER_POOL,
-            const.CLIENT_ID,
-            client_secret=const.CLIENT_SECRET,
+    def _cognito(self, *, refresh_token: str | None = None) -> Cognito:
+        return Cognito(
+            self.endpoints.user_pool,
+            self.endpoints.client_id,
+            client_secret=self.endpoints.client_secret,
             username=self._username,
+            refresh_token=refresh_token,
             # Must be explicit; otherwise pycognito reads ambient AWS config
             # and raises a confusing ResourceNotFoundException.
-            user_pool_region=const.REGION,
+            user_pool_region=self.endpoints.region,
         )
+
+    def _srp_login(self) -> Cognito:
+        user = self._cognito()
         user.authenticate(password=self._password)
         return user
 
-    def _exchange(self) -> tuple[str, Credentials]:
-        client = boto3.client(
-            "cognito-identity",
-            region_name=const.REGION,
-            config=Config(signature_version=UNSIGNED),
-        )
-        logins = {const.PROVIDER: self.id_token}
-        identity_id = self._identity_id or client.get_id(
-            IdentityPoolId=const.IDENTITY_POOL, Logins=logins
-        )["IdentityId"]
-        raw = client.get_credentials_for_identity(
-            IdentityId=identity_id, Logins=logins
-        )["Credentials"]
-        return identity_id, Credentials(
-            access_key=raw["AccessKeyId"],
-            # "SecretKey", not "SecretAccessKey" - differs from STS.
-            secret_key=raw["SecretKey"],
-            session_token=raw["SessionToken"],
-            expiration=raw["Expiration"],
-        )
+    def _refresh(self, refresh_token: str) -> Cognito:
+        user = self._cognito(refresh_token=refresh_token)
+        user.renew_access_token()
+        return user
 
-    def _attach(self) -> None:
-        creds = self.credentials
-        client = boto3.client(
-            "iot",
-            region_name=const.REGION,
-            aws_access_key_id=creds.access_key,
-            aws_secret_access_key=creds.secret_key,
-            aws_session_token=creds.session_token,
-        )
-        try:
-            attached = client.list_attached_policies(target=self.identity_id)
-            names = [p["policyName"] for p in attached.get("policies", [])]
-            if const.POLICY_NAME in names:
-                return
-        except Exception:  # noqa: BLE001 - listing is best-effort
-            _LOGGER.debug("list_attached_policies failed; attaching anyway")
-
-        try:
-            client.attach_policy(
-                policyName=const.POLICY_NAME, target=self.identity_id
-            )
-        except Exception as err:  # noqa: BLE001
-            raise ZephyrPolicyError(
-                f"Could not attach {const.POLICY_NAME} to {self.identity_id}. "
-                "Without it the MQTT connection succeeds but every message is "
-                "silently dropped."
-            ) from err
+    # _identity_client, _exchange and _attach are inherited from
+    # AbstractAuth: they operate on tokens and endpoints, nothing
+    # Cognito-login-specific, and hoisting them is what makes AbstractAuth
+    # implementable by consumers.
 
     # -- async surface -------------------------------------------------
 
-    async def authenticate(self) -> None:
+    async def async_get_tokens(self) -> ZephyrTokens:
+        if self._tokens is not None and not self._tokens.expired:
+            return self._tokens
+        async with self._lock:
+            # Re-check under the lock: whoever held it may have refreshed
+            # while we waited, and a second login would be wasted and
+            # rate-limitable.
+            if self._tokens is not None and not self._tokens.expired:
+                return self._tokens
+            return await self._acquire()
+
+    async def _acquire(self) -> ZephyrTokens:
+        """Refresh or log in. Caller holds self._lock."""
+        stored = self._tokens
+        user: Cognito | None = None
+
+        if stored is not None:
+            try:
+                user = await asyncio.to_thread(self._refresh, stored.refresh_token)
+            except Exception as err:  # noqa: BLE001
+                # Refresh tokens expire (30 days by default) and can be
+                # revoked. Reauthenticate rather than surfacing an error.
+                _LOGGER.debug("refresh rejected (%s); falling back to SRP", err)
+
+        if user is None:
+            try:
+                user = await asyncio.to_thread(self._srp_login)
+            except Exception as err:  # noqa: BLE001
+                # Classify - a DNS failure or pool throttling here must NOT
+                # become ZephyrAuthError, which the supervisor treats as
+                # terminal and the consumer maps to a reauth prompt.
+                raise self._classify(err) from err
+
+        self._user = user
         try:
-            self._user = await asyncio.to_thread(self._srp_login)
-            self._identity_id, self._credentials = await asyncio.to_thread(
-                self._exchange
+            identity_id, credentials = await asyncio.to_thread(
+                self._exchange,
+                user.id_token,
+                stored.identity_id if stored is not None else None,
             )
+        except ZephyrError:
+            raise
         except Exception as err:  # noqa: BLE001
-            raise ZephyrAuthError(f"Cognito authentication failed: {err}") from err
-        _LOGGER.debug("authenticated; credentials expire %s",
-                      self._credentials.expiration)
+            raise self._classify(err) from err
 
-    async def refresh(self) -> None:
-        """Renew tokens and re-exchange. Cheaper than a full SRP login."""
-        if self._user is None:
-            raise ZephyrAuthError("authenticate() has not been called")
-        try:
-            await asyncio.to_thread(self._user.renew_access_token)
-            self._identity_id, self._credentials = await asyncio.to_thread(
-                self._exchange
-            )
-        except Exception as err:  # noqa: BLE001
-            raise ZephyrAuthError(f"Token renewal failed: {err}") from err
-
-    async def attach_policy(self) -> None:
-        """Bind the IoT policy to this identity.
-
-        MUST run before connecting. An open MQTT connection does not pick up
-        newly attached permissions.
-        """
-        await asyncio.to_thread(self._attach)
+        self._credentials = credentials
+        self._tokens = ZephyrTokens(
+            username=self._username,
+            id_token=user.id_token,
+            refresh_token=user.refresh_token or (
+                stored.refresh_token if stored else ""
+            ),
+            identity_id=identity_id,
+            expires_at=credentials.expiration.timestamp(),
+        )
+        self._seen_tokens = self._tokens
+        if self._token_updater is not None:
+            self._token_updater(self._tokens)
+        return self._tokens

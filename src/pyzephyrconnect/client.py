@@ -15,7 +15,18 @@ from typing import Any
 import aiohttp
 
 from .api import ZephyrApi
-from .auth import ZephyrAuth
+
+# transitional: Task 10 rewrites this module. CredentialsAuth's constructor
+# signature happens to match the (username, password, session) call below,
+# but its attribute surface (async_get_tokens/async_get_credentials/etc.)
+# does not match the legacy ZephyrAuth calls this module still makes below
+# (.authenticate()/.attach_policy()/.refresh()/.id_token/.credentials/
+# .mqtt_client_id/.identity_id). Almost every test that exercises this
+# module monkeypatches ZephyrAuth, so that mismatch is never hit; the one
+# exception (test_identity_id_raises_before_async_setup) only ever touches
+# the identity_id property, which both classes raise ZephyrAuthError from
+# before any tokens/credentials exist.
+from .auth import CredentialsAuth as ZephyrAuth
 from .models import HoodCapabilities, HoodState
 from .shadow import ShadowClient
 
@@ -39,7 +50,7 @@ class ZephyrClient:
     def __init__(
         self, username: str, password: str, session: aiohttp.ClientSession
     ) -> None:
-        self._auth = ZephyrAuth(username, password)
+        self._auth = ZephyrAuth(username, password, session)
         self._api = ZephyrApi(session)
         self._capabilities: dict[str, HoodCapabilities] = {}
         self._states: dict[str, HoodState] = {}

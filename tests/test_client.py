@@ -277,7 +277,12 @@ async def test_identity_id_returns_auth_value(wired):
 
 
 def test_identity_id_raises_before_async_setup():
-    """Before async_setup(), accessing identity_id propagates the auth error."""
+    """Before async_setup(), accessing identity_id propagates the auth error.
+
+    Constructs the real auth object (the `wired` fixture is not used here),
+    so this exercises AbstractAuth.identity_id's actual guard rather than a
+    mock - see the "no tokens acquired yet" message on that property.
+    """
     c = ZephyrClient("u", "p", MagicMock())
-    with pytest.raises(ZephyrAuthError, match="authenticate"):
+    with pytest.raises(ZephyrAuthError, match="no tokens acquired yet"):
         _ = c.identity_id

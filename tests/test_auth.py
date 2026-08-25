@@ -6,8 +6,12 @@ import pytest
 from botocore.exceptions import ClientError
 
 from pyzephyrconnect import auth as auth_module
-from pyzephyrconnect.auth import AbstractAuth, Credentials, ZephyrAuth, ZephyrTokens
-from pyzephyrconnect.exceptions import ZephyrAuthError, ZephyrTransportError
+from pyzephyrconnect.auth import AbstractAuth, Credentials, CredentialsAuth, ZephyrTokens
+from pyzephyrconnect.exceptions import (
+    ZephyrAuthError,
+    ZephyrPolicyError,
+    ZephyrTransportError,
+)
 
 IDENTITY = "us-west-2:00000000-1111-2222-3333-444455556666"
 
@@ -31,6 +35,7 @@ def fake_aws(monkeypatch):
     """Replace pycognito and boto3 with recording doubles."""
     cognito = MagicMock()
     cognito.id_token = "ID-TOKEN"
+    cognito.refresh_token = "REFRESH-TOKEN"
     monkeypatch.setattr(auth_module, "Cognito", MagicMock(return_value=cognito))
 
     identity = MagicMock()
@@ -45,104 +50,6 @@ def fake_aws(monkeypatch):
 
     monkeypatch.setattr(auth_module.boto3, "client", MagicMock(side_effect=client))
     return {"cognito": cognito, "identity": identity, "iot": iot}
-
-
-async def test_authenticate_runs_srp_and_exchanges_credentials(fake_aws):
-    a = ZephyrAuth("user@example.com", "pw")
-    await a.authenticate()
-
-    fake_aws["cognito"].authenticate.assert_called_once_with(password="pw")
-    assert a.id_token == "ID-TOKEN"
-    assert a.credentials.secret_key == "SECRET"
-
-
-async def test_user_pool_region_is_passed_explicitly(fake_aws):
-    """Without it pycognito falls back to ambient AWS config and raises a
-    misleading ResourceNotFoundException."""
-    await ZephyrAuth("u", "p").authenticate()
-    kwargs = auth_module.Cognito.call_args.kwargs
-    assert kwargs["user_pool_region"] == "us-west-2"
-    assert kwargs["client_secret"], "SRP fails without the client secret"
-
-
-async def test_identity_id_keeps_its_region_prefix(fake_aws):
-    """The full 'us-west-2:uuid' is what the IoT policy variable resolves to
-    and is the correct MQTT client ID base. Stripping it breaks delivery."""
-    a = ZephyrAuth("u", "p")
-    await a.authenticate()
-    assert a.identity_id == IDENTITY
-    assert a.identity_id.startswith("us-west-2:")
-
-
-async def test_mqtt_client_id_is_suffixed(fake_aws):
-    """A bare identity ID collides with the phone app and the two sessions
-    evict each other in a reconnect loop."""
-    a = ZephyrAuth("u", "p")
-    await a.authenticate()
-    assert a.mqtt_client_id == f"{IDENTITY}-ha"
-
-
-async def test_attach_policy_is_skipped_when_already_attached(fake_aws):
-    fake_aws["iot"].list_attached_policies.return_value = {
-        "policies": [{"policyName": "RangeHoodPolicy"}]
-    }
-    a = ZephyrAuth("u", "p")
-    await a.authenticate()
-    await a.attach_policy()
-    fake_aws["iot"].attach_policy.assert_not_called()
-
-
-async def test_attach_policy_attaches_when_missing(fake_aws):
-    a = ZephyrAuth("u", "p")
-    await a.authenticate()
-    await a.attach_policy()
-    fake_aws["iot"].attach_policy.assert_called_once_with(
-        policyName="RangeHoodPolicy", target=IDENTITY
-    )
-
-
-async def test_refresh_renews_without_a_full_srp_round_trip(fake_aws):
-    """Re-running SRP costs multiple round trips and the pool may rate-limit."""
-    a = ZephyrAuth("u", "p")
-    await a.authenticate()
-    fake_aws["cognito"].authenticate.reset_mock()
-
-    await a.refresh()
-
-    fake_aws["cognito"].renew_access_token.assert_called_once()
-    fake_aws["cognito"].authenticate.assert_not_called()
-    # get_id is only valid once; the identity must be reused.
-    assert fake_aws["identity"].get_id.call_count == 1
-
-
-async def test_authentication_failure_is_wrapped(fake_aws):
-    fake_aws["cognito"].authenticate.side_effect = Exception("Incorrect username")
-    with pytest.raises(ZephyrAuthError):
-        await ZephyrAuth("u", "bad").authenticate()
-
-
-async def test_exchange_failure_during_authenticate_is_wrapped(fake_aws):
-    """The identity exchange (get_id/get_credentials_for_identity) runs
-    after SRP login succeeds. A botocore ClientError from it (e.g. an
-    invalid/expired token) must surface as ZephyrAuthError, not raw
-    botocore - the HA integration routes on exception TYPE for reauth."""
-    fake_aws["identity"].get_credentials_for_identity.side_effect = Exception(
-        "ClientError: NotAuthorizedException"
-    )
-    with pytest.raises(ZephyrAuthError):
-        await ZephyrAuth("u", "p").authenticate()
-
-
-async def test_exchange_failure_during_refresh_is_wrapped(fake_aws):
-    """refresh() shares _exchange with authenticate() and must wrap its
-    failures the same way."""
-    a = ZephyrAuth("u", "p")
-    await a.authenticate()
-    fake_aws["identity"].get_credentials_for_identity.side_effect = Exception(
-        "ClientError: NotAuthorizedException"
-    )
-    with pytest.raises(ZephyrAuthError):
-        await a.refresh()
 
 
 def test_credentials_expire_early_by_the_refresh_margin():
@@ -166,6 +73,168 @@ def _stored_tokens(expires_in=-1):
         identity_id=IDENTITY,
         expires_at=time.time() + expires_in,
     )
+
+
+# -- CredentialsAuth ------------------------------------------------------
+#
+# Ported from the deleted ZephyrAuth suite: explicit user_pool_region,
+# policy-attach failure wrapping, and the accessor-raises-before-auth
+# contract. The "SecretKey, not SecretAccessKey" and "attaches when
+# missing" behaviours already have first-class coverage at the AbstractAuth
+# level (see test_a_minimal_subclass_satisfies_the_whole_client_contract
+# and the cache/exchange sections below) and are not duplicated here.
+
+
+def _not_authorized():
+    return ClientError(
+        {"Error": {"Code": "NotAuthorizedException", "Message": "expired"}},
+        "InitiateAuth",
+    )
+
+
+async def test_user_pool_region_is_passed_explicitly(fake_aws):
+    """Without it pycognito falls back to ambient AWS config and raises a
+    misleading ResourceNotFoundException."""
+    auth = CredentialsAuth("u", "p", MagicMock())
+    await auth.async_get_tokens()
+
+    kwargs = auth_module.Cognito.call_args.kwargs
+    assert kwargs["user_pool_region"] == "us-west-2"
+    assert kwargs["client_secret"], "SRP fails without the client secret"
+
+
+def test_accessor_raises_before_any_tokens_are_acquired():
+    """Mirrors the deleted ZephyrAuth contract: identity-derived state
+    touched before any tokens exist must fail loudly, not return stale or
+    empty data."""
+    auth = CredentialsAuth("u", "p", MagicMock())
+    with pytest.raises(ZephyrAuthError):
+        _ = auth.identity_id
+
+
+async def test_attach_policy_wraps_a_failed_attach_in_zephyr_policy_error(
+    fake_aws,
+):
+    fake_aws["iot"].attach_policy.side_effect = Exception("AccessDenied")
+    auth = CredentialsAuth("u", "p", MagicMock())
+
+    with pytest.raises(ZephyrPolicyError):
+        await auth.async_attach_policy()
+
+
+async def test_srp_runs_when_no_tokens_are_supplied(fake_aws):
+    auth = CredentialsAuth("user@example.com", "pw", MagicMock())
+    tokens = await auth.async_get_tokens()
+
+    fake_aws["cognito"].authenticate.assert_called_once_with(password="pw")
+    assert tokens.id_token == "ID-TOKEN"
+    assert tokens.username == "user@example.com"
+
+
+async def test_unexpired_stored_tokens_skip_the_network_entirely(fake_aws):
+    """The whole point of persistence: a restart must not re-run SRP."""
+    auth = CredentialsAuth(
+        "user@example.com", "pw", MagicMock(), tokens=_stored_tokens(3600)
+    )
+    tokens = await auth.async_get_tokens()
+
+    assert tokens.id_token == "OLD-ID"
+    fake_aws["cognito"].authenticate.assert_not_called()
+
+
+async def test_expired_stored_tokens_refresh_instead_of_full_srp(fake_aws):
+    auth = CredentialsAuth(
+        "user@example.com", "pw", MagicMock(), tokens=_stored_tokens()
+    )
+    await auth.async_get_tokens()
+
+    fake_aws["cognito"].renew_access_token.assert_called_once()
+    fake_aws["cognito"].authenticate.assert_not_called()
+
+
+async def test_rejected_refresh_token_falls_back_to_srp(fake_aws):
+    """Cognito refresh tokens expire (30 days by default) and can be
+    revoked. That must reauthenticate, not surface an error."""
+    fake_aws["cognito"].renew_access_token.side_effect = _not_authorized()
+    auth = CredentialsAuth(
+        "user@example.com", "pw", MagicMock(), tokens=_stored_tokens()
+    )
+    tokens = await auth.async_get_tokens()
+
+    fake_aws["cognito"].authenticate.assert_called_once_with(password="pw")
+    assert tokens.id_token == "ID-TOKEN"
+
+
+async def test_token_updater_fires_so_the_consumer_can_persist(fake_aws):
+    seen = []
+    auth = CredentialsAuth(
+        "user@example.com", "pw", MagicMock(), token_updater=seen.append
+    )
+    await auth.async_get_tokens()
+
+    assert len(seen) == 1
+    assert seen[0].refresh_token
+
+
+async def test_stale_identity_id_is_discarded_and_refetched_once(fake_aws):
+    """A persisted identity_id survives restarts, so a wrong one becomes
+    permanent. It decides the MQTT client ID and the IoT policy principal."""
+    identity = fake_aws["identity"]
+    identity.get_credentials_for_identity.side_effect = [
+        _not_authorized(),
+        _creds_response(),
+    ]
+    auth = CredentialsAuth(
+        "user@example.com", "pw", MagicMock(), tokens=_stored_tokens(3600)
+    )
+    await auth.async_get_credentials()
+
+    assert identity.get_id.call_count == 1
+    assert identity.get_credentials_for_identity.call_count == 2
+
+
+async def test_concurrent_callers_trigger_only_one_login(fake_aws):
+    """ZephyrApi asks for tokens on every request and the supervisor asks too,
+    so an expired token can be requested by several callers at once. The pool
+    rate-limits (PROTOCOL.md section 3.1)."""
+    import asyncio
+
+    auth = CredentialsAuth("user@example.com", "pw", MagicMock())
+    await asyncio.gather(*(auth.async_get_tokens() for _ in range(5)))
+
+    assert fake_aws["cognito"].authenticate.call_count == 1
+
+
+async def test_identity_id_is_read_not_reconstructed(fake_aws):
+    """Consumers use this as a config entry's permanent unique ID, so it must
+    come from the tokens rather than by stripping a suffix off a value
+    derived from it."""
+    auth = CredentialsAuth("user@example.com", "pw", MagicMock())
+    await auth.async_get_tokens()
+
+    assert auth.identity_id == IDENTITY
+    assert auth.mqtt_client_id == f"{auth.identity_id}-ha"
+
+
+async def test_identity_id_survives_a_refresh(fake_aws):
+    """Password changes and token refreshes must not change the account key -
+    the identity pool keys this on the user pool's immutable sub claim."""
+    auth = CredentialsAuth(
+        "user@example.com", "pw", MagicMock(), tokens=_stored_tokens()
+    )
+    first = (await auth.async_get_tokens()).identity_id
+    auth._tokens = _stored_tokens()          # force another refresh
+    assert (await auth.async_get_tokens()).identity_id == first
+
+
+async def test_mqtt_client_id_keeps_the_region_prefix_and_suffix(fake_aws):
+    """The policy pins client ID to identity; the suffix is what lets this
+    coexist with the phone app instead of evicting it."""
+    auth = CredentialsAuth("user@example.com", "pw", MagicMock())
+    await auth.async_get_tokens()
+
+    assert auth.mqtt_client_id == f"{IDENTITY}-ha"
+    assert auth.mqtt_client_id.startswith("us-west-2:")
 
 
 class _StaticAuth(AbstractAuth):
