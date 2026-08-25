@@ -117,6 +117,20 @@ def _redacted(payload: dict[str, Any]) -> dict[str, Any]:
     return {k: ("<redacted>" if k in _REDACT else v) for k, v in payload.items()}
 
 
+def _range(maximum: int | None) -> str:
+    """Formats a 0..maximum range, or names it unknown when unadvertised.
+
+    Args:
+        maximum: The hood's advertised maximum, or None when the
+            discoverdevice payload did not report one.
+
+    Returns:
+        "0-<maximum>" when advertised, "range unknown" otherwise - never
+        the literal "0-None".
+    """
+    return f"0-{maximum}" if maximum is not None else "range unknown"
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Builds the probe CLI's argument parser."""
     parser = argparse.ArgumentParser(
@@ -188,8 +202,8 @@ async def main(argv: list[str] | None = None) -> int:
         else:
             hood = hoods[0]
         caps = hood.capabilities
-        print(f"device: {caps.model} (fan 0-{caps.max_fan_speed}, "
-              f"light 0-{caps.max_light_level})")
+        print(f"device: {caps.model} (fan {_range(caps.max_fan_speed)}, "
+              f"light {_range(caps.max_light_level)})")
 
         try:
             await hood.async_start()
