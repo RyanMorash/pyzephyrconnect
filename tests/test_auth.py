@@ -303,3 +303,89 @@ async def test_exchange_transient_failure_propagates_without_refetch(fake_aws):
         await auth.async_get_credentials()
 
     assert fake_aws["identity"].get_id.call_count == 0
+
+
+# -- canary: the real pycognito exception --------------------------------
+
+
+def test_classify_matches_the_real_pycognito_force_change_password_exception():
+    """_classify matches pycognito's terminal exceptions by type NAME, not
+    isinstance, so this module never has to import pycognito's exception
+    classes. That means a rename or a module move in a future pycognito
+    release would not be caught by type-checking - it would just silently
+    stop matching and fall through to ZephyrTransportError. This test
+    imports the REAL class from the installed package (not a same-named
+    local stand-in, unlike
+    test_classify_matches_pycognito_terminal_exceptions_by_type_name above)
+    so a rename fails this test loudly instead."""
+    from pycognito.exceptions import ForceChangePasswordException
+
+    err = ForceChangePasswordException("must change password")
+    result = AbstractAuth._classify(err)
+    assert isinstance(result, ZephyrAuthError)
+
+
+# -- identity override reset on account swap -----------------------------
+
+
+class _RecordingAuth(_StaticAuth):
+    """Like CredentialsAuth: records every _on_identity_refetched call."""
+
+    def __init__(self, tokens, session):
+        super().__init__(tokens, session)
+        self.refetched_identities: list[str] = []
+
+    def _on_identity_refetched(self, identity_id):
+        self.refetched_identities.append(identity_id)
+
+
+async def test_identity_override_resets_when_tokens_change_accounts(fake_aws):
+    """A stored identity_id can go stale - the exchange rejects it and
+    refetches, setting _identity_override (covered by the
+    override-write-back and _on_identity_refetched-hook lines that were
+    previously uncovered). If the auth's tokens are later swapped for a
+    DIFFERENT account's, that override must not survive the swap: serving
+    the old identity's credentials and client ID under the new tokens is
+    the PROTOCOL.md section 3.3 silent-drop failure. The second
+    async_get_credentials() call must do a fresh exchange and resolve to
+    the new tokens' own identity, not the stale override."""
+    refetched_identity = "us-west-2:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    other_account_identity = "us-west-2:99999999-8888-7777-6666-555544443333"
+
+    # First exchange: the stored identity is rejected, forcing a refetch.
+    fake_aws["identity"].get_credentials_for_identity.side_effect = [
+        _client_error("ResourceNotFoundException"),
+        _creds_response(),
+    ]
+    fake_aws["identity"].get_id.return_value = {"IdentityId": refetched_identity}
+
+    auth = _RecordingAuth(_stored_tokens(3600), MagicMock())
+    await auth.async_get_credentials()
+
+    assert auth.identity_id == refetched_identity
+    assert auth.refetched_identities == [refetched_identity]
+
+    # Second exchange, under a different account's tokens entirely.
+    fake_aws["identity"].get_credentials_for_identity.side_effect = None
+    fake_aws["identity"].get_credentials_for_identity.return_value = (
+        _creds_response()
+    )
+    fake_aws["identity"].get_id.return_value = {
+        "IdentityId": other_account_identity
+    }
+    exchanges_before = fake_aws["identity"].get_credentials_for_identity.call_count
+
+    auth._static = ZephyrTokens(
+        username="other@example.com",
+        id_token="OTHER-ID",
+        refresh_token="OTHER-REFRESH",
+        identity_id=other_account_identity,
+        expires_at=time.time() + 3600,
+    )
+    await auth.async_get_credentials()
+
+    assert (
+        fake_aws["identity"].get_credentials_for_identity.call_count
+        > exchanges_before
+    ), "swapping to a new account's tokens must trigger a fresh exchange"
+    assert auth.identity_id == other_account_identity

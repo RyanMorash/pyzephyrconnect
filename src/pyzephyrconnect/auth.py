@@ -196,6 +196,15 @@ class AbstractAuth(ABC):
         and are bound to a live socket, so there is nothing worth storing.
         """
         tokens = await self.async_get_tokens()
+        if (
+            self._seen_tokens is not None
+            and self._seen_tokens.identity_id != tokens.identity_id
+        ):
+            # The tokens now name a different identity than before. A stale
+            # _identity_override from the PREVIOUS tokens must not mask the
+            # change - serving the old identity's credentials and client ID
+            # is the PROTOCOL.md section 3.3 silent-drop failure.
+            self._identity_override = None
         self._seen_tokens = tokens
         current_identity = self._identity_override or tokens.identity_id
         if not self.credentials_expired and self._credentials_for == current_identity:
@@ -276,8 +285,21 @@ class AbstractAuth(ABC):
         # pycognito raises its own terminal exceptions that never go through
         # botocore/ClientError - a forced password change or an MFA
         # challenge means "needs the user", not "retry". Matched on the
-        # type name (not isinstance) so this module does not have to import
-        # pycognito's exception classes.
+        # type name (not isinstance) - not to avoid importing pycognito
+        # (this module already imports Cognito from it), but because
+        # pycognito's exception classes have moved between modules/versions
+        # in its history, and a name string survives that churn while an
+        # import path does not. test_auth.py has a canary test that
+        # imports the real class and asserts against it directly, so a
+        # rename shows up as a loud test failure instead of a silent
+        # classification gap.
+        #
+        # TokenVerificationException is deliberately NOT in this set: it
+        # can be raised for a transient JWKS fetch failure, not just a bad
+        # token, so it stays retryable here. A genuinely invalid token
+        # still surfaces terminally - as a ClientError from the next
+        # Cognito call - so nothing is lost by not treating it as terminal
+        # at this layer.
         if type(err).__name__ in {
             "ForceChangePasswordException",
             "SoftwareTokenMFAChallengeException",
@@ -288,8 +310,13 @@ class AbstractAuth(ABC):
         # No raw exception text here: botocore's ParamValidationError (and
         # others) can echo parameter values back in the message, which may
         # include tokens - and this lands in ERROR logs users paste into
-        # public issues.
-        return ZephyrTransportError(f"cloud request failed: {type(err).__name__}")
+        # public issues. The AWS error code itself is not a secret, so it
+        # is kept - "cloud request failed: ClientError" alone collapsed
+        # every botocore failure into one indistinguishable message.
+        detail = f" ({code})" if code else ""
+        return ZephyrTransportError(
+            f"cloud request failed: {type(err).__name__}{detail}"
+        )
 
     # -- blocking bodies, run in a worker thread ----------------------
 
