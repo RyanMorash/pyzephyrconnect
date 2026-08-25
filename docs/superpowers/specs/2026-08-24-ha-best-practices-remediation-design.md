@@ -31,10 +31,10 @@ In scope:
 
 Out of scope:
 
-- The `VALIDATION.md` contradiction. That runbook forbids integration writes
-  until hardware validation completes, while the draft integration writes
-  from six platforms today. That is a product decision, unrelated to these
-  docs, and is tracked separately.
+- The `VALIDATION.md` contradiction. That runbook forbids any consumer from
+  writing to the shadow until hardware validation of the write path is
+  complete, while this library exposes a write path today. That is a product
+  decision, unrelated to these docs, and is tracked separately.
 - Any change to `HoodState.raw` / `HoodCapabilities.raw`. They stay exactly
   as they are: they are the evidence channel for characterising unmodelled
   fields on hoods we have never seen, and the consumer's diagnostics output

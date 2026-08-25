@@ -58,17 +58,18 @@ entirely on restart if you hand it tokens from a previous session:
 ```python
 from pyzephyrconnect import ZephyrClient, ZephyrTokens
 
-saved = entry.data.get("tokens")
 client = ZephyrClient.from_credentials(
-    entry.data[CONF_USERNAME],
-    entry.data[CONF_PASSWORD],
-    async_get_clientsession(hass),
+    username,
+    password,
+    session,
     tokens=ZephyrTokens.from_dict(saved) if saved else None,
-    token_updater=lambda t: hass.config_entries.async_update_entry(
-        entry, data={**entry.data, "tokens": t.as_dict()}
-    ),
+    token_updater=save,          # called with a ZephyrTokens on every refresh
 )
 ```
+
+`saved` is whatever `as_dict()` produced last time, and `save` is however you
+choose to persist it. Where that lives is your call — see the warning below
+before deciding.
 
 `ZephyrTokens.as_dict()` returns JSON-serializable primitives only, so it is
 safe to store in a config entry. It carries `username`, `id_token`,
@@ -91,32 +92,26 @@ Notes:
 > refresh token is valid for around 30 days by default and is on its own
 > sufficient to take over the account.
 >
-> If you store it under `entry.data["tokens"]`, the existing diagnostics
-> handler will dump it. `async_redact_data` matches on key names, so a
-> `REDACT_KEYS` set containing `CONF_PASSWORD` will **not** reach `id_token`
-> or `refresh_token` nested inside a `tokens` sub-dict — they will appear in
-> full. The entire premise of that diagnostics file is that it is safe to
-> paste into a public issue, so this must be handled in the same commit that
-> introduces persistence, not after.
+> Two Home Assistant behaviours make this easy to get wrong:
 >
-> Add the token keys to the redaction set, or redact the whole `tokens` key:
+> - `async_redact_data` matches on **key names at the level it is given**. A
+>   redaction set that names the top-level keys will not reach an `id_token`
+>   nested one level down inside a sub-dict — those values pass through in
+>   full.
+> - Config entries are stored as plain JSON in `.storage/core.config_entries`.
 >
-> ```python
-> REDACT_KEYS = {
->     "thingName", "SN", "MAC", "location",
->     CONF_USERNAME, CONF_PASSWORD,
->     "tokens", "id_token", "refresh_token",
-> }
-> ```
+> So wherever these tokens are persisted, the redaction list needs to name
+> them — either the individual keys (`id_token`, `refresh_token`) or whatever
+> container they are stored under. Diagnostics output is meant to be safe to
+> paste into a public issue, so this belongs in the same change that
+> introduces persistence, not a follow-up.
 >
-> `identity_id` is a stable account identifier and is worth redacting for the
-> same reason `SN` and `MAC` are, even though it is not a credential.
+> `identity_id` is worth redacting too. It is not a credential, but it is a
+> stable account identifier in the same category as a serial number or MAC.
 >
-> Consider whether the tokens belong in `entry.data` at all. Home Assistant
-> stores config entries as plain JSON in `.storage/core.config_entries`. The
-> password is already there, so tokens are not a new class of exposure — but
-> they are a second live credential to keep track of, and one that is easy to
-> forget when writing a redaction list.
+> Persistence is optional. `from_credentials` works without `tokens` and
+> `token_updater` and simply re-runs the SRP login on each restart, which
+> avoids introducing a second live credential entirely.
 
 ### `identity_id` is unchanged, and is the right config entry unique ID
 
@@ -127,9 +122,9 @@ Identity Pools key an identity on the *provider's* user identifier, which for
 a User Pool provider is the immutable `sub` claim — not the email, not the
 password. So it survives a password change, survives an email change, is
 idempotent across `get_id` calls, and does not change on token refresh. It is
-also the right granularity: this is a hub-type integration where one account
-can own several hoods, so `thingName` would be per-device and the email is
-both mutable and personal data.
+also the right granularity for an account-level entry: one account can own
+several hoods, so `thingName` identifies a device rather than the account, and
+the email address is both mutable and personal data.
 
 The one theoretical failure is the vendor recreating their identity pool,
 which would reissue every user's ID. Not worth designing around: the IoT
@@ -230,12 +225,16 @@ Keeping that alive was previously the consumer's job via
 that renews credentials and rebuilds each hood's socket before expiry, started
 by the first `hood.async_start()` and cancelled by `client.async_stop()`.
 
-**Implication worth reviewing:** if your coordinator's polling interval was
-kept alive specifically so that credentials would not lapse, that reason no
-longer applies. Whether the periodic tick still earns its keep for other
-reasons — a safety-net re-read when push has been briefly unhealthy, or
-degraded HTTPS polling while MQTT is down — is your call. `hood.async_poll()`
-and `client.connected` both still exist for that.
+**What this means for you:** keeping credentials alive is no longer a reason
+for a consumer to poll on a timer. If a periodic tick is still wanted for
+other reasons — a safety-net re-read after push has been briefly unhealthy, or
+degraded HTTPS reads while MQTT is down — `hood.async_poll()` and
+`client.connected` both still exist for that.
+
+A terminal failure inside the supervisor (a revoked refresh token, or a
+missing IoT policy) stops it, flips `client.connected` to `False`, and is
+re-raised from the next `hood.async_poll()`. That is the intended path for it
+to reach a reauth flow, so a consumer that never polls will not learn about it.
 
 ---
 
@@ -279,8 +278,8 @@ The numeric capability fields are now `int | None`:
 - **Present but malformed** → raises the new `ZephyrDataError`. This runs once
   at setup, so it fails loudly rather than producing a wrong capability set.
 
-Existing gates like `caps.max_charcoal_filter_hours > 0` will now raise
-`TypeError` on `None`. They need a `None` check first.
+Any comparison against these values needs a `None` check first —
+`None > 0` raises `TypeError` rather than evaluating falsy.
 
 String fields (`model`, `serial`, `mac`, `manufacturer`, warranties) still
 default to `""`, and the `supports_*` booleans still default to `False` —
@@ -289,7 +288,7 @@ absent means "not advertised", which is the correct reading for a feature flag.
 ### `raw` is unchanged
 
 `HoodState.raw` and `HoodCapabilities.raw` keep exactly their current shape and
-contents. Anything reading them — diagnostics in particular — needs no change.
+contents. Anything reading them needs no change.
 
 ---
 
@@ -304,11 +303,11 @@ them.
 | `ZephyrWriteError` | A field is not writable, a value is out of range, or the payload is empty |
 | `ZephyrDataError` | A capability field was present but unparseable |
 
-**This fixes a live bug.** `client.async_set_state` previously raised a bare
-`RuntimeError` when called before `async_start()` for that thing — which is
-not a `ZephyrError`, so a handler catching `ZephyrAuthError`/`ZephyrError`
-around a write let it escape uncaught. It is now `ZephyrNotConnectedError` and
-is caught by an existing `ZephyrError` handler.
+**Note the first one.** `client.async_set_state` previously raised a bare
+`RuntimeError` when called before the shadow connection for that thing was
+open. `RuntimeError` is not a `ZephyrError`, so any handler catching
+`ZephyrError` around a write would have let it escape. It is now
+`ZephyrNotConnectedError` and is caught by a `ZephyrError` handler.
 
 Unchanged: `ZephyrError`, `ZephyrAuthError`, `ZephyrCertificateError`,
 `ZephyrPolicyError`, `ZephyrTransportError`.
@@ -352,8 +351,15 @@ fails silently rather than loudly:
 
 ## Still open, unrelated to this change
 
-`VALIDATION.md` in the library repo states that nothing in the integration may
-write to the shadow until hardware validation of the write path is complete.
-Several write platforms exist in the integration today. That contradiction is a
-product decision, not an API one, and is out of scope for this changelog — but
-it should be resolved deliberately rather than by default.
+The library's own `VALIDATION.md` runbook states that the shadow write path is
+unverified and that no consumer should write to it until hardware validation
+is complete. That validation has not happened yet.
+
+The write API described in §3 exists and works, but the *semantics* of several
+fields are still unestablished — `PROTOCOL.md` §7 lists what remains. Notably,
+whether `power` gates the light and fan, whether `setdelaytimer` accepts
+arbitrary values or snaps to presets, and the units of the `use*time` counters.
+Those three answers materially affect what entities should exist.
+
+This is a product decision rather than an API one and is out of scope for this
+changelog, but it is worth resolving deliberately rather than by default.
