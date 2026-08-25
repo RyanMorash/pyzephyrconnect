@@ -28,7 +28,14 @@ def _caps(**overrides) -> HoodCapabilities:
 def _hood(caps=None):
     shadow = MagicMock()
     shadow.connect = AsyncMock()
-    shadow.disconnect = AsyncMock()
+
+    async def _yielding_disconnect():
+        # A real teardown awaits a thread join; yield twice so lock-release
+        # races between _stop and _start become observable to tests.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+    shadow.disconnect = AsyncMock(side_effect=_yielding_disconnect)
     shadow.request_state = AsyncMock()
     shadow.publish_state = AsyncMock()
     hood = Hood(
