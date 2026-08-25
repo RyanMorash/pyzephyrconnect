@@ -44,15 +44,22 @@ class ZephyrTokens:
     Primitives only - the auth documentation asks for JSON-serializable
     data so the consumer, not the library, owns storage.
 
-    `username` is not decoration: Cognito's SECRET_HASH is
-    HMAC-SHA256(client_secret, username + client_id), and pycognito
-    recomputes it on every REFRESH_TOKEN_AUTH call. Tokens without it
-    cannot be refreshed.
-
-    `identity_id` is the full "us-west-2:uuid" string. The region prefix is
-    load-bearing - it is what the IoT policy's
-    ${cognito-identity.amazonaws.com:sub} resolves to, and it is the basis
-    of the MQTT client ID. Never strip it.
+    Attributes:
+        username: Username the tokens were minted under. Not decoration:
+            Cognito's SECRET_HASH is HMAC-SHA256(client_secret,
+            username + client_id), and pycognito recomputes it on every
+            REFRESH_TOKEN_AUTH call. Tokens without it cannot be
+            refreshed.
+        id_token: Cognito ID token, presented in the Logins map of the
+            identity exchange.
+        refresh_token: Long-lived token used to renew the ID token
+            without a fresh SRP login.
+        identity_id: The full "us-west-2:uuid" string. The region prefix
+            is load-bearing - it is what the IoT policy's
+            ${cognito-identity.amazonaws.com:sub} resolves to, and it is
+            the basis of the MQTT client ID. Never strip it.
+        expires_at: POSIX timestamp of token expiry; `expired` applies
+            the refresh margin against it.
     """
 
     username: str
@@ -67,7 +74,7 @@ class ZephyrTokens:
 
     @property
     def expired(self) -> bool:
-        """True once inside the refresh margin.
+        """Whether the tokens are inside the refresh margin.
 
         Deliberately pessimistic for the same reason Credentials.expired is:
         rebuilding the MQTT socket takes time.
@@ -75,7 +82,7 @@ class ZephyrTokens:
         return time.time() >= (self.expires_at - const.REFRESH_MARGIN_SECONDS)
 
     def as_dict(self) -> dict[str, str | float]:
-        """Return the JSON-serializable form for the consumer to persist."""
+        """Returns the JSON-serializable form for the consumer to persist."""
         return {
             "username": self.username,
             "id_token": self.id_token,
@@ -86,7 +93,7 @@ class ZephyrTokens:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> ZephyrTokens:
-        """Rebuild from restored storage, validating rather than coercing.
+        """Rebuilds from restored storage, validating rather than coercing.
 
         str() coercion was worse than no validation: a corrupted None
         became the literal "None", which is a perfectly usable string that
@@ -94,6 +101,17 @@ class ZephyrTokens:
         SECRET_HASH Cognito rejects, or as an MQTT client ID whose messages
         AWS IoT silently drops. Corruption has to fail here, at the
         boundary the README tells consumers to call.
+
+        Args:
+            data: Mapping previously produced by as_dict and restored
+                from the consumer's storage.
+
+        Returns:
+            The validated tokens.
+
+        Raises:
+            ZephyrDataError: If any field is missing, empty, of the wrong
+                type, or (for expires_at) not a finite number.
         """
         try:
             values: dict[str, str] = {}
@@ -150,6 +168,16 @@ class AbstractAuth(ABC):
     about them is worth delegating or persisting.
 
     CredentialsAuth is the built-in implementation for the simple case.
+
+    Attributes:
+        session: The aiohttp client session, owned by the consumer.
+        endpoints: Cloud endpoint set every Cognito and IoT call runs
+            against.
+        credentials_generation: Monotonic counter identifying the current
+            AWS credentials, incremented at every site that installs a
+            fresh set. A socket presigned under an older generation
+            carries a SigV4 signature that dies at the old expiry, no
+            matter how fresh the cache looks now.
     """
 
     def __init__(
@@ -157,7 +185,12 @@ class AbstractAuth(ABC):
         session: aiohttp.ClientSession,
         endpoints: Endpoints = DEFAULT_ENDPOINTS,
     ) -> None:
-        """Store the session and endpoints; all derived state starts empty."""
+        """Stores the session and endpoints; all derived state starts empty.
+
+        Args:
+            session: aiohttp client session, owned by the consumer.
+            endpoints: Cloud endpoint set to authenticate against.
+        """
         self.session = session
         self.endpoints = endpoints
         self._credentials: Credentials | None = None
@@ -191,7 +224,7 @@ class AbstractAuth(ABC):
 
     @abstractmethod
     async def async_get_tokens(self) -> ZephyrTokens:
-        """Return valid, unexpired tokens, refreshing if necessary.
+        """Returns valid, unexpired tokens, refreshing if necessary.
 
         Called on every REST request and by the credential supervisor, so
         implementations should return a cached value while it is fresh.
@@ -199,7 +232,7 @@ class AbstractAuth(ABC):
 
     @property
     def identity_id(self) -> str:
-        """Cognito identity ID, the full region-prefixed string.
+        """The Cognito identity ID, the full region-prefixed string.
 
         Stable per account: the identity pool keys this on the user pool's
         immutable `sub` claim, so it survives password and email changes and
@@ -208,8 +241,10 @@ class AbstractAuth(ABC):
 
         Available after the first async_get_credentials(), which
         ZephyrClient.async_setup() performs (and CredentialsAuth also makes
-        it available after async_get_tokens()). Raises ZephyrAuthError
-        before that.
+        it available after async_get_tokens()).
+
+        Raises:
+            ZephyrAuthError: If no tokens have been acquired yet.
         """
         if self._identity_override is not None:
             return self._identity_override
@@ -219,17 +254,21 @@ class AbstractAuth(ABC):
 
     @property
     def mqtt_client_id(self) -> str:
-        """Identity ID plus a stable suffix.
+        """The identity ID plus a stable suffix.
 
         The IoT policy pins the client ID to the identity. Using the bare
         identity ID makes this library and the phone app evict each other.
         Derived from identity_id, never the other way around.
+
+        Raises:
+            ZephyrAuthError: If no tokens have been acquired yet (via
+                identity_id).
         """
         return f"{self.identity_id}{const.CLIENT_ID_SUFFIX}"
 
     @property
     def credentials_expired(self) -> bool:
-        """True when the cached AWS credentials need renewing.
+        """Whether the cached AWS credentials need renewing.
 
         A plain property on purpose. The supervisor must be able to ask "do
         these need replacing?" without async_get_credentials() renewing them
@@ -243,10 +282,20 @@ class AbstractAuth(ABC):
         return self._credentials is None or self._credentials.expired
 
     async def async_get_credentials(self) -> Credentials:
-        """AWS credentials for SigV4-presigning the MQTT WebSocket URL.
+        """Returns AWS credentials for SigV4-presigning the MQTT WebSocket URL.
 
         Derived from the ID token rather than persisted: they last an hour
         and are bound to a live socket, so there is nothing worth storing.
+
+        Returns:
+            The cached credentials while fresh and minted for the current
+            identity; otherwise a freshly exchanged set.
+
+        Raises:
+            ZephyrAuthError: If the cloud rejects the credentials
+                terminally.
+            ZephyrTransportError: If the exchange fails for a retryable
+                infrastructure reason.
         """
         tokens = await self.async_get_tokens()
         if (
@@ -309,7 +358,7 @@ class AbstractAuth(ABC):
             return self._credentials
 
     async def async_get_presign_credentials(self) -> tuple[Credentials, int]:
-        """The current credentials AND the generation they belong to.
+        """Returns the current credentials and the generation they belong to.
 
         Read as a consistent pair: the two attribute reads below are
         consecutive sync statements on the event loop, atomic with respect
@@ -317,6 +366,16 @@ class AbstractAuth(ABC):
         an await, which can pair a newer counter with older credentials
         and leave a socket the supervisor believes is current dying at the
         older credentials' expiry.
+
+        Returns:
+            The credentials and the generation counter value they were
+            installed under, guaranteed consistent with each other.
+
+        Raises:
+            ZephyrAuthError: If the cloud rejects the credentials
+                terminally.
+            ZephyrTransportError: If the exchange fails for a retryable
+                infrastructure reason.
         """
         while True:
             creds = await self.async_get_credentials()
@@ -326,30 +385,47 @@ class AbstractAuth(ABC):
             # on the newer pair immediately.
 
     async def async_attach_policy(self) -> None:
-        """Bind the IoT policy to this identity.
+        """Binds the IoT policy to this identity.
 
         MUST run before connecting. An open MQTT connection does not pick up
         newly attached permissions.
+
+        Raises:
+            ZephyrPolicyError: If IoT refuses the attach itself.
+            ZephyrAuthError: If the cloud rejects the credentials
+                terminally.
+            ZephyrTransportError: If a retryable infrastructure failure
+                interrupts the exchange or the attach.
         """
         credentials = await self.async_get_credentials()
         await asyncio.to_thread(self._attach, self.identity_id, credentials)
 
     def _on_identity_refetched(self, identity_id: str) -> None:
-        """Hook: a stored identity_id was stale and has been replaced.
+        """Hook called when a stored identity_id was stale and got replaced.
 
         Default no-op. CredentialsAuth overrides it to write the corrected
         value back into its persisted tokens. ZephyrClient also re-attaches
         the IoT policy for the new identity - see _ensure_policy.
+
+        Args:
+            identity_id: The freshly fetched replacement identity ID.
         """
 
     @staticmethod
     def _classify(err: Exception) -> ZephyrError:
-        """Terminal credential rejection, or retryable infrastructure noise?
+        """Classifies a failure as terminal rejection or retryable noise.
 
         The supervisor keys terminal-vs-retry on the exception TYPE, so
         wrapping everything in ZephyrAuthError turns a DNS blip or a Cognito
         TooManyRequestsException at the hourly refresh into a permanent stop
         and a reauth prompt. Only genuine rejections may become auth errors.
+
+        Args:
+            err: The exception a pycognito or botocore call raised.
+
+        Returns:
+            ZephyrAuthError for a genuine credential rejection,
+            ZephyrTransportError for everything else.
         """
         code = ""
         if isinstance(err, ClientError):
@@ -401,7 +477,7 @@ class AbstractAuth(ABC):
     # -- blocking bodies, run in a worker thread ----------------------
 
     def _identity_client(self) -> Any:
-        """Build an unsigned cognito-identity client for the exchange.
+        """Builds an unsigned cognito-identity client for the exchange.
 
         UNSIGNED because get_id and get_credentials_for_identity
         authenticate through the Logins token map, not SigV4 - there are no
@@ -416,19 +492,27 @@ class AbstractAuth(ABC):
     def _exchange(
         self, id_token: str, identity_id: str | None
     ) -> tuple[str, Credentials]:
-        """Trade an ID token for AWS credentials.
+        """Trades an ID token for AWS credentials.
 
         A persisted identity_id is replayed when we have one, but it can be
         stale - and unlike an in-memory value, a bad one survives restarts.
         Only a failure that actually means "this identity is wrong"
         discards it and refetches once; everything else propagates to
         _classify.
+
+        Args:
+            id_token: Cognito ID token to present in the Logins map.
+            identity_id: Previously stored identity ID to replay, or None
+                to have Cognito resolve one.
+
+        Returns:
+            The resolved identity ID and the freshly minted credentials.
         """
         client = self._identity_client()
         logins = {self.endpoints.provider: id_token}
 
         def fetch(iid: str | None) -> tuple[str, dict]:
-            """Resolve `iid` if None, then mint raw credentials for it."""
+            """Resolves `iid` if None, then mints raw credentials for it."""
             resolved = iid or client.get_id(
                 IdentityPoolId=self.endpoints.identity_pool, Logins=logins
             )["IdentityId"]
@@ -473,7 +557,7 @@ class AbstractAuth(ABC):
         )
 
     def _attach(self, identity_id: str, creds: Credentials) -> None:
-        """Bind the policy, classifying the failure rather than assuming one.
+        """Binds the policy, classifying the failure rather than assuming one.
 
         Only a genuine authorization/policy refusal is terminal. Every other
         failure - a throttled or unreachable IoT endpoint during a
@@ -481,6 +565,17 @@ class AbstractAuth(ABC):
         because a blanket ZephyrPolicyError here keys the supervisor's
         terminal-vs-retry decision to "stop" and permanently kills every
         hood over what is usually a transient blip.
+
+        Args:
+            identity_id: Identity to attach the policy to.
+            creds: AWS credentials that sign the IoT calls.
+
+        Raises:
+            ZephyrPolicyError: If IoT refused the attach itself - the
+                caller may not attach, or the policy does not exist.
+            ZephyrAuthError: If the credentials were rejected terminally.
+            ZephyrTransportError: If the attach failed for a retryable
+                infrastructure reason.
         """
         client = boto3.client(
             "iot",
@@ -536,6 +631,12 @@ class Credentials:
 
     These SigV4-sign the presigned MQTT WebSocket URL and the IoT policy
     attach. Deliberately never persisted - see AbstractAuth.
+
+    Attributes:
+        access_key: AWS access key ID.
+        secret_key: AWS secret access key.
+        session_token: AWS session token for the temporary credentials.
+        expiration: Expiry reported by the identity exchange.
     """
 
     access_key: str
@@ -549,7 +650,7 @@ class Credentials:
 
     @property
     def expired(self) -> bool:
-        """True once inside the refresh margin.
+        """Whether the credentials are inside the refresh margin.
 
         Deliberately pessimistic: rebuilding the MQTT socket takes time, and
         credentials that expire mid-handshake fail opaquely.
@@ -577,11 +678,18 @@ class CredentialsAuth(AbstractAuth):
         token_updater: Callable[[ZephyrTokens], None] | None = None,
         endpoints: Endpoints = DEFAULT_ENDPOINTS,
     ) -> None:
-        """Set up SRP login as `username`, optionally resuming stored tokens.
+        """Sets up SRP login as `username`, optionally resuming stored tokens.
 
-        `tokens` lets the first acquisition try the stored refresh token
-        before burning a rate-limited SRP login; `token_updater` is called
-        with every new ZephyrTokens so the consumer can persist them.
+        Args:
+            username: Cognito username to log in as.
+            password: Password for the SRP login.
+            session: aiohttp client session, owned by the consumer.
+            tokens: Previously persisted tokens; lets the first
+                acquisition try the stored refresh token before burning a
+                rate-limited SRP login.
+            token_updater: Called with every new ZephyrTokens so the
+                consumer can persist them.
+            endpoints: Cloud endpoint set to authenticate against.
         """
         super().__init__(session, endpoints)
         self._username = username
@@ -598,11 +706,14 @@ class CredentialsAuth(AbstractAuth):
         self._lock = asyncio.Lock()
 
     def _on_identity_refetched(self, identity_id: str) -> None:
-        """Persist a corrected identity into the stored tokens.
+        """Persists a corrected identity into the stored tokens.
 
         The base class already routes mqtt_client_id through its override;
         this makes the correction survive a restart instead of being
         rediscovered by a failed exchange every time.
+
+        Args:
+            identity_id: The freshly fetched replacement identity ID.
         """
         if self._tokens is not None:
             self._tokens = replace(self._tokens, identity_id=identity_id)
@@ -614,7 +725,15 @@ class CredentialsAuth(AbstractAuth):
     def _cognito(
         self, *, username: str | None = None, refresh_token: str | None = None
     ) -> Cognito:
-        """Build a pycognito handle for the configured pool, client and secret."""
+        """Builds a pycognito handle for the configured pool/client/secret.
+
+        Args:
+            username: Username to bind the handle to; defaults to the
+                constructor username. The refresh path passes the stored
+                username, which minted the refresh token.
+            refresh_token: Stored refresh token to seed the handle with,
+                for the REFRESH_TOKEN_AUTH path.
+        """
         return Cognito(
             self.endpoints.user_pool,
             self.endpoints.client_id,
@@ -627,17 +746,20 @@ class CredentialsAuth(AbstractAuth):
         )
 
     def _srp_login(self) -> Cognito:
-        """Log in with the password over SRP, minting fresh tokens.
+        """Logs in with the password over SRP, minting fresh tokens.
 
         The expensive, rate-limited path (PROTOCOL.md section 3.1) - taken
         only when there is no stored refresh token or Cognito rejected it.
+
+        Returns:
+            An authenticated pycognito handle carrying the fresh tokens.
         """
         user = self._cognito()
         user.authenticate(password=self._password)
         return user
 
     def _refresh(self, stored: ZephyrTokens) -> Cognito:
-        """Renew from a stored refresh token, under ITS username.
+        """Renews from a stored refresh token, under ITS username.
 
         stored.username, not self._username: SECRET_HASH is
         HMAC-SHA256(client_secret, username + client_id) and pycognito
@@ -648,6 +770,13 @@ class CredentialsAuth(AbstractAuth):
         consumer that rebuilds this object with a differently spelled
         username (a changed email, different casing) while restoring the
         same tokens sends a hash Cognito rejects.
+
+        Args:
+            stored: The persisted tokens whose refresh token - and the
+                username that minted it - drive the renewal.
+
+        Returns:
+            A pycognito handle carrying the renewed tokens.
         """
         user = self._cognito(
             username=stored.username, refresh_token=stored.refresh_token
@@ -663,10 +792,19 @@ class CredentialsAuth(AbstractAuth):
     # -- async surface -------------------------------------------------
 
     async def async_get_tokens(self) -> ZephyrTokens:
-        """Serve the cached tokens while fresh; refresh or log in otherwise.
+        """Serves cached tokens while fresh; refreshes or logs in otherwise.
 
         The unlocked fast path keeps this cheap for ZephyrApi, which calls
         it on every REST request.
+
+        Returns:
+            Valid, unexpired tokens.
+
+        Raises:
+            ZephyrAuthError: If Cognito rejects the credentials
+                terminally.
+            ZephyrTransportError: If refresh, login or the identity
+                exchange fails for a retryable infrastructure reason.
         """
         if self._tokens is not None and not self._tokens.expired:
             return self._tokens
@@ -679,7 +817,20 @@ class CredentialsAuth(AbstractAuth):
             return await self._acquire()
 
     async def _acquire(self) -> ZephyrTokens:
-        """Refresh or log in. Caller holds self._lock."""
+        """Refreshes or logs in, minting fresh tokens.
+
+        The caller must hold self._lock.
+
+        Returns:
+            The freshly acquired tokens, persisted through the token
+            updater when one is configured.
+
+        Raises:
+            ZephyrAuthError: If Cognito rejects the login or the identity
+                exchange rejects the credentials terminally.
+            ZephyrTransportError: If a retryable infrastructure failure
+                interrupts the refresh, the login or the exchange.
+        """
         stored = self._tokens
         user: Cognito | None = None
         # Which username the tokens minted below belong to. The REFRESH

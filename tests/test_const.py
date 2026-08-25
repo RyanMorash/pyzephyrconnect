@@ -8,6 +8,7 @@ from pyzephyrconnect.const import DEFAULT_ENDPOINTS, Endpoints
 
 
 def test_aws_constants_are_pinned():
+    """Tests that the pinned AWS constants keep their values."""
     assert const.REGION == "us-west-2"
     assert const.USER_POOL == "us-west-2_McuoKpkna"
     assert const.IOT_ENDPOINT.endswith(".iot.us-west-2.amazonaws.com")
@@ -16,8 +17,11 @@ def test_aws_constants_are_pinned():
 
 
 def test_alarm_and_counter_fields_are_not_writable():
-    """The probe allowlist is the only thing preventing a write to a
-    read-only alarm field. Guard it with a test."""
+    """Tests that alarm and counter fields stay out of WRITABLE_FIELDS.
+
+    The probe allowlist is the only thing preventing a write to a
+    read-only alarm field. Guard it with a test.
+    """
     forbidden = {
         "alarmfan", "alarmfaultcode", "alarmgreasefilter", "faultCode",
         "fanwarning", "usegreasefiltertime", "usecharcoalfiltertime",
@@ -27,6 +31,7 @@ def test_alarm_and_counter_fields_are_not_writable():
 
 
 def test_writable_fields_cover_the_validation_sequence():
+    """Tests that WRITABLE_FIELDS covers the controls but not delaytimer."""
     for field in ("light", "power", "fan", "setdelaytimer",
                   "setcleanairfunction", "setrecirculating",
                   "resetgreasefilter"):
@@ -38,6 +43,7 @@ def test_writable_fields_cover_the_validation_sequence():
 
 
 def test_defaults_reproduce_the_current_constants():
+    """Tests that DEFAULT_ENDPOINTS reproduces the pinned production URLs."""
     e = DEFAULT_ENDPOINTS
     assert e.region == "us-west-2"
     assert e.iot_endpoint == "a1nqxu0hki9zw3-ats.iot.us-west-2.amazonaws.com"
@@ -47,13 +53,17 @@ def test_defaults_reproduce_the_current_constants():
 
 
 def test_overriding_the_base_moves_both_rest_urls():
-    """Developers must be able to specify API locations - a staging host, or
-    a vendor host change, should not require a release."""
+    """Tests that overriding device_api_base moves both REST URLs.
+
+    Developers must be able to specify API locations - a staging host, or
+    a vendor host change, should not require a release.
+    """
     e = Endpoints(device_api_base="https://staging.example.com/prod")
     assert e.device_api_list == "https://staging.example.com/prod/getowndevices"
     assert e.device_api_discover == "https://staging.example.com/prod/discoverdevice"
 
 
 def test_endpoints_are_frozen():
+    """Tests that Endpoints instances refuse attribute assignment."""
     with pytest.raises(dataclasses.FrozenInstanceError):
         DEFAULT_ENDPOINTS.region = "eu-west-1"

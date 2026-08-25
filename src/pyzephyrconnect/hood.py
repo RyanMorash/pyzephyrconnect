@@ -33,7 +33,17 @@ class Hood:
         poll: Callable[[str], Awaitable[HoodState]],
         prepare: Callable[[], Awaitable[None]],
     ) -> None:
-        """Bind the hood to the account-level callables ZephyrClient wires in."""
+        """Binds the hood to the account-level callables ZephyrClient wires in.
+
+        Args:
+            capabilities: What this hood can do, from the discoverdevice
+                endpoint.
+            shadow_factory: Builds a new ShadowClient bound to this hood;
+                invoked on every start and supervisor rebuild.
+            poll: Reads current state over HTTPS for a given thing name.
+            prepare: Attaches the IoT policy; awaited before each connect
+                (see _start).
+        """
         self._capabilities = capabilities
         self._shadow_factory = shadow_factory
         self._poll = poll
@@ -83,11 +93,17 @@ class Hood:
         return self._connected
 
     def handle_connection_change(self, connected: bool) -> None:
-        """Called by ShadowClient from the event loop."""
+        """Records the new connection state for this hood.
+
+        Called by ShadowClient from the event loop.
+
+        Args:
+            connected: Whether this hood's shadow connection is now up.
+        """
         self._connected = connected
 
     async def async_start(self) -> None:
-        """Open this hood's shadow connection and request current state."""
+        """Opens this hood's shadow connection and requests current state."""
         async with self._lock:
             self._should_run = True
             try:
@@ -112,7 +128,7 @@ class Hood:
                 raise
 
     async def async_stop(self) -> None:
-        """Close this hood's shadow connection and drop the intent to run.
+        """Closes this hood's shadow connection and drops the intent to run.
 
         With _should_run cleared the supervisor will not bring the hood
         back up. This does not retire the account-level supervisor itself -
@@ -123,7 +139,7 @@ class Hood:
             await self._stop()
 
     async def async_reconnect(self) -> None:
-        """Rebuild the socket after a credential refresh.
+        """Rebuilds the socket after a credential refresh.
 
         The presigned URL is derived from credentials that expire, so a
         refresh without a reconnect leaves a socket AWS IoT will drop.
@@ -141,16 +157,20 @@ class Hood:
             await self._start()
 
     def note_presigned_generation(self, generation: int) -> None:
-        """Record the credential generation this socket's URL is signed under.
+        """Records which credential generation signed this socket's URL.
 
         Called by the provider ZephyrClient hands to ShadowClient, which
         invokes it on every connect attempt - so a reconnect re-records the
         current generation and no caller has to remember to.
+
+        Args:
+            generation: The credentials provider's current generation
+                counter.
         """
         self._presigned_generation = generation
 
     def needs_represign(self, current: int) -> bool:
-        """True when the live socket is signed under stale credentials.
+        """Reports whether the live socket is signed under stale credentials.
 
         The supervisor's rebuild trigger. Keyed on the generation rather
         than on `credentials_expired`, because a REST call refreshing the
@@ -159,6 +179,13 @@ class Hood:
 
         Requires an actual socket: a generation mismatch must never bring up
         a hood that was never started or was deliberately stopped.
+
+        Args:
+            current: The credentials provider's current generation counter.
+
+        Returns:
+            True when this hood should run, has a live socket, and that
+            socket was presigned under a different generation.
         """
         return (
             self._should_run
@@ -167,7 +194,7 @@ class Hood:
         )
 
     async def async_ensure_running(self) -> None:
-        """Reopen the socket if the consumer wants this hood up and it is not.
+        """Reopens the socket if the consumer wants this hood up and it is not.
 
         The recovery path for a transient failure during a supervisor
         rebuild: _start raised, _shadow stayed None, and without this the
@@ -179,7 +206,7 @@ class Hood:
                 await self._start()
 
     async def _stop_for_supervisor(self) -> None:
-        """Close the socket without clearing consumer intent.
+        """Closes the socket without clearing consumer intent.
 
         The supervisor's terminal branch calls this: paho must stop
         hammering presigned URLs that can no longer be renewed, and the
@@ -194,7 +221,7 @@ class Hood:
     # reentrant, so async_reconnect cannot call the public methods.
 
     async def _start(self) -> None:
-        """Attach the IoT policy, connect the shadow, and request initial state.
+        """Attaches the IoT policy, connects the shadow, and requests state.
 
         Lock-free: callers hold self._lock. A no-op when a socket already
         exists; if the initial state request fails, the hood is put back in
@@ -240,7 +267,7 @@ class Hood:
             raise
 
     async def _stop(self) -> None:
-        """Tear down the shadow connection, if any.
+        """Tears down the shadow connection, if any.
 
         Lock-free: callers hold self._lock. Leaves consumer intent
         (_should_run) untouched - that distinction belongs to the callers.
@@ -261,13 +288,17 @@ class Hood:
             await shadow.disconnect()
 
     async def async_poll(self) -> HoodState:
-        """Read state over HTTPS. Used at setup and while push is down.
+        """Reads state over HTTPS; used at setup and while push is down.
 
         This is also how a terminal supervisor failure reaches the consumer:
         the supervisor stops on an auth or policy error and flips `connected`
         to False, which drives the consumer to poll, and this call re-raises
         the stored error so it can become a reauth prompt rather than a hood
         that quietly stops updating.
+
+        Returns:
+            The freshly polled state, after recording it and notifying
+            listeners.
         """
         state = await self._poll(self.thing_name)
         self.handle_state(state)
@@ -276,7 +307,13 @@ class Hood:
     # -- state ---------------------------------------------------------
 
     def handle_state(self, state: HoodState) -> None:
-        """Record new state and notify listeners. Called by ZephyrClient."""
+        """Records new state and notifies listeners.
+
+        Called by ZephyrClient.
+
+        Args:
+            state: The newly received hood state.
+        """
         self._state = state
         for callback in list(self._listeners):
             try:
@@ -286,11 +323,19 @@ class Hood:
                 _LOGGER.exception("state listener raised")
 
     def add_listener(self, callback: StateListener) -> Callable[[], None]:
-        """Register a state listener and return a callable that removes it."""
+        """Registers a state listener.
+
+        Args:
+            callback: Invoked with the new state on every update.
+
+        Returns:
+            A callable that removes the listener; safe to call more than
+            once.
+        """
         self._listeners.append(callback)
 
         def remove() -> None:
-            """Unregister the listener; safe to call more than once."""
+            """Unregisters the listener; safe to call more than once."""
             try:
                 self._listeners.remove(callback)
             except ValueError:
@@ -301,10 +346,20 @@ class Hood:
     # -- writes: ACTUATE HARDWARE --------------------------------------
 
     def _check_range(self, name: str, value: int, maximum: int | None) -> None:
-        """Raise ZephyrWriteError when value falls outside 0..maximum.
+        """Range-checks a value against 0..maximum for this hood.
 
         Negatives are always refused; the upper bound applies only when
         this hood advertises a positive maximum.
+
+        Args:
+            name: Field name used in the error message.
+            value: The candidate value to check.
+            maximum: The hood's advertised maximum, or None when it does
+                not advertise one.
+
+        Raises:
+            ZephyrWriteError: If value is negative, or exceeds a positive
+                advertised maximum.
         """
         if value < 0:
             raise ZephyrWriteError(f"{name} cannot be negative, got {value}")
@@ -317,29 +372,51 @@ class Hood:
             )
 
     async def async_set_fields(self, fields: dict[str, int]) -> None:
-        """WRITE PATH - actuates hardware. Diagnostic surface.
+        """Publishes arbitrary allowlisted fields - actuates hardware.
 
-        The typed async_set_* methods below are the normal way to write.
-        This exists for the probe CLI, which writes arbitrary allowlisted
-        fields in order to map semantics that are not yet established -
-        something a fixed method surface cannot express.
+        WRITE PATH and diagnostic surface. The typed async_set_* methods
+        below are the normal way to write. This exists for the probe CLI,
+        which writes arbitrary allowlisted fields in order to map
+        semantics that are not yet established - something a fixed method
+        surface cannot express.
 
         Publishes state.reported, not state.desired: that is what this
         device acts on. state.desired writes are accepted by AWS IoT and
         silently ignored by the hardware.
+
+        Args:
+            fields: Writable field names mapped to the integer values to
+                publish.
+
+        Raises:
+            ZephyrNotConnectedError: If there is no live socket - never
+                started, stopped, or a rebuild failed - or if the shadow
+                destroyed its own connection while refusing the write.
+            ZephyrWriteError: If fields is empty or names a field outside
+                const.WRITABLE_FIELDS.
         """
         async with self._lock:
             await self._publish(fields)
 
     async def _publish(self, fields: dict[str, int]) -> None:
-        """Validate fields and publish them to the shadow. Actuates hardware.
+        """Validates fields and publishes them to the shadow.
 
-        Lock-free: callers hold self._lock. Refuses empty payloads and
-        anything outside const.WRITABLE_FIELDS; destructive fields go
-        through with a warning. Raises ZephyrNotConnectedError when there
-        is no socket. If the shadow tears its own connection down while
-        refusing the write, the hood is reset to the no-socket shape the
-        supervisor rebuilds from.
+        Actuates hardware. Lock-free: callers hold self._lock. Refuses
+        empty payloads and anything outside const.WRITABLE_FIELDS;
+        destructive fields go through with a warning. If the shadow tears
+        its own connection down while refusing the write, the hood is
+        reset to the no-socket shape the supervisor rebuilds from.
+
+        Args:
+            fields: Writable field names mapped to the integer values to
+                publish.
+
+        Raises:
+            ZephyrNotConnectedError: If there is no socket, or if the
+                shadow destroyed its own connection while refusing the
+                write.
+            ZephyrWriteError: If fields is empty or names a field outside
+                const.WRITABLE_FIELDS.
         """
         if self._shadow is None:
             # No thing name in the message: it identifies a home, and
@@ -384,25 +461,63 @@ class Hood:
             raise
 
     async def async_set_power(self, on: bool) -> None:
-        """Switch hood power on or off."""
+        """Switches hood power on or off.
+
+        Args:
+            on: True to power the hood on; False to power it off.
+
+        Raises:
+            ZephyrNotConnectedError: If this hood is not connected - never
+                started, stopped, or a rebuild failed.
+        """
         await self.async_set_fields({"power": int(bool(on))})
 
     async def async_set_light(self, level: int) -> None:
-        """Set the light level, range-checked against this hood's maximum."""
+        """Sets the light level, range-checked against this hood's maximum.
+
+        Args:
+            level: Target light level, from 0 up to the hood's advertised
+                maximum.
+
+        Raises:
+            ZephyrNotConnectedError: If this hood is not connected - never
+                started, stopped, or a rebuild failed.
+            ZephyrWriteError: If level is negative or exceeds this hood's
+                advertised maximum.
+        """
         self._check_range("light", level, self._capabilities.max_light_level)
         await self.async_set_fields({"light": level})
 
     async def async_set_fan(self, speed: int) -> None:
-        """Set the fan speed, range-checked against this hood's maximum."""
+        """Sets the fan speed, range-checked against this hood's maximum.
+
+        Args:
+            speed: Target fan speed, from 0 up to the hood's advertised
+                maximum.
+
+        Raises:
+            ZephyrNotConnectedError: If this hood is not connected - never
+                started, stopped, or a rebuild failed.
+            ZephyrWriteError: If speed is negative or exceeds this hood's
+                advertised maximum.
+        """
         self._check_range("fan", speed, self._capabilities.max_fan_speed)
         await self.async_set_fields({"fan": speed})
 
     async def async_set_clean_air(self, on: bool) -> None:
-        """Switch the clean-air function on or off."""
+        """Switches the clean-air function on or off.
+
+        Args:
+            on: True to enable the clean-air function; False to disable it.
+
+        Raises:
+            ZephyrNotConnectedError: If this hood is not connected - never
+                started, stopped, or a rebuild failed.
+        """
         await self.async_set_fields({"setcleanairfunction": int(bool(on))})
 
     async def async_set_delay_timer(self, value: int) -> None:
-        """Arm the delay-off timer.
+        """Arms the delay-off timer.
 
         UNITS UNESTABLISHED: VALIDATION.md question 2 - whether this is
         seconds or minutes, and whether it snaps to presets, is exactly what
@@ -411,14 +526,41 @@ class Hood:
 
         The device derives and decrements `delaytimer` from this itself, so
         only `setdelaytimer` is written.
+
+        Args:
+            value: The timer value to write to `setdelaytimer`; units are
+                deliberately undocumented until the runbook establishes
+                them.
+
+        Raises:
+            ZephyrNotConnectedError: If this hood is not connected - never
+                started, stopped, or a rebuild failed.
+            ZephyrWriteError: If value is negative.
         """
         self._check_range("delay timer", value, None)
         await self.async_set_fields({"setdelaytimer": value})
 
     async def async_set_recirculating(self, on: bool) -> None:
-        """DESTRUCTIVE: changes filter accounting for this hood."""
+        """Switches recirculating mode on or off - DESTRUCTIVE.
+
+        Changes filter accounting for this hood.
+
+        Args:
+            on: True to enable recirculating mode; False to disable it.
+
+        Raises:
+            ZephyrNotConnectedError: If this hood is not connected - never
+                started, stopped, or a rebuild failed.
+        """
         await self.async_set_fields({"setrecirculating": int(bool(on))})
 
     async def async_reset_grease_filter(self) -> None:
-        """DESTRUCTIVE: zeroes a usage counter that cannot be reconstructed."""
+        """Resets the grease filter usage counter - DESTRUCTIVE.
+
+        Zeroes a usage counter that cannot be reconstructed.
+
+        Raises:
+            ZephyrNotConnectedError: If this hood is not connected - never
+                started, stopped, or a rebuild failed.
+        """
         await self.async_set_fields({"resetgreasefilter": 1})

@@ -22,6 +22,7 @@ TOKEN = "SESSIONTOKEN/with+special=chars"
 
 
 def _url(**kw) -> str:
+    """Build a presigned URL from the test constants with overrides."""
     params = dict(
         access_key=KEY, secret_key=SECRET, session_token=TOKEN,
         endpoint=ENDPOINT, region="us-west-2", now=NOW,
@@ -31,6 +32,7 @@ def _url(**kw) -> str:
 
 
 def test_url_shape():
+    """Tests that the URL is wss to the endpoint with path /mqtt."""
     url = _url()
     parts = urlsplit(url)
     assert parts.scheme == "wss"
@@ -39,6 +41,7 @@ def test_url_shape():
 
 
 def test_required_query_parameters_present():
+    """Tests that all required SigV4 query parameters are present."""
     q = parse_qs(urlsplit(_url()).query)
     assert q["X-Amz-Algorithm"] == ["AWS4-HMAC-SHA256"]
     assert q["X-Amz-SignedHeaders"] == ["host"]
@@ -51,9 +54,12 @@ def test_required_query_parameters_present():
 
 
 def test_security_token_is_excluded_from_the_signature():
-    """AWS IoT requires the session token be appended AFTER signing.
+    """Tests that the session token does not affect the signature.
+
+    AWS IoT requires the session token be appended AFTER signing.
     Including it in the canonical query string produces a signature the
-    broker rejects, and the failure looks like a generic handshake error."""
+    broker rejects, and the failure looks like a generic handshake error.
+    """
     with_token = parse_qs(urlsplit(_url()).query)["X-Amz-Signature"][0]
     without = parse_qs(
         urlsplit(_url(session_token=None)).query
@@ -62,6 +68,7 @@ def test_security_token_is_excluded_from_the_signature():
 
 
 def test_signature_is_deterministic():
+    """Tests that identical inputs produce identical URLs."""
     assert _url() == _url()
 
 
@@ -75,15 +82,19 @@ def test_signature_is_deterministic():
     ],
 )
 def test_signature_changes_when_any_signed_input_changes(override):
+    """Tests that changing any signed input changes the signature."""
     base = parse_qs(urlsplit(_url()).query)["X-Amz-Signature"][0]
     other = parse_qs(urlsplit(_url(**override)).query)["X-Amz-Signature"][0]
     assert base != other
 
 
 def test_canonical_request_matches_sigv4_specification():
-    """Hand-verifiable against the SigV4 spec: method, URI, sorted query,
+    """Tests that the canonical request matches the SigV4 layout.
+
+    Hand-verifiable against the SigV4 spec: method, URI, sorted query,
     canonical headers terminated by a newline, a blank line, signed headers,
-    then the SHA-256 of an empty payload."""
+    then the SHA-256 of an empty payload.
+    """
     cr = canonical_request(
         access_key=KEY, endpoint=ENDPOINT, region="us-west-2", now=NOW
     )
@@ -101,8 +112,11 @@ def test_canonical_request_matches_sigv4_specification():
 
 
 def test_query_string_is_sorted():
-    """SigV4 requires lexicographically sorted parameters. An unsorted
-    canonical query produces a valid-looking but rejected signature."""
+    """Tests that the canonical query string is sorted.
+
+    SigV4 requires lexicographically sorted parameters. An unsorted
+    canonical query produces a valid-looking but rejected signature.
+    """
     cr = canonical_request(
         access_key=KEY, endpoint=ENDPOINT, region="us-west-2", now=NOW
     )
@@ -112,7 +126,9 @@ def test_query_string_is_sorted():
 
 
 def test_signing_key_matches_the_published_aws_vector():
-    """AWS documents the intermediate signing key for this exact input in
+    """Tests that _signing_key matches the published AWS vector.
+
+    AWS documents the intermediate signing key for this exact input in
     "Examples of how to derive a signing key for Signature Version 4".
 
     There is no published vector for iotdevicegateway WebSocket presigning,

@@ -32,8 +32,21 @@ _REDACT = {"thingName", "SN", "MAC", "location"}
 
 
 def parse_assignment(text: str) -> tuple[str, int]:
-    """Parse `field=value`. Values are integers; the shadow has no others
-    among the writable fields."""
+    """Parses a `field=value` assignment from the command line.
+
+    Values are integers; the shadow has no others among the writable
+    fields.
+
+    Args:
+        text: The assignment as passed to --set.
+
+    Returns:
+        The field name and its integer value.
+
+    Raises:
+        ValueError: If `text` is not exactly one field=value pair, or
+            the value is not an integer.
+    """
     if text.count("=") != 1:
         raise ValueError(f"expected field=value, got {text!r}")
     field, _, raw = text.partition("=")
@@ -47,8 +60,21 @@ def parse_assignment(text: str) -> tuple[str, int]:
 
 
 def validate_write(field: str, *, confirmed: bool, forced: bool) -> None:
-    """Raise unless this write is permitted. Order matters: report an
-    unwritable field before complaining about missing flags."""
+    """Raises unless this write is permitted.
+
+    Order matters: report an unwritable field before complaining about
+    missing flags.
+
+    Args:
+        field: Shadow field the caller wants to write.
+        confirmed: Whether --confirm was passed.
+        forced: Whether --force was passed.
+
+    Raises:
+        PermissionError: If the field is not writable, if --confirm is
+            missing, or if the field is destructive and --force is
+            missing.
+    """
     if field not in const.WRITABLE_FIELDS:
         raise PermissionError(
             f"{field!r} is not writable. Allowed: "
@@ -69,7 +95,16 @@ def validate_write(field: str, *, confirmed: bool, forced: bool) -> None:
 def diff_states(
     before: dict[str, Any], after: dict[str, Any]
 ) -> dict[str, tuple[Any, Any]]:
-    """Changed keys as {key: (before, after)}. Absent-before reads as None."""
+    """Computes the changed keys between two shadow snapshots.
+
+    Args:
+        before: The earlier shadow snapshot.
+        after: The later shadow snapshot.
+
+    Returns:
+        Changed keys as {key: (before, after)}. An absent key reads as
+        None.
+    """
     return {
         key: (before.get(key), after.get(key))
         for key in set(before) | set(after)
@@ -78,12 +113,12 @@ def diff_states(
 
 
 def _redacted(payload: dict[str, Any]) -> dict[str, Any]:
-    """Copy `payload` with identifying values replaced by a placeholder."""
+    """Copies `payload` with identifying values replaced by a placeholder."""
     return {k: ("<redacted>" if k in _REDACT else v) for k, v in payload.items()}
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    """Build the probe CLI's argument parser."""
+    """Builds the probe CLI's argument parser."""
     parser = argparse.ArgumentParser(
         prog="pyzephyrconnect",
         description="Read and probe a Zephyr range hood's device shadow.",
@@ -104,13 +139,19 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 async def main(argv: list[str] | None = None) -> int:
-    """Run the probe CLI and return its exit code.
+    """Runs the probe CLI and returns its exit code.
 
     Any --set request is parsed and validated before credentials are read,
     so a refused write fails fast without prompting or touching the
     network. Credentials come from ZEPHYR_USER/ZEPHYR_PASS or interactive
-    prompts. Exit codes: 0 on success, 1 when the account has no devices,
-    2 for invalid or refused arguments.
+    prompts.
+
+    Args:
+        argv: Command-line arguments, or None to read sys.argv.
+
+    Returns:
+        0 on success, 1 when the account has no devices, 2 for invalid
+        or refused arguments.
     """
     args = _build_parser().parse_args(argv)
     logging.basicConfig(
@@ -181,7 +222,7 @@ async def main(argv: list[str] | None = None) -> int:
 
 
 def _report(changes: dict[str, tuple[Any, Any]]) -> None:
-    """Print the observed shadow diff, or a note that nothing changed."""
+    """Prints the observed shadow diff, or a note that nothing changed."""
     if not changes:
         print("\nno reported change. The device may have ignored the write, "
               "or it may not echo this field.")
@@ -192,7 +233,7 @@ def _report(changes: dict[str, tuple[Any, Any]]) -> None:
 
 
 def run() -> int:
-    """Run main() under asyncio, mapping ctrl-c to exit status 130."""
+    """Runs main() under asyncio, mapping ctrl-c to exit status 130."""
     try:
         return asyncio.run(main())
     except KeyboardInterrupt:

@@ -1,3 +1,5 @@
+"""Tests for pyzephyrconnect.probe."""
+
 import json
 from contextlib import nullcontext
 
@@ -17,11 +19,13 @@ from pyzephyrconnect.probe import (
     [("fan=3", ("fan", 3)), ("light=0", ("light", 0)), ("power=1", ("power", 1))],
 )
 def test_parse_assignment(text, expected):
+    """Tests that field=value parses into a (field, int) tuple."""
     assert parse_assignment(text) == expected
 
 
 @pytest.mark.parametrize("text", ["fan", "fan=", "=3", "fan=high", "fan=3=4"])
 def test_parse_assignment_rejects_malformed_input(text):
+    """Tests that a malformed assignment raises ValueError."""
     with pytest.raises(ValueError):
         parse_assignment(text)
 
@@ -33,21 +37,28 @@ def test_write_requires_confirmation():
 
 
 def test_readonly_fields_are_refused_even_with_confirm():
-    """Counters and alarms are device-reported. Writing them is meaningless
-    at best and confusing at worst."""
+    """Tests that device-reported fields are refused even when forced.
+
+    Counters and alarms are device-reported. Writing them is meaningless
+    at best and confusing at worst.
+    """
     for field in ("usegreasefiltertime", "alarmfan", "isOnline", "faultCode"):
         with pytest.raises(PermissionError, match="not writable"):
             validate_write(field, confirmed=True, forced=True)
 
 
 def test_unknown_fields_are_refused():
+    """Tests that an unknown field is refused as not writable."""
     with pytest.raises(PermissionError, match="not writable"):
         validate_write("madeUpField", confirmed=True, forced=True)
 
 
 def test_dangerous_fields_need_force_as_well_as_confirm():
-    """resetgreasefilter zeroes an unrecoverable counter; setrecirculating
-    changes filter accounting. --confirm alone must not be enough."""
+    """Tests that dangerous fields need --force on top of --confirm.
+
+    resetgreasefilter zeroes an unrecoverable counter; setrecirculating
+    changes filter accounting. --confirm alone must not be enough.
+    """
     for field in ("resetgreasefilter", "setrecirculating"):
         with pytest.raises(PermissionError, match="--force"):
             validate_write(field, confirmed=True, forced=False)
@@ -55,40 +66,50 @@ def test_dangerous_fields_need_force_as_well_as_confirm():
 
 @pytest.mark.parametrize("field", ["light", "fan", "power", "setdelaytimer"])
 def test_ordinary_writes_pass_with_confirm_alone(field):
+    """Tests that ordinary fields validate with --confirm alone."""
     with nullcontext():
         validate_write(field, confirmed=True, forced=False)
 
 
 @pytest.mark.parametrize("field", ["resetgreasefilter", "setrecirculating"])
 def test_dangerous_writes_pass_with_both_flags(field):
+    """Tests that dangerous fields validate with --confirm and --force."""
     with nullcontext():
         validate_write(field, confirmed=True, forced=True)
 
 
 def test_diff_reports_only_changed_keys():
+    """Tests that diff_states reports only keys whose values changed."""
     before = {"fan": 0, "light": 0, "usefantime": 1979}
     after = {"fan": 3, "light": 0, "usefantime": 1979}
     assert diff_states(before, after) == {"fan": (0, 3)}
 
 
 def test_diff_reports_newly_appearing_keys():
-    """A field the device only reports once set is exactly what the
-    validation sequence is hunting for."""
+    """Tests that a newly appearing key is reported as (None, value).
+
+    A field the device only reports once set is exactly what the
+    validation sequence is hunting for.
+    """
     assert diff_states({"fan": 0}, {"fan": 0, "newField": 7}) == {
         "newField": (None, 7)
     }
 
 
 def test_diff_of_identical_states_is_empty():
+    """Tests that diff_states of identical states is empty."""
     assert diff_states({"fan": 1}, {"fan": 1}) == {}
 
 
 def test_redacted_diff_never_exposes_an_identifier_that_starts_reporting():
-    """Every print path must run diff_states on redacted snapshots. When a
+    """Tests that a redacted key appearing anew shows the placeholder.
+
+    Every print path must run diff_states on redacted snapshots. When a
     _REDACT key (e.g. location) goes from absent to present - the shape
     diff_states can actually express as a "change" once both snapshots are
     pre-redacted - the reported old/new must be None / the redaction
-    placeholder, never the real coordinates."""
+    placeholder, never the real coordinates.
+    """
     before = {"fan": 1}
     after = {"location": "41.0,-106.0", "fan": 1}
 
@@ -99,11 +120,14 @@ def test_redacted_diff_never_exposes_an_identifier_that_starts_reporting():
 
 
 def test_redacted_diff_drops_a_changed_identifier_present_on_both_sides():
-    """When a _REDACT key is present before and after but its value
+    """Tests that a changed redacted key drops out of the diff.
+
+    When a _REDACT key is present before and after but its value
     changes, redacting before diffing collapses both sides to the same
     placeholder, so diff_states (equality-based) treats it as unchanged and
     the key drops out entirely - the strongest form of "never leaks",
-    since nothing about the key's real value is reported at all."""
+    since nothing about the key's real value is reported at all.
+    """
     before = {"location": "40.0,-105.0", "fan": 1}
     after = {"location": "41.0,-106.0", "fan": 1}
 
@@ -115,9 +139,12 @@ def test_redacted_diff_drops_a_changed_identifier_present_on_both_sides():
 
 
 def test_redacted_diff_still_shows_real_values_for_ordinary_keys():
-    """Redaction must not over-blank: a change in a non-_REDACT key still
+    """Tests that ordinary keys keep real values through redaction.
+
+    Redaction must not over-blank: a change in a non-_REDACT key still
     reports its real before/after values through the same redacted-diff
-    path used by watch mode and post-write reporting."""
+    path used by watch mode and post-write reporting.
+    """
     before = {"location": "40.0,-105.0", "fan": 0}
     after = {"location": "40.0,-105.0", "fan": 3}
 
@@ -128,12 +155,15 @@ def test_redacted_diff_still_shows_real_values_for_ordinary_keys():
 
 
 async def test_async_stop_runs_even_when_a_post_start_step_raises(monkeypatch):
-    """main() must disconnect the shadow client on every path once
+    """Tests that the shadow disconnects when a post-start step raises.
+
+    main() must disconnect the shadow client on every path once
     hood.async_start() has begun, not only on happy-path returns. Here
     shadow.request_state() (invoked inside Hood._start()) raises, so the
     failure surfaces before probe ever prints state - this also covers the
     harder case where the shadow was already registered on the hood before
-    the exception, not just a clean failure to start."""
+    the exception, not just a clean failure to start.
+    """
     from datetime import UTC, datetime, timedelta
     from pathlib import Path
     from unittest.mock import AsyncMock, MagicMock
@@ -196,10 +226,13 @@ async def test_async_stop_runs_even_when_a_post_start_step_raises(monkeypatch):
 
 
 async def test_thing_mismatch_exits_2_without_touching_the_device(monkeypatch):
-    """An operator typo in --thing must fail closed rather than silently
+    """Tests that a --thing mismatch exits 2 without device writes.
+
+    An operator typo in --thing must fail closed rather than silently
     fall back to actuating whichever hood happens to be first on the
     account - that fallback is exactly what let a `--thing` typo write to
-    the wrong physical hardware."""
+    the wrong physical hardware.
+    """
     from datetime import UTC, datetime, timedelta
     from pathlib import Path
     from unittest.mock import AsyncMock, MagicMock

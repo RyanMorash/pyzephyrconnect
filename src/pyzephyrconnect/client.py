@@ -55,7 +55,12 @@ class ZephyrClient:
     """One authenticated account and the hoods under it."""
 
     def __init__(self, auth: AbstractAuth) -> None:
-        """Bind the client to one auth object; no I/O until async_setup()."""
+        """Binds the client to one auth object; no I/O until async_setup().
+
+        Args:
+            auth: The auth implementation supplying tokens, AWS
+                credentials, and the endpoint set shared by REST and MQTT.
+        """
         self._auth = auth
         # Deliberately NOT a separate constructor argument. The auth object
         # already carries the endpoints and ZephyrApi reads them from there,
@@ -108,14 +113,24 @@ class ZephyrClient:
         token_updater: Callable[[ZephyrTokens], None] | None = None,
         endpoints: Endpoints = DEFAULT_ENDPOINTS,
     ) -> ZephyrClient:
-        """Convenience path: build a CredentialsAuth and a client from it.
+        """Builds a CredentialsAuth and a client from it, as a convenience.
 
         Supply `tokens` from a previous session and `token_updater` to
         persist new ones, and a restart will skip the SRP login entirely.
 
-        `token_updater` is called on the event loop, so it must not block.
-        Persisting usually means a storage write; a consumer that needs I/O
-        should schedule it rather than perform it inline.
+        Args:
+            username: The Zephyr account username.
+            password: The Zephyr account password.
+            session: The aiohttp session all HTTP traffic runs on.
+            tokens: Tokens persisted from a previous session, if any.
+            token_updater: Callback receiving fresh tokens to persist.
+                Called on the event loop, so it must not block. Persisting
+                usually means a storage write; a consumer that needs I/O
+                should schedule it rather than perform it inline.
+            endpoints: The cloud endpoints both REST and MQTT target.
+
+        Returns:
+            A ZephyrClient bound to the newly built CredentialsAuth.
         """
         return cls(
             CredentialsAuth(
@@ -130,21 +145,22 @@ class ZephyrClient:
 
     @property
     def identity_id(self) -> str:
-        """Cognito identity ID. Stable per account; a natural unique key.
+        """The Cognito identity ID; stable per account, a natural unique key.
 
         Reads the identity straight off the auth object. Do not reconstruct
         it by stripping the suffix off mqtt_client_id - that derives a source
         from its own derivative and returns a wrong value the day
         CLIENT_ID_SUFFIX changes.
 
-        Raises ZephyrAuthError before the first credential exchange, which
-        async_setup() performs.
+        Raises:
+            ZephyrAuthError: If read before the first credential exchange,
+                which async_setup() performs.
         """
         return self._auth.identity_id
 
     @property
     def connected(self) -> bool:
-        """True while at least one hood has a live push connection.
+        """Whether at least one hood has a live push connection.
 
         Derived from the hoods rather than a single latched flag, which with
         more than one hood reported whichever shadow changed state last.
@@ -152,7 +168,7 @@ class ZephyrClient:
         return any(hood.connected for hood in self._hoods.values())
 
     async def async_setup(self) -> list[Hood]:
-        """Authenticate and discover every hood on the account.
+        """Authenticates and discovers every hood on the account.
 
         Serialised whole. The one-run guard below is checked before the
         first await, so without the lock two concurrent calls both passed
@@ -160,6 +176,13 @@ class ZephyrClient:
         the lock the documented contract holds under concurrency as well:
         concurrent callers serialise; if the first succeeds the second
         raises already-run; if the first FAILS the second is a clean retry.
+
+        Returns:
+            Every discovered Hood, one per device on the account.
+
+        Raises:
+            ZephyrError: If async_setup() has already run on this client.
+                One client = one setup; build a new client to re-discover.
         """
         async with self._setup_lock:
             if self._setup_complete:
@@ -223,12 +246,17 @@ class ZephyrClient:
             return list(self._hoods.values())
 
     async def async_stop(self) -> None:
-        """Stop every hood and retire the supervisor.
+        """Stops every hood and retires the supervisor.
 
         Stopping a hood directly via `hood.async_stop()` does NOT retire the
         supervisor - only THIS method does. The supervisor is scoped to the
         client, not to any one hood, and keeps ticking (renewing credentials,
         reconnecting whatever is still `_should_run`) until this cancels it.
+
+        Raises:
+            asyncio.CancelledError: If the caller cancelled this shutdown.
+                The cancellation is honoured, but only after every hood is
+                torn down, so no hood is stranded and no paho thread leaks.
         """
         # Set BEFORE the supervisor block: a caller's cancellation can land
         # either at the supervisor await or inside the hood loop, and both
@@ -288,7 +316,7 @@ class ZephyrClient:
     # -- internals -----------------------------------------------------
 
     async def _ensure_policy(self) -> None:
-        """Attach the IoT policy. Idempotent, and latched after the first run.
+        """Attaches the IoT policy; idempotent, latched after the first run.
 
         Passed to each Hood as its `prepare` callable, so it always runs
         before the first connect and never on a reconnect.
@@ -298,6 +326,10 @@ class ZephyrClient:
         the lock, so a waiter that queued behind an attach for identity A
         latches whichever identity is current when its own attach runs -
         never A over a newer B.
+
+        Raises:
+            ZephyrPolicyError: If the policy could not be attached to the
+                current identity (raised by async_attach_policy).
         """
         async with self._policy_lock:
             # Re-read, not the value captured before the lock: an identity
@@ -311,15 +343,22 @@ class ZephyrClient:
             self._policy_attached_for = identity
 
     def _make_shadow(self, hood: Hood) -> ShadowClient:
-        """Build one hood's ShadowClient. Passed to Hood as its `shadow_factory`.
+        """Builds one hood's ShadowClient; its `shadow_factory` callable.
 
         Hood._start calls this on every (re)connect, so each rebuild gets a
         fresh paho client. Also (re)starts the refresh supervisor: the
         supervisor retires itself when no started hoods remain, and building
         a shadow is exactly the moment supervision is needed again.
+
+        Args:
+            hood: The hood the shadow client is built for; its thing name,
+                message handling, and connection callback are wired in.
+
+        Returns:
+            A fresh, unstarted ShadowClient for this hood.
         """
         async def provider() -> Credentials:
-            """Fetch presign credentials; note their generation on the hood."""
+            """Fetches presign credentials; notes generation on the hood."""
             # The PAIR, in one call. Fetching the credentials and then
             # reading credentials_generation as a separate statement puts an
             # await between them: a refresh landing in that window records
@@ -365,7 +404,7 @@ class ZephyrClient:
         return shadow
 
     def _ensure_supervisor(self) -> None:
-        """Start the refresh supervisor unless a live one is already running.
+        """Starts the refresh supervisor unless a live one already runs.
 
         A done task counts as not running: the supervisor retires itself
         when no started hoods remain and stops on terminal errors, so this
@@ -379,7 +418,7 @@ class ZephyrClient:
             self._supervisor = asyncio.create_task(self._supervise())
 
     async def _poll_state(self, thing_name: str) -> HoodState:
-        """Read one hood's state over HTTPS. Passed to Hood as its `poll`.
+        """Reads one hood's state over HTTPS; passed to Hood as its `poll`.
 
         Re-raises a stored terminal supervisor error before doing anything
         else, so an auth failure that stopped the supervisor becomes a
@@ -388,6 +427,18 @@ class ZephyrClient:
 
         Deliberately lock-free: this is the degraded-mode read path and must
         not queue behind a reconnect that may itself be stuck.
+
+        Args:
+            thing_name: The AWS IoT thing name of the hood to read.
+
+        Returns:
+            The hood's state built from a fresh discoverdevice response,
+            with the identifier fields filtered out.
+
+        Raises:
+            ZephyrError: A fresh instance of the stored terminal supervisor
+                error (ZephyrAuthError or ZephyrPolicyError), re-raised so
+                the failure surfaces on the consumer's next poll.
         """
         if self._supervisor_error is not None:
             # A fresh instance, not the stored object: re-raising the SAME
@@ -402,10 +453,16 @@ class ZephyrClient:
         return self._state_from_discover(payload)
 
     def _state_from_discover(self, payload: dict[str, Any]) -> HoodState:
-        """Build state from a discoverdevice payload, minus the identifiers.
+        """Builds state from a discoverdevice payload, minus the identifiers.
 
         See _PERSONAL_DATA_KEYS: this response is a flat dict mixing shadow
         fields with identifiers, and those must never enter HoodState.raw.
+
+        Args:
+            payload: The flat discoverdevice response dict.
+
+        Returns:
+            A HoodState whose raw dict excludes the identifier keys.
         """
         return HoodState.from_reported(
             {k: v for k, v in payload.items() if k not in _PERSONAL_DATA_KEYS}
@@ -414,7 +471,7 @@ class ZephyrClient:
     def _handle_message(
         self, hood: Hood, topic: str, payload: dict[str, Any]
     ) -> None:
-        """Fold an incoming shadow message into one hood's state.
+        """Folds an incoming shadow message into one hood's state.
 
         get/accepted carries a full document; update/accepted carries only
         what changed, so it is merged rather than replacing the cache.
@@ -431,6 +488,13 @@ class ZephyrClient:
         in addition to the try/except backstop. Diagnostics are limited to
         the topic's leaf segment (accepted/delta/rejected), which carries no
         identifiers.
+
+        Args:
+            hood: The hood whose cached state the message is folded into.
+            topic: The full MQTT topic the message arrived on; only its
+                leaf segment is ever logged.
+            payload: The decoded JSON payload, shape-checked here because
+                valid-but-wrong-shaped JSON still reaches this handler.
         """
         if not isinstance(payload, dict):
             _LOGGER.warning(
@@ -494,7 +558,7 @@ class ZephyrClient:
     # -- the refresh supervisor ----------------------------------------
 
     async def _supervise(self) -> None:
-        """Keep credentials fresh and sockets alive.
+        """Keeps credentials fresh and sockets alive.
 
         The presigned WebSocket URL embeds a SigV4 signature over
         credentials that expire in an hour. AWS IoT drops the session at
@@ -563,7 +627,7 @@ class ZephyrClient:
                 _LOGGER.exception("refresh cycle failed; retrying next tick")
 
     async def _refresh_once(self) -> bool:
-        """Renew credentials if inside the margin; keep wanted hoods up.
+        """Renews credentials if inside the margin; keeps wanted hoods up.
 
         Asks `credentials_expired` rather than calling
         async_get_credentials() first: that method renews as a side effect,
@@ -587,6 +651,16 @@ class ZephyrClient:
         on expiring signatures) nor be swallowed as handled - the hood keeps
         its consumer intent and async_ensure_running retries it every tick,
         which is also how a hood whose rebuild failed LAST cycle recovers.
+
+        Returns:
+            True if at least one hood's socket was rebuilt for a newer
+            credential generation, False otherwise.
+
+        Raises:
+            ZephyrPolicyError: Re-raised from a hood rebuild; terminal, so
+                deliberately not swallowed by the per-hood try/except.
+            ZephyrAuthError: Re-raised from a hood rebuild; terminal, same
+                handling as ZephyrPolicyError.
         """
         if self._auth.credentials_expired:
             _LOGGER.debug("credentials near expiry; refreshing")

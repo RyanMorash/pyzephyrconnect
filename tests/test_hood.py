@@ -1,3 +1,5 @@
+"""Tests for pyzephyrconnect.hood."""
+
 import asyncio
 import contextlib
 import json
@@ -20,16 +22,19 @@ THING = "aaaaaaaabbbbbbbbccccccccddddddddeeeeeeee"
 
 
 def _caps(**overrides) -> HoodCapabilities:
+    """Build HoodCapabilities from the discover fixture with overrides."""
     payload = json.loads((FIXTURES / "discoverdevice.json").read_text())
     payload.update(overrides)
     return HoodCapabilities.from_discover(payload)
 
 
 def _hood(caps=None):
+    """Build a Hood wired to a mocked shadow and return both."""
     shadow = MagicMock()
     shadow.connect = AsyncMock()
 
     async def _yielding_disconnect():
+        """Disconnect double that yields twice before returning."""
         # A real teardown awaits a thread join; yield twice so lock-release
         # races between _stop and _start become observable to tests.
         await asyncio.sleep(0)
@@ -48,6 +53,7 @@ def _hood(caps=None):
 
 
 async def test_typed_methods_publish_the_vendor_field_names():
+    """Tests that typed setters publish the vendor field names."""
     hood, shadow = _hood()
     await hood.async_start()
 
@@ -62,8 +68,11 @@ async def test_typed_methods_publish_the_vendor_field_names():
 
 
 async def test_out_of_range_is_refused_before_anything_is_published():
-    """The device advertises its own limits. Catching this locally beats a
-    silent no-op on hardware."""
+    """Tests that an out-of-range write is refused before publishing.
+
+    The device advertises its own limits. Catching this locally beats a
+    silent no-op on hardware.
+    """
     hood, shadow = _hood()
     await hood.async_start()
 
@@ -73,8 +82,11 @@ async def test_out_of_range_is_refused_before_anything_is_published():
 
 
 async def test_absent_capability_maximum_permits_the_write():
-    """Hoods we have never seen omit capability keys. A missing maximum must
-    not become a blanket refusal to write."""
+    """Tests that a missing capability maximum still permits the write.
+
+    Hoods we have never seen omit capability keys. A missing maximum must
+    not become a blanket refusal to write.
+    """
     hood, shadow = _hood(_caps(maxFanSpeed=None))
     await hood.async_start()
 
@@ -83,6 +95,7 @@ async def test_absent_capability_maximum_permits_the_write():
 
 
 async def test_negative_values_are_always_refused():
+    """Tests that a negative value raises ZephyrWriteError."""
     hood, _ = _hood()
     await hood.async_start()
     with pytest.raises(ZephyrWriteError):
@@ -90,8 +103,11 @@ async def test_negative_values_are_always_refused():
 
 
 async def test_raw_writes_enforce_the_allowlist():
-    """The allowlist used to live only in the probe CLI, so any other caller
-    could write anything."""
+    """Tests that raw field writes enforce the writable allowlist.
+
+    The allowlist used to live only in the probe CLI, so any other caller
+    could write anything.
+    """
     hood, shadow = _hood()
     await hood.async_start()
 
@@ -108,9 +124,12 @@ async def test_writing_before_start_raises_a_library_error():
 
 
 async def test_policy_is_attached_before_the_socket_opens():
-    """The single most dangerous failure in this protocol: without the policy,
+    """Tests that the policy attach completes before connect.
+
+    The single most dangerous failure in this protocol: without the policy,
     connect, subscribe and publish all succeed and every message is silently
-    dropped, with no exception and no log line (PROTOCOL.md section 3.3)."""
+    dropped, with no exception and no log line (PROTOCOL.md section 3.3).
+    """
     order = []
     shadow = MagicMock()
     shadow.connect = AsyncMock(side_effect=lambda: order.append("connect"))
@@ -127,11 +146,15 @@ async def test_policy_is_attached_before_the_socket_opens():
 
 
 async def test_starting_twice_does_not_orphan_a_client():
-    """The first paho client keeps its network thread running, so overwriting
-    it leaks a thread and a socket per call."""
+    """Tests that a second start does not build a second client.
+
+    The first paho client keeps its network thread running, so overwriting
+    it leaks a thread and a socket per call.
+    """
     made = []
 
     def factory(_h):
+        """Shadow factory that records every client it builds."""
         shadow = MagicMock()
         shadow.connect = AsyncMock()
         shadow.request_state = AsyncMock()
@@ -146,12 +169,16 @@ async def test_starting_twice_does_not_orphan_a_client():
 
 
 async def test_ensure_running_recovers_a_hood_whose_rebuild_failed():
-    """A transient connect failure during a supervisor rebuild leaves the
+    """Tests that ensure_running revives a hood after a failed rebuild.
+
+    A transient connect failure during a supervisor rebuild leaves the
     hood with no socket but with consumer intent intact. It must come back
-    on a later tick, not stay dead until a reload."""
+    on a later tick, not stay dead until a reload.
+    """
     made = []
 
     def factory(_h):
+        """Shadow factory whose second client fails to connect."""
         shadow = MagicMock()
         shadow.connect = AsyncMock(
             side_effect=ZephyrTransportError("boom") if len(made) == 1 else None
@@ -173,9 +200,12 @@ async def test_ensure_running_recovers_a_hood_whose_rebuild_failed():
 
 
 async def test_reconnect_does_not_start_a_hood_that_was_never_started():
-    """The supervisor reconnects every hood it knows about. Discovering two
+    """Tests that reconnect skips a hood that was never started.
+
+    The supervisor reconnects every hood it knows about. Discovering two
     hoods and starting one must not mean the other quietly comes up on the
-    next credential refresh."""
+    next credential refresh.
+    """
     hood, shadow = _hood()
     await hood.async_reconnect()
 
@@ -183,9 +213,12 @@ async def test_reconnect_does_not_start_a_hood_that_was_never_started():
 
 
 async def test_a_write_during_a_reconnect_waits_rather_than_failing():
-    """The supervisor rebuilds the socket about every 50 minutes. A write
+    """Tests that a write during a reconnect waits on the lock.
+
+    The supervisor rebuilds the socket about every 50 minutes. A write
     landing in that window is not a disconnected hood, and must not surface
-    to the user as a failed command."""
+    to the user as a failed command.
+    """
     import asyncio
 
     hood, shadow = _hood()
@@ -194,6 +227,7 @@ async def test_a_write_during_a_reconnect_waits_rather_than_failing():
     release = asyncio.Event()
 
     async def slow_connect():
+        """Connect double that blocks until the test releases it."""
         await release.wait()
 
     shadow.connect = AsyncMock(side_effect=slow_connect)
@@ -211,6 +245,7 @@ async def test_a_write_during_a_reconnect_waits_rather_than_failing():
 
 
 async def test_listeners_are_notified_and_removable():
+    """Tests that listeners get states and stop after removal."""
     hood, _ = _hood()
     seen = []
     remove = hood.add_listener(seen.append)
@@ -222,12 +257,16 @@ async def test_listeners_are_notified_and_removable():
 
 
 async def test_a_raising_listener_does_not_block_the_others(caplog):
-    """One bad consumer must not stop the others from updating, and the
-    failure must still be visible somewhere."""
+    """Tests that a raising listener is logged and others still run.
+
+    One bad consumer must not stop the others from updating, and the
+    failure must still be visible somewhere.
+    """
     hood, _ = _hood()
     seen = []
 
     def bad(_state):
+        """Listener that always raises RuntimeError."""
         raise RuntimeError("boom")
 
     hood.add_listener(bad)
@@ -242,10 +281,13 @@ async def test_a_raising_listener_does_not_block_the_others(caplog):
 
 
 async def test_not_connected_message_omits_the_thing_name():
-    """No thing name in the message: it identifies a home, and exception
+    """Tests that the not-connected message omits the thing name.
+
+    No thing name in the message: it identifies a home, and exception
     text ends up in logs users paste publicly. The wording must also cover
     every way a hood can end up without a shadow, not just 'never
-    started'."""
+    started'.
+    """
     hood, _ = _hood()
     with pytest.raises(ZephyrNotConnectedError, match="not connected") as excinfo:
         await hood.async_set_light(1)
@@ -254,9 +296,12 @@ async def test_not_connected_message_omits_the_thing_name():
 
 
 async def test_destructive_write_is_pinned_and_logged(caplog):
-    """setrecirculating changes filter accounting for the hood. Pin both the
+    """Tests that the recirculating write payload and warning are pinned.
+
+    setrecirculating changes filter accounting for the hood. Pin both the
     exact published payload and the warning so a future refactor cannot
-    silently drop either."""
+    silently drop either.
+    """
     hood, shadow = _hood()
     await hood.async_start()
 
@@ -269,17 +314,21 @@ async def test_destructive_write_is_pinned_and_logged(caplog):
 
 
 async def test_intent_survives_a_failed_supervisor_rebuild():
-    """A rebuild NOBODY asked for must not demote consumer intent back to
+    """Tests that consumer intent survives a failed supervisor rebuild.
+
+    A rebuild NOBODY asked for must not demote consumer intent back to
     'never started' - async_ensure_running is the sole recovery path and it
     keys off _should_run, not off having a socket.
 
     The supervisor-internal paths (async_reconnect, async_ensure_running,
     _stop_for_supervisor) go straight to _start/_stop and keep this
     semantics. Only the consumer-facing async_start rolls intent back - see
-    test_a_failed_consumer_start_rolls_back_intent."""
+    test_a_failed_consumer_start_rolls_back_intent.
+    """
     made = []
 
     def factory(_h):
+        """Shadow factory whose second client fails to connect."""
         shadow = MagicMock()
         shadow.connect = AsyncMock(
             side_effect=ZephyrTransportError("boom") if len(made) == 1 else None
@@ -306,7 +355,9 @@ async def test_intent_survives_a_failed_supervisor_rebuild():
 
 
 async def test_a_failed_consumer_start_rolls_back_intent():
-    """A start the CONSUMER asked for that raises must leave the hood
+    """Tests that a failed consumer start rolls back consumer intent.
+
+    A start the CONSUMER asked for that raises must leave the hood
     genuinely stopped.
 
     Home Assistant's ConfigEntryNotReady pattern abandons the client whose
@@ -314,10 +365,12 @@ async def test_a_failed_consumer_start_rolls_back_intent():
     would let this client's supervisor bring the abandoned hood up in the
     background, and its per-connection MQTT client IDs are identical to the
     replacement client's - AWS IoT treats two live connections sharing an ID
-    as one session and evicts the working one for the zombie."""
+    as one session and evicts the working one for the zombie.
+    """
     made = []
 
     def factory(_h):
+        """Shadow factory whose every client fails to connect."""
         shadow = MagicMock()
         shadow.connect = AsyncMock(side_effect=ZephyrTransportError("boom"))
         shadow.request_state = AsyncMock()
@@ -339,7 +392,9 @@ async def test_a_failed_consumer_start_rolls_back_intent():
 
 
 async def test_a_failed_state_request_leaves_the_hood_recoverable():
-    """request_state() raising AFTER _shadow was set produced the worst
+    """Tests that a failed state request leaves the hood recoverable.
+
+    request_state() raising AFTER _shadow was set produced the worst
     possible shape: the hood LOOKED healthy - a later start returns early and
     async_ensure_running declines to rebuild while _shadow is not None - but
     the state GET never happened and nothing ever retried it. _start must put
@@ -350,10 +405,12 @@ async def test_a_failed_state_request_leaves_the_hood_recoverable():
     Driven through the supervisor's rebuild here, which is where recovery
     has to work: a consumer-facing async_start that raises rolls intent back
     on purpose (see test_a_failed_consumer_start_rolls_back_intent), so
-    there is deliberately nothing left to recover on that path."""
+    there is deliberately nothing left to recover on that path.
+    """
     made = []
 
     def factory(_h):
+        """Shadow factory whose second client fails its state request."""
         shadow = MagicMock()
         shadow.connect = AsyncMock()
         shadow.disconnect = AsyncMock()
@@ -380,6 +437,7 @@ async def test_a_failed_state_request_leaves_the_hood_recoverable():
 
 
 async def test_async_stop_clears_intent_so_ensure_running_stays_off():
+    """Tests that async_stop clears intent so no rebuild happens."""
     hood, shadow = _hood()
     await hood.async_start()
     await hood.async_stop()
@@ -393,6 +451,7 @@ async def test_async_stop_clears_intent_so_ensure_running_stays_off():
 
 
 async def test_empty_fields_payload_is_refused():
+    """Tests that an empty fields payload raises without publishing."""
     hood, shadow = _hood()
     await hood.async_start()
 
@@ -403,6 +462,7 @@ async def test_empty_fields_payload_is_refused():
 
 
 async def test_poll_records_state_and_notifies_listeners():
+    """Tests that async_poll stores state and notifies listeners."""
     hood, _ = _hood()
     seen = []
     hood.add_listener(seen.append)
@@ -414,18 +474,22 @@ async def test_poll_records_state_and_notifies_listeners():
 
 
 async def test_stop_swaps_the_shadow_reference_before_the_await():
-    """Regression for the cancellation-landing-on-await bug: _shadow must
+    """Tests that _stop clears _shadow before awaiting the teardown.
+
+    Regression for the cancellation-landing-on-await bug: _shadow must
     already be None the instant the teardown await starts, not after it
     returns. Otherwise a cancellation there leaves _shadow pointing at a
     torn-down client while _should_run is still True, and
     async_ensure_running declines to rebuild forever - a permanently dark
-    hood."""
+    hood.
+    """
     hood, shadow = _hood()
     await hood.async_start()
 
     never_set = asyncio.Event()
 
     async def hang() -> None:
+        """Disconnect double that blocks forever."""
         await never_set.wait()
 
     shadow.disconnect = AsyncMock(side_effect=hang)
@@ -447,10 +511,13 @@ async def test_stop_swaps_the_shadow_reference_before_the_await():
 
 
 async def test_connected_flag_clears_before_a_failed_teardown_propagates():
-    """A disconnect() that raises must not leave the hood reporting
+    """Tests that connected clears even when disconnect raises.
+
+    A disconnect() that raises must not leave the hood reporting
     connected=True with _shadow already torn down - that would mislead the
     derived client.connected and availability logic. The flag joins the
-    swap on the clear-before-await side of _stop for exactly this reason."""
+    swap on the clear-before-await side of _stop for exactly this reason.
+    """
     hood, shadow = _hood()
     await hood.async_start()
     hood.handle_connection_change(True)
@@ -464,6 +531,7 @@ async def test_connected_flag_clears_before_a_failed_teardown_propagates():
 
 
 async def test_typed_power_and_delay_timer_publish_shapes():
+    """Tests that power and delay-timer setters publish vendor shapes."""
     hood, shadow = _hood()
     await hood.async_start()
 
@@ -475,15 +543,19 @@ async def test_typed_power_and_delay_timer_publish_shapes():
 
 
 async def test_a_write_refused_by_a_dead_socket_leaves_a_recoverable_hood():
-    """ShadowClient tears its own connection down when paho refuses a write
+    """Tests that a dead-socket write refusal leaves a recoverable hood.
+
+    ShadowClient tears its own connection down when paho refuses a write
     it has already queued - the only way to stop that write actuating the
     hood on paho's next reconnect. The hood must not keep pointing at the
     hollowed-out client afterwards: async_ensure_running declines to rebuild
     while _shadow is set, and needs_represign sees a generation that still
-    matches, so push would stay dark until the next credential rotation."""
+    matches, so push would stay dark until the next credential rotation.
+    """
     made = []
 
     def factory(_h):
+        """Shadow factory whose first client refuses writes as dead."""
         shadow = MagicMock()
         shadow.connect = AsyncMock()
         shadow.disconnect = AsyncMock()
