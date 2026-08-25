@@ -30,6 +30,17 @@ class Endpoints:
     overridable so the library can be pointed at a staging host, exercised
     in tests without monkeypatching module globals, and survive a vendor
     host change without needing a release.
+
+    Attributes:
+        region: AWS region hosting the Cognito pools.
+        user_pool: Cognito user pool ID.
+        client_id: Cognito app client ID.
+        client_secret: Cognito app client secret. Already public (it
+            ships in the iOS bundle), but excluded from repr so it stays
+            out of logs and tracebacks.
+        identity_pool: Cognito identity pool ID.
+        iot_endpoint: AWS IoT Core (ATS) endpoint hostname.
+        device_api_base: Base URL of the vendor device REST API.
     """
 
     region: str = REGION
@@ -49,10 +60,12 @@ class Endpoints:
 
     @property
     def device_api_list(self) -> str:
+        """URL of the getowndevices endpoint."""
         return f"{self.device_api_base}/getowndevices"
 
     @property
     def device_api_discover(self) -> str:
+        """URL of the discoverdevice endpoint."""
         return f"{self.device_api_base}/discoverdevice"
 
 

@@ -36,7 +36,7 @@ CERT_BUNDLE_EXPIRY = "2030"
 
 
 def build_ssl_context() -> ssl.SSLContext:
-    """System trust store, plus the bundled TWCA CAs as extra anchors.
+    """Builds an SSL context of system trust plus the bundled TWCA CAs.
 
     The vendor's HTTPS host presents a chain whose intermediate omits the
     Subject Key Identifier extension, which OpenSSL 3.x rejects under normal
@@ -51,6 +51,10 @@ def build_ssl_context() -> ssl.SSLContext:
     mainstream CA. Adding the TWCA anchors alongside the system store fixes
     the SKI defect for this vendor while leaving normal trust intact
     everywhere else, and survives a future CA rotation.
+
+    Returns:
+        A default SSL context with the bundled TWCA CAs loaded as extra
+        trust anchors alongside the system store.
     """
     ctx = ssl.create_default_context()
     with resources.as_file(
@@ -76,6 +80,15 @@ class ZephyrApi:
         *,
         ssl_context: ssl.SSLContext | None = None,
     ) -> None:
+        """Stores the auth object and, optionally, a pre-built SSL context.
+
+        Args:
+            auth: Auth implementation that owns the aiohttp session and
+                supplies the Cognito tokens and endpoint set.
+            ssl_context: Pre-built SSL context to use for requests. When
+                omitted, one is built lazily in a worker thread on first
+                use.
+        """
         self._auth = auth
         # Deliberately NOT built here. build_ssl_context() calls
         # SSLContext.load_default_certs and load_verify_locations, both of
@@ -85,12 +98,18 @@ class ZephyrApi:
         self._ssl = ssl_context
 
     async def _get_ssl(self) -> ssl.SSLContext:
-        """The SSL context, built off the event loop on first use."""
+        """Returns the SSL context, built off the event loop on first use."""
         if self._ssl is None:
             self._ssl = await asyncio.to_thread(build_ssl_context)
         return self._ssl
 
     def _headers(self, id_token: str) -> dict[str, str]:
+        """Builds the JSON request headers for one device-API call.
+
+        Args:
+            id_token: Cognito ID token, placed verbatim in the
+                Authorization header.
+        """
         # Bare token, no "Bearer " prefix - the API rejects the prefixed form.
         return {
             "Authorization": id_token,
@@ -99,6 +118,29 @@ class ZephyrApi:
         }
 
     async def _post(self, url: str, **kwargs: Any) -> Any:
+        """POSTs to the given URL and returns the parsed JSON body as a dict.
+
+        Asks the auth object for tokens on every call and translates each
+        failure into the ZephyrError hierarchy.
+
+        Args:
+            url: Endpoint URL to POST to.
+            **kwargs: Passed through to the underlying aiohttp
+                session.post call (e.g. a json= or data= payload).
+
+        Raises:
+            ZephyrAuthError: The endpoint returned 403 - the ID token is
+                rejected or expired.
+            ZephyrError: The endpoint returned any other HTTP error
+                status.
+            ZephyrCertificateError: TLS verification failed against both
+                the system CA store and the bundled TWCA anchors.
+            ZephyrTransportError: Transport noise (DNS failure, connection
+                reset, timeout) or an unparseable body, such as a vendor
+                maintenance page or WAF interstitial - transient failures,
+                not data-shape bugs the caller should treat as fatal.
+            ZephyrDataError: The body parsed but was not a dict.
+        """
         tokens = await self._auth.async_get_tokens()
         ssl_context = await self._get_ssl()
         try:
@@ -153,10 +195,22 @@ class ZephyrApi:
             ) from err
 
     async def get_own_devices(self) -> list[dict[str, Any]]:
-        """Return the caller's devices.
+        """Returns the caller's devices.
 
         Note: the response includes precise device coordinates. Treat the
         payload as personal data and never log it.
+
+        Returns:
+            The device dicts from the getowndevices response, or an empty
+            list when the payload carries none or has an unexpected shape.
+
+        Raises:
+            ZephyrAuthError: The API rejected the ID token.
+            ZephyrCertificateError: TLS verification failed.
+            ZephyrTransportError: A network failure, timeout, or
+                unparseable response body.
+            ZephyrDataError: The response body was not a JSON object.
+            ZephyrError: Any other HTTP error status.
         """
         # Empty body, not "{}" - matches the captured request exactly.
         payload = await self._post(self._auth.endpoints.device_api_list, data=b"")
@@ -170,7 +224,23 @@ class ZephyrApi:
         return devices
 
     async def discover_device(self, thing_name: str) -> dict[str, Any]:
-        """Return capabilities merged with current state for one thing."""
+        """Returns capabilities merged with current state for one thing.
+
+        Args:
+            thing_name: AWS IoT thing name identifying the device.
+
+        Returns:
+            The discoverdevice response dict: the device's declared
+            capabilities merged with its current reported state.
+
+        Raises:
+            ZephyrAuthError: The API rejected the ID token.
+            ZephyrCertificateError: TLS verification failed.
+            ZephyrTransportError: A network failure, timeout, or
+                unparseable response body.
+            ZephyrDataError: The response body was not a JSON object.
+            ZephyrError: Any other HTTP error status.
+        """
         return await self._post(
             self._auth.endpoints.device_api_discover,
             json={"thingName": thing_name},

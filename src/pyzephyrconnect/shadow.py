@@ -48,18 +48,26 @@ class ShadowTopics:
     """Classic shadow topic names for one thing."""
 
     def __init__(self, thing_name: str) -> None:
+        """Anchors every topic under $aws/things/<thing_name>/shadow.
+
+        Args:
+            thing_name: The AWS IoT thing name whose shadow to address.
+        """
         self._base = f"$aws/things/{thing_name}/shadow"
 
     @property
     def get(self) -> str:
+        """The read-request topic. The reply arrives on get/accepted."""
         return f"{self._base}/get"
 
     @property
     def get_accepted(self) -> str:
+        """Where the full shadow document arrives after a get."""
         return f"{self._base}/get/accepted"
 
     @property
     def get_rejected(self) -> str:
+        """Errors for a get; 404 means no shadow document exists yet."""
         return f"{self._base}/get/rejected"
 
     @property
@@ -69,22 +77,35 @@ class ShadowTopics:
 
     @property
     def update_accepted(self) -> str:
+        """Confirmed state changes; carries only the fields that changed."""
         return f"{self._base}/update/accepted"
 
     @property
     def update_rejected(self) -> str:
+        """Where the broker reports rejected writes."""
         return f"{self._base}/update/rejected"
 
     @property
     def update_delta(self) -> str:
+        """Desired-vs-reported deltas.
+
+        Subscribed but never merged into cached state: nothing in this
+        system writes state.desired (see publish_state), so a delta here
+        is never device-authored.
+        """
         return f"{self._base}/update/delta"
 
     @property
     def update_documents(self) -> str:
+        """Before/after document pairs for each accepted update."""
         return f"{self._base}/update/documents"
 
     @property
     def subscriptions(self) -> tuple[str, ...]:
+        """Every topic to subscribe to.
+
+        The response topics only, not the publish topics.
+        """
         return (
             self.get_accepted,
             self.get_rejected,
@@ -96,7 +117,12 @@ class ShadowTopics:
 
 
 class ShadowClient:
-    """One MQTT connection to one thing's shadow."""
+    """One MQTT connection to one thing's shadow.
+
+    Attributes:
+        topics: The ShadowTopics naming every shadow topic for this
+            thing.
+    """
 
     def __init__(
         self,
@@ -108,6 +134,19 @@ class ShadowClient:
         *,
         endpoints: Endpoints = DEFAULT_ENDPOINTS,
     ) -> None:
+        """Stores the wiring; no network I/O happens until connect().
+
+        Args:
+            thing_name: The AWS IoT thing name whose shadow to speak to.
+            client_id: The MQTT client ID presented to AWS IoT.
+            on_message: Called on the event loop with the topic and the
+                decoded payload of each incoming shadow message.
+            on_connection_change: Called on the event loop with True when
+                the session comes up and False when it drops.
+            credentials_provider: Awaited for fresh AWS credentials on
+                every connect attempt; see connect() for why.
+            endpoints: The AWS region and hosts to connect to.
+        """
         self.topics = ShadowTopics(thing_name)
         self._client_id = client_id
         self._on_message_cb = on_message
@@ -124,6 +163,16 @@ class ShadowClient:
     # -- paho callbacks (background thread) ---------------------------
 
     def _dispatch(self, fn: Callable[..., None], *args: Any) -> None:
+        """Marshals a call from paho's network thread onto the event loop.
+
+        Dropping the call when the loop is missing or closed is
+        deliberate - see the module docstring for why nothing on paho's
+        thread may raise.
+
+        Args:
+            fn: The callable to run on the event loop.
+            *args: Positional arguments passed through to fn.
+        """
         if self._loop is None or self._loop.is_closed():
             return
         try:
@@ -135,6 +184,23 @@ class ShadowClient:
             return
 
     def _on_connect(self, client, userdata, flags, reason_code, properties=None):
+        """Subscribes to the shadow topics and refreshes state on (re)connect.
+
+        Runs on paho's network thread, on the initial CONNACK and again on
+        paho's own auto-reconnects. A refused CONNACK only logs: the
+        readiness events stay unset, so a connect() waiting on them times
+        out with ZephyrTransportError instead of half-succeeding.
+
+        Args:
+            client: The paho client that fired the callback. Used instead
+                of self._client, which is still unset during the first
+                handshake.
+            userdata: Unused paho callback argument.
+            flags: Unused CONNACK flags.
+            reason_code: The CONNACK result; nonzero means the broker
+                refused the connection.
+            properties: Unused MQTT v5 properties.
+        """
         if reason_code != 0:
             _LOGGER.warning("MQTT connect refused: %s", reason_code)
             return
@@ -166,6 +232,15 @@ class ShadowClient:
         self._dispatch(self._on_connection_cb, True)
 
     def _reset_subscription_state(self, expected: int) -> None:
+        """Arms subscription tracking for a batch of expected SUBACKs.
+
+        Runs on the event loop, dispatched from _on_connect. Zero expected
+        topics counts as already subscribed.
+
+        Args:
+            expected: How many SUBACKs must be granted before the
+                subscribed event sets.
+        """
         self._pending_subscribes = expected
         self._subscribe_error = None
         self._subscribed.clear()
@@ -173,11 +248,15 @@ class ShadowClient:
             self._subscribed.set()
 
     def _on_disconnect(self, client, userdata, flags, reason_code, properties=None):
+        """Marks the session down and notifies the owner.
+
+        Runs on paho's network thread.
+        """
         self._dispatch(self._connected.clear)
         self._dispatch(self._on_connection_cb, False)
 
     def _on_subscribe(self, client, userdata, mid, reason_code_list, properties):
-        """Record the GRANTED QoS for connect() to observe.
+        """Records the GRANTED QoS for connect() to observe.
 
         paho resolves the subscribe even when the broker refused the topic.
         Granted QoS 128 means denied, and the cause is almost always a
@@ -189,11 +268,29 @@ class ShadowClient:
         them, so an exception here silently kills the network thread. The
         result is dispatched onto the event loop instead, where connect()
         can observe and raise it safely.
+
+        Args:
+            client: Unused paho callback argument.
+            userdata: Unused paho callback argument.
+            mid: Unused message ID of the SUBSCRIBE being acknowledged.
+            reason_code_list: One granted-QoS code per requested topic; a
+                failure code means the broker denied that subscription.
+            properties: Unused MQTT v5 properties.
         """
         denied = any(getattr(code, "is_failure", False) for code in reason_code_list)
         self._dispatch(self._record_subscribe_result, denied)
 
     def _record_subscribe_result(self, denied: bool) -> None:
+        """Folds one SUBACK result into the readiness state.
+
+        Runs on the event loop, dispatched from _on_subscribe. A denial
+        records a ZephyrPolicyError and sets the subscribed event early,
+        so connect() wakes and raises it instead of waiting out its
+        timeout.
+
+        Args:
+            denied: Whether the broker refused any topic in the SUBACK.
+        """
         if denied:
             if self._subscribe_error is None:
                 self._subscribe_error = ZephyrPolicyError(
@@ -209,6 +306,18 @@ class ShadowClient:
             self._subscribed.set()
 
     def _on_message(self, client, userdata, message):
+        """Decodes an incoming publish and hands it to the owner's callback.
+
+        Runs on paho's network thread; the callback itself is dispatched
+        onto the event loop. Malformed JSON is dropped with a warning that
+        names only the topic leaf - the full topic embeds the thing name,
+        which is personal data.
+
+        Args:
+            client: Unused paho callback argument.
+            userdata: Unused paho callback argument.
+            message: The incoming MQTT message; its payload must be JSON.
+        """
         try:
             payload = json.loads(message.payload)
         except (ValueError, TypeError):
@@ -224,12 +333,23 @@ class ShadowClient:
     # -- async surface -------------------------------------------------
 
     async def connect(self, timeout: float = 15.0) -> None:
-        """Open the WebSocket and subscribe to the shadow topics.
+        """Opens the WebSocket and subscribes to the shadow topics.
 
         Credentials are fetched from the provider on every attempt rather
         than captured once: the presigned URL embeds a SigV4 signature that
         expires with them, so a reconnect must re-presign or it will retry a
         URL AWS IoT has already stopped accepting.
+
+        Args:
+            timeout: Seconds to wait for the CONNACK, and again for the
+                shadow subscriptions, before giving up.
+
+        Raises:
+            ZephyrTransportError: The connection or the shadow
+                subscriptions did not complete within the timeout.
+            ZephyrPolicyError: AWS IoT denied a shadow subscription -
+                almost always a missing IoT policy on the Cognito
+                identity.
         """
         self._loop = asyncio.get_running_loop()
         if self._client is not None:
@@ -319,6 +439,14 @@ class ShadowClient:
             raise
 
     async def disconnect(self) -> None:
+        """Tears down the paho client and joins its network thread.
+
+        A no-op with no client. The reference and readiness events are
+        cleared before the first await, so a newer connection completing
+        during a slow teardown is not clobbered. The join runs in a worker
+        thread and is shielded: a cancellation arriving mid-teardown still
+        sees the thread stopped (best-effort) before it propagates.
+        """
         if self._client is None:
             return
         client, self._client = self._client, None
@@ -358,6 +486,14 @@ class ShadowClient:
 
     @staticmethod
     def _teardown(client: mqtt.Client) -> None:
+        """Sends DISCONNECT, then joins the network thread, in that order.
+
+        Runs in a worker thread: loop_stop() blocks on a thread join that
+        must never happen on the event loop.
+
+        Args:
+            client: The paho client to shut down.
+        """
         # disconnect() BEFORE loop_stop(). The network thread is what writes
         # the DISCONNECT packet; stopping it first means the packet is queued
         # and never sent, and the broker only notices via keepalive timeout.
@@ -372,10 +508,18 @@ class ShadowClient:
             client.loop_stop()
 
     def _publish(self, topic: str, payload: dict[str, Any]) -> None:
-        """Hand one message to paho. Callers must use _publish_or_disconnect.
+        """Hands one message to paho; callers must use _publish_or_disconnect.
 
-        Raises _PublishQueued (never seen outside this module) when paho
-        accepted the message with no socket to write it on.
+        Args:
+            topic: The shadow topic to publish to.
+            payload: The JSON-serializable message body.
+
+        Raises:
+            ZephyrNotConnectedError: No post-CONNACK session exists to
+                carry the write.
+            _PublishQueued: paho accepted the message with no socket to
+                write it on. Never seen outside this module.
+            ZephyrTransportError: paho refused the publish outright.
         """
         # is_connected() reflects post-CONNACK state (paho sets it in
         # _handle_connack BEFORE dispatching on_connect), so this is the real
@@ -413,7 +557,7 @@ class ShadowClient:
     async def _publish_or_disconnect(
         self, topic: str, payload: dict[str, Any]
     ) -> None:
-        """Publish, and destroy the connection rather than leave a write queued.
+        """Publishes, tearing the connection down rather than queuing a write.
 
         A refused write must never actuate hardware later. Tearing the
         connection down discards the queued message with the paho client
@@ -426,6 +570,16 @@ class ShadowClient:
         would come back as a state report long after the caller gave up, and
         a GET refused against a dead client leaves the same orphaned session
         a refused write does.
+
+        Args:
+            topic: The shadow topic to publish to.
+            payload: The JSON-serializable message body.
+
+        Raises:
+            ZephyrNotConnectedError: The publish was refused - no live
+                session, or paho queued it with no socket - and the
+                connection has been torn down.
+            ZephyrTransportError: paho refused the publish outright.
         """
         try:
             self._publish(topic, payload)
@@ -460,11 +614,17 @@ class ShadowClient:
             raise ZephyrNotConnectedError("hood is not connected") from None
 
     async def request_state(self) -> None:
-        """Ask for the full shadow. The reply lands on get/accepted."""
+        """Asks for the full shadow; the reply lands on get/accepted.
+
+        Raises:
+            ZephyrNotConnectedError: The GET was refused and the
+                connection torn down; see _publish_or_disconnect.
+            ZephyrTransportError: paho refused the publish outright.
+        """
         await self._publish_or_disconnect(self.topics.get, {})
 
     async def publish_state(self, fields: dict[str, Any]) -> None:
-        """WRITE PATH - actuates hardware.
+        """Publishes reported state - the WRITE PATH; it actuates hardware.
 
         Publishes to state.reported, not state.desired. That is backwards
         from the usual AWS IoT shadow convention (reported is normally
@@ -478,6 +638,17 @@ class ShadowClient:
 
         Callers are responsible for allowlisting fields. Only the probe CLI
         should reach this until the write path has been validated.
+
+        Args:
+            fields: The state.reported fields to write. Must be non-empty
+                and already allowlisted by the caller.
+
+        Raises:
+            ZephyrWriteError: fields is empty; an empty reported state is
+                never published.
+            ZephyrNotConnectedError: The write was refused and the
+                connection torn down rather than left to deliver later.
+            ZephyrTransportError: paho refused the publish outright.
         """
         if not fields:
             raise ZephyrWriteError("refusing to publish an empty reported state")

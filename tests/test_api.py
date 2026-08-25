@@ -1,3 +1,5 @@
+"""Tests for pyzephyrconnect.api."""
+
 import json
 import ssl
 import time
@@ -24,6 +26,7 @@ THING = "aaaaaaaabbbbbbbbccccccccddddddddeeeeeeee"
 
 
 def _fake_auth(session, endpoints=DEFAULT_ENDPOINTS):
+    """Build a MagicMock auth double serving fixed unexpired tokens."""
     auth = MagicMock()
     auth.session = session
     auth.endpoints = endpoints
@@ -47,6 +50,7 @@ TWCA_SUBJECT_COMMON_NAMES = {
 
 
 def _common_name(cert: dict) -> str | None:
+    """Return the commonName from a parsed certificate subject, if any."""
     for rdn in cert.get("subject", ()):
         for key, value in rdn:
             if key == "commonName":
@@ -55,10 +59,13 @@ def _common_name(cert: dict) -> str | None:
 
 
 def test_ssl_context_adds_twca_anchors_without_replacing_system_trust():
-    """The context must add the TWCA CAs as extra anchors on top of the
+    """Tests that the SSL context adds TWCA anchors atop system trust.
+
+    The context must add the TWCA CAs as extra anchors on top of the
     system trust store, not replace the store with just the three of them -
     that would be pinning, which breaks the moment the vendor rotates to a
-    mainstream CA."""
+    mainstream CA.
+    """
     ctx = build_ssl_context()
     assert isinstance(ctx, ssl.SSLContext)
     assert ctx.verify_mode == ssl.CERT_REQUIRED
@@ -75,13 +82,16 @@ def test_ssl_context_adds_twca_anchors_without_replacing_system_trust():
 
 
 def test_twca_anchors_outlive_the_old_leaf_pin():
-    """The whole point of trusting the TWCA CAs rather than the leaf:
+    """Tests that the TWCA anchors outlive the old leaf pin.
+
+    The whole point of trusting the TWCA CAs rather than the leaf:
     validity must extend past 2026-10-15, when the vendor's leaf expires.
 
     Checked against the bundle file directly (not the merged context) since
     some system trust stores already carry same-named TWCA roots, which
     would make a name-filtered read of the merged context ambiguous about
-    which cert - system's or the bundle's - is being checked."""
+    which cert - system's or the bundle's - is being checked.
+    """
     with resources.as_file(
         resources.files("pyzephyrconnect.certs").joinpath(CERT_BUNDLE)
     ) as path:
@@ -96,8 +106,11 @@ def test_twca_anchors_outlive_the_old_leaf_pin():
 
 
 async def test_get_own_devices_sends_a_bare_token_and_empty_body():
-    """The vendor API takes the raw ID token with NO 'Bearer ' prefix and a
-    genuinely empty body - not '{}'. Both matter."""
+    """Tests that get_own_devices sends a bare token and an empty body.
+
+    The vendor API takes the raw ID token with NO 'Bearer ' prefix and a
+    genuinely empty body - not '{}'. Both matter.
+    """
     session = FakeSession(
         FakeResponse({"message": "Success", "devices": [{"thingName": THING}]})
     )
@@ -113,6 +126,7 @@ async def test_get_own_devices_sends_a_bare_token_and_empty_body():
 
 
 async def test_discover_device_posts_the_thing_name():
+    """Tests that discover_device posts the thing name to the discover URL."""
     session = FakeSession(FakeResponse({"maxFanSpeed": 6}))
     api = ZephyrApi(_fake_auth(session))
     result = await api.discover_device(THING)
@@ -123,6 +137,7 @@ async def test_discover_device_posts_the_thing_name():
 
 
 async def test_requests_pass_the_pinned_ssl_context():
+    """Tests that the ssl_context handed to ZephyrApi reaches the request."""
     ctx = build_ssl_context()
     session = FakeSession(FakeResponse({"devices": []}))
     await ZephyrApi(_fake_auth(session), ssl_context=ctx).get_own_devices()
@@ -130,11 +145,17 @@ async def test_requests_pass_the_pinned_ssl_context():
 
 
 async def test_certificate_failure_raises_an_actionable_error():
-    """A generic SSLError here sends the operator hunting through their
-    system trust store. Name the bundle instead."""
+    """Tests that a certificate failure raises an actionable error.
+
+    A generic SSLError here sends the operator hunting through their
+    system trust store. Name the bundle instead.
+    """
 
     class ExplodingSession:
+        """Session double whose post always fails certificate validation."""
+
         def post(self, url, **kwargs):
+            """Raise ClientConnectorCertificateError for any request."""
             raise aiohttp.ClientConnectorCertificateError(
                 connection_key=None,
                 certificate_error=ssl.SSLCertVerificationError("bad chain"),
@@ -145,15 +166,19 @@ async def test_certificate_failure_raises_an_actionable_error():
 
 
 async def test_missing_devices_key_returns_empty_list():
+    """Tests that a response without a devices key yields an empty list."""
     session = FakeSession(FakeResponse({"message": "Success"}))
     assert await ZephyrApi(_fake_auth(session)).get_own_devices() == []
 
 
 async def test_403_response_raises_zephyr_auth_error():
-    """A 403 means the ID token is rejected or expired, which is an
+    """Tests that a 403 response raises ZephyrAuthError.
+
+    A 403 means the ID token is rejected or expired, which is an
     auth-class failure. The HA integration routes on exception TYPE to
     decide reauth vs. transient retry, so this must be ZephyrAuthError
-    specifically (a ZephyrError subclass), not the generic base."""
+    specifically (a ZephyrError subclass), not the generic base.
+    """
     session = FakeSession(FakeResponse({}, status=403))
     with pytest.raises(ZephyrAuthError) as excinfo:
         await ZephyrApi(_fake_auth(session)).get_own_devices()
@@ -161,6 +186,7 @@ async def test_403_response_raises_zephyr_auth_error():
 
 
 async def test_other_4xx_response_raises_generic_zephyr_error():
+    """Tests that a non-403 4xx raises ZephyrError but not ZephyrAuthError."""
     session = FakeSession(FakeResponse({}, status=400))
     with pytest.raises(ZephyrError) as excinfo:
         await ZephyrApi(_fake_auth(session)).get_own_devices()
@@ -168,8 +194,11 @@ async def test_other_4xx_response_raises_generic_zephyr_error():
 
 
 async def test_authorization_header_is_a_bare_token():
-    """PROTOCOL.md section 4: the API rejects a 'Bearer ' prefix. This is
-    trivially easy to break while refactoring onto AbstractAuth."""
+    """Tests that the Authorization header is a bare token.
+
+    PROTOCOL.md section 4: the API rejects a 'Bearer ' prefix. This is
+    trivially easy to break while refactoring onto AbstractAuth.
+    """
     session = FakeSession(FakeResponse({"devices": []}))
     api = ZephyrApi(_fake_auth(session))
     await api.get_own_devices()
@@ -188,8 +217,11 @@ async def test_getowndevices_sends_a_zero_length_body():
 
 
 async def test_every_request_asks_auth_for_a_current_token():
-    """Refresh lives in the request path now, so a token that went stale
-    between calls is renewed without the consumer doing anything."""
+    """Tests that every request asks auth for a current token.
+
+    Refresh lives in the request path now, so a token that went stale
+    between calls is renewed without the consumer doing anything.
+    """
     session = FakeSession(
         FakeResponse({"devices": []}), FakeResponse({"thingName": "t"})
     )
@@ -202,6 +234,7 @@ async def test_every_request_asks_auth_for_a_current_token():
 
 
 async def test_endpoint_override_reaches_the_url_requested():
+    """Tests that an endpoint override changes the URL actually requested."""
     session = FakeSession(FakeResponse({"devices": []}))
     auth = _fake_auth(
         session, endpoints=Endpoints(device_api_base="https://staging.example/prod")
@@ -212,26 +245,36 @@ async def test_endpoint_override_reaches_the_url_requested():
 
 
 class _RaisingSession:
+    """Session double whose post raises a preconfigured exception."""
+
     def __init__(self, exc):
+        """Store the exception to raise from post."""
         self._exc = exc
 
     def post(self, url, **kwargs):
+        """Raise the configured exception for any request."""
         raise self._exc
 
 
 async def test_transient_network_failure_wraps_in_transport_error():
-    """New clause in _post: aiohttp.ClientError/TimeoutError must surface as
+    """Tests that a transient network failure wraps in ZephyrTransportError.
+
+    New clause in _post: aiohttp.ClientError/TimeoutError must surface as
     ZephyrTransportError so a consumer catching ZephyrError catches
-    everything on the setup and poll paths."""
+    everything on the setup and poll paths.
+    """
     api = ZephyrApi(_fake_auth(_RaisingSession(aiohttp.ClientConnectionError())))
     with pytest.raises(ZephyrTransportError):
         await api.get_own_devices()
 
 
 async def test_certificate_failure_still_wins_over_the_transport_clause():
-    """ClientConnectorCertificateError subclasses ClientError; the cert
+    """Tests that a certificate failure still wins over the transport clause.
+
+    ClientConnectorCertificateError subclasses ClientError; the cert
     clause is listed first and must keep winning - the diagnosis it carries
-    is the valuable one."""
+    is the valuable one.
+    """
     exc = aiohttp.ClientConnectorCertificateError(
         connection_key=MagicMock(), certificate_error=ssl.SSLError("boom")
     )
@@ -241,10 +284,13 @@ async def test_certificate_failure_still_wins_over_the_transport_clause():
 
 
 async def test_non_json_body_raises_zephyr_transport_error():
-    """A vendor maintenance page or WAF interstitial returns a 200 with a
+    """Tests that a non-JSON body raises ZephyrTransportError.
+
+    A vendor maintenance page or WAF interstitial returns a 200 with a
     non-JSON body. json.JSONDecodeError is a ValueError and aiohttp does not
     wrap it - left unhandled it would escape _post() as a raw ValueError
-    instead of the ZephyrError subclasses consumers are told to catch."""
+    instead of the ZephyrError subclasses consumers are told to catch.
+    """
     session = FakeSession(
         FakeResponse(None, json_exc=json.JSONDecodeError("bad", "<html>", 0))
     )
@@ -253,23 +299,30 @@ async def test_non_json_body_raises_zephyr_transport_error():
 
 
 async def test_empty_body_raises_zephyr_data_error():
-    """aiohttp returns None for an empty 200 body. get_own_devices() calls
+    """Tests that an empty body raises ZephyrDataError.
+
+    aiohttp returns None for an empty 200 body. get_own_devices() calls
     .get('devices') on the result, which would AttributeError on None if
-    _post() did not reject the shape first."""
+    _post() did not reject the shape first.
+    """
     session = FakeSession(FakeResponse(None))
     with pytest.raises(ZephyrDataError):
         await ZephyrApi(_fake_auth(session)).get_own_devices()
 
 
 async def test_non_dict_body_raises_zephyr_data_error():
-    """A bare list or string body is equally unusable to every caller of
-    _post(), even though it decoded as valid JSON."""
+    """Tests that a non-dict body raises ZephyrDataError.
+
+    A bare list or string body is equally unusable to every caller of
+    _post(), even though it decoded as valid JSON.
+    """
     session = FakeSession(FakeResponse(["unexpected", "list"]))
     with pytest.raises(ZephyrDataError):
         await ZephyrApi(_fake_auth(session)).get_own_devices()
 
 
 async def test_ssl_context_is_built_once_and_cached(monkeypatch):
+    """Tests that build_ssl_context runs once and its result is reused."""
     import pyzephyrconnect.api as api_module
 
     calls = []
@@ -289,9 +342,12 @@ async def test_ssl_context_is_built_once_and_cached(monkeypatch):
 
 @pytest.mark.parametrize("shape", [1, "x", {"a": 1}])
 async def test_a_non_list_devices_value_returns_empty_list(shape):
-    """`len(devices)` runs before anything validates the shape, so a scalar
-    here raised a raw TypeError out of the debug log line - outside the
-    "consumers catch ZephyrError" contract, and before the client-side
-    guard downstream ever gets a look."""
+    """Tests that a non-list devices value returns an empty list.
+
+    Before get_own_devices grew its shape guard, `len(devices)` ran ahead
+    of any validation, so a scalar here raised a raw TypeError out of the
+    debug log line - outside the "consumers catch ZephyrError" contract,
+    and before the client-side guard downstream ever got a look.
+    """
     session = FakeSession(FakeResponse({"devices": shape}))
     assert await ZephyrApi(_fake_auth(session)).get_own_devices() == []

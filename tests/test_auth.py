@@ -1,3 +1,5 @@
+"""Tests for pyzephyrconnect.auth."""
+
 import logging
 import time
 import traceback
@@ -19,6 +21,7 @@ IDENTITY = "us-west-2:00000000-1111-2222-3333-444455556666"
 
 
 def _creds_response(expires_in_seconds=3600):
+    """Build a get_credentials_for_identity response payload."""
     return {
         "Credentials": {
             "AccessKeyId": "AKIA",
@@ -48,6 +51,7 @@ def fake_aws(monkeypatch):
     iot.list_attached_policies.return_value = {"policies": []}
 
     def client(service, **kwargs):
+        """Return the recording double for the requested AWS service."""
         return {"cognito-identity": identity, "iot": iot}[service]
 
     monkeypatch.setattr(auth_module.boto3, "client", MagicMock(side_effect=client))
@@ -55,8 +59,11 @@ def fake_aws(monkeypatch):
 
 
 def test_credentials_expire_early_by_the_refresh_margin():
-    """Reporting 'valid' until the last second guarantees a mid-flight
-    expiry, because rebuilding the socket is not instant."""
+    """Tests that credentials expire early by the refresh margin.
+
+    Reporting 'valid' until the last second guarantees a mid-flight
+    expiry, because rebuilding the socket is not instant.
+    """
     nearly = Credentials(
         "k", "s", "t", datetime.now(UTC) + timedelta(seconds=60)
     )
@@ -68,6 +75,7 @@ def test_credentials_expire_early_by_the_refresh_margin():
 
 
 def _stored_tokens(expires_in=-1):
+    """Build stored ZephyrTokens that expire in the given seconds."""
     return ZephyrTokens(
         username="user@example.com",
         id_token="OLD-ID",
@@ -88,6 +96,7 @@ def _stored_tokens(expires_in=-1):
 
 
 def _not_authorized():
+    """Build a NotAuthorizedException ClientError for InitiateAuth."""
     return ClientError(
         {"Error": {"Code": "NotAuthorizedException", "Message": "expired"}},
         "InitiateAuth",
@@ -95,8 +104,11 @@ def _not_authorized():
 
 
 async def test_user_pool_region_is_passed_explicitly(fake_aws):
-    """Without it pycognito falls back to ambient AWS config and raises a
-    misleading ResourceNotFoundException."""
+    """Tests that the user pool region is passed explicitly.
+
+    Without it pycognito falls back to ambient AWS config and raises a
+    misleading ResourceNotFoundException.
+    """
     auth = CredentialsAuth("u", "p", MagicMock())
     await auth.async_get_tokens()
 
@@ -106,23 +118,30 @@ async def test_user_pool_region_is_passed_explicitly(fake_aws):
 
 
 def test_accessor_raises_before_any_tokens_are_acquired():
-    """Mirrors the deleted ZephyrAuth contract: identity-derived state
+    """Tests that the accessor raises before any tokens are acquired.
+
+    Mirrors the deleted ZephyrAuth contract: identity-derived state
     touched before any tokens exist must fail loudly, not return stale or
-    empty data."""
+    empty data.
+    """
     auth = CredentialsAuth("u", "p", MagicMock())
     with pytest.raises(ZephyrAuthError):
         _ = auth.identity_id
 
 
 def _iot_error(code):
+    """Build an AttachPolicy ClientError with the given error code."""
     return ClientError({"Error": {"Code": code, "Message": "no"}}, "AttachPolicy")
 
 
 async def test_attach_policy_wraps_a_refused_attach_in_zephyr_policy_error(
     fake_aws,
 ):
-    """A genuine authorization refusal stays terminal - retrying cannot
-    grant a permission the identity does not have."""
+    """Tests that a refused attach wraps in ZephyrPolicyError.
+
+    A genuine authorization refusal stays terminal - retrying cannot
+    grant a permission the identity does not have.
+    """
     fake_aws["iot"].attach_policy.side_effect = _iot_error("AccessDeniedException")
     auth = CredentialsAuth("u", "p", MagicMock())
 
@@ -138,6 +157,7 @@ async def test_attach_policy_wraps_a_refused_attach_in_zephyr_policy_error(
     "code", ["AccessDeniedException", "UnauthorizedException", "ResourceNotFoundException"]
 )
 async def test_the_terminal_attach_codes_stay_policy_errors(fake_aws, code):
+    """Tests that each terminal attach code raises ZephyrPolicyError."""
     fake_aws["iot"].attach_policy.side_effect = _iot_error(code)
     auth = CredentialsAuth("u", "p", MagicMock())
 
@@ -146,10 +166,13 @@ async def test_the_terminal_attach_codes_stay_policy_errors(fake_aws, code):
 
 
 async def test_a_throttled_attach_stays_retryable(fake_aws):
-    """The supervisor keys terminal-vs-retry on the exception TYPE. A
+    """Tests that a throttled attach stays retryable.
+
+    The supervisor keys terminal-vs-retry on the exception TYPE. A
     throttled IoT endpoint during a supervisor rebuild is transient, and
     wrapping it as a policy error permanently stops every hood over a blip
-    that would have cleared on the next tick."""
+    that would have cleared on the next tick.
+    """
     fake_aws["iot"].attach_policy.side_effect = _iot_error(
         "TooManyRequestsException"
     )
@@ -160,9 +183,12 @@ async def test_a_throttled_attach_stays_retryable(fake_aws):
 
 
 async def test_an_unreachable_attach_endpoint_stays_retryable(fake_aws):
-    """Not every failure is a ClientError - a socket error never reaches
+    """Tests that an unreachable attach endpoint stays retryable.
+
+    Not every failure is a ClientError - a socket error never reaches
     botocore's error shape at all, and it is the most obviously transient
-    case there is."""
+    case there is.
+    """
     fake_aws["iot"].attach_policy.side_effect = OSError("connection reset")
     auth = CredentialsAuth("u", "p", MagicMock())
 
@@ -173,9 +199,12 @@ async def test_an_unreachable_attach_endpoint_stays_retryable(fake_aws):
 async def test_a_rejected_credential_at_attach_surfaces_as_an_auth_error(
     fake_aws,
 ):
-    """_classify's own split still applies underneath: a rejected
+    """Tests that a rejected credential at attach surfaces as an auth error.
+
+    _classify's own split still applies underneath: a rejected
     credential means the user must reauth, which is neither a retry nor a
-    policy problem."""
+    policy problem.
+    """
     fake_aws["iot"].attach_policy.side_effect = _iot_error(
         "NotAuthorizedException"
     )
@@ -186,6 +215,7 @@ async def test_a_rejected_credential_at_attach_surfaces_as_an_auth_error(
 
 
 async def test_srp_runs_when_no_tokens_are_supplied(fake_aws):
+    """Tests that SRP authentication runs when no tokens are supplied."""
     auth = CredentialsAuth("user@example.com", "pw", MagicMock())
     tokens = await auth.async_get_tokens()
 
@@ -206,6 +236,7 @@ async def test_unexpired_stored_tokens_skip_the_network_entirely(fake_aws):
 
 
 async def test_expired_stored_tokens_refresh_instead_of_full_srp(fake_aws):
+    """Tests that expired stored tokens are refreshed without a full SRP."""
     auth = CredentialsAuth(
         "user@example.com", "pw", MagicMock(), tokens=_stored_tokens()
     )
@@ -216,8 +247,11 @@ async def test_expired_stored_tokens_refresh_instead_of_full_srp(fake_aws):
 
 
 async def test_rejected_refresh_token_falls_back_to_srp(fake_aws):
-    """Cognito refresh tokens expire (30 days by default) and can be
-    revoked. That must reauthenticate, not surface an error."""
+    """Tests that a rejected refresh token falls back to SRP.
+
+    Cognito refresh tokens expire (30 days by default) and can be
+    revoked. That must reauthenticate, not surface an error.
+    """
     fake_aws["cognito"].renew_access_token.side_effect = _not_authorized()
     auth = CredentialsAuth(
         "user@example.com", "pw", MagicMock(), tokens=_stored_tokens()
@@ -229,6 +263,7 @@ async def test_rejected_refresh_token_falls_back_to_srp(fake_aws):
 
 
 async def test_token_updater_fires_so_the_consumer_can_persist(fake_aws):
+    """Tests that token_updater receives the freshly acquired tokens."""
     seen = []
     auth = CredentialsAuth(
         "user@example.com", "pw", MagicMock(), token_updater=seen.append
@@ -240,8 +275,11 @@ async def test_token_updater_fires_so_the_consumer_can_persist(fake_aws):
 
 
 async def test_stale_identity_id_is_discarded_and_refetched_once(fake_aws):
-    """A persisted identity_id survives restarts, so a wrong one becomes
-    permanent. It decides the MQTT client ID and the IoT policy principal."""
+    """Tests that a stale identity_id is discarded and refetched once.
+
+    A persisted identity_id survives restarts, so a wrong one becomes
+    permanent. It decides the MQTT client ID and the IoT policy principal.
+    """
     identity = fake_aws["identity"]
     identity.get_credentials_for_identity.side_effect = [
         _not_authorized(),
@@ -257,9 +295,12 @@ async def test_stale_identity_id_is_discarded_and_refetched_once(fake_aws):
 
 
 async def test_concurrent_callers_trigger_only_one_login(fake_aws):
-    """ZephyrApi asks for tokens on every request and the supervisor asks too,
+    """Tests that concurrent callers trigger only one login.
+
+    ZephyrApi asks for tokens on every request and the supervisor asks too,
     so an expired token can be requested by several callers at once. The pool
-    rate-limits (PROTOCOL.md section 3.1)."""
+    rate-limits (PROTOCOL.md section 3.1).
+    """
     import asyncio
 
     auth = CredentialsAuth("user@example.com", "pw", MagicMock())
@@ -269,9 +310,12 @@ async def test_concurrent_callers_trigger_only_one_login(fake_aws):
 
 
 async def test_identity_id_is_read_not_reconstructed(fake_aws):
-    """Consumers use this as a config entry's permanent unique ID, so it must
+    """Tests that identity_id is read, not reconstructed.
+
+    Consumers use this as a config entry's permanent unique ID, so it must
     come from the tokens rather than by stripping a suffix off a value
-    derived from it."""
+    derived from it.
+    """
     auth = CredentialsAuth("user@example.com", "pw", MagicMock())
     await auth.async_get_tokens()
 
@@ -280,8 +324,11 @@ async def test_identity_id_is_read_not_reconstructed(fake_aws):
 
 
 async def test_identity_id_survives_a_refresh(fake_aws):
-    """Password changes and token refreshes must not change the account key -
-    the identity pool keys this on the user pool's immutable sub claim."""
+    """Tests that identity_id survives a refresh.
+
+    Password changes and token refreshes must not change the account key -
+    the identity pool keys this on the user pool's immutable sub claim.
+    """
     auth = CredentialsAuth(
         "user@example.com", "pw", MagicMock(), tokens=_stored_tokens()
     )
@@ -291,8 +338,11 @@ async def test_identity_id_survives_a_refresh(fake_aws):
 
 
 async def test_mqtt_client_id_keeps_the_region_prefix_and_suffix(fake_aws):
-    """The policy pins client ID to identity; the suffix is what lets this
-    coexist with the phone app instead of evicting it."""
+    """Tests that mqtt_client_id keeps the region prefix and suffix.
+
+    The policy pins client ID to identity; the suffix is what lets this
+    coexist with the phone app instead of evicting it.
+    """
     auth = CredentialsAuth("user@example.com", "pw", MagicMock())
     await auth.async_get_tokens()
 
@@ -304,19 +354,24 @@ class _StaticAuth(AbstractAuth):
     """The documented consumer path: implement one method, nothing else."""
 
     def __init__(self, tokens, session):
+        """Initialize with the static tokens to serve."""
         super().__init__(session)
         self._static = tokens
 
     async def async_get_tokens(self):
+        """Return the static tokens unchanged."""
         return self._static
 
 
 async def test_a_minimal_subclass_satisfies_the_whole_client_contract(fake_aws):
-    """ZephyrClient consumes async_get_credentials, credentials_expired,
+    """Tests that a minimal subclass satisfies the whole client contract.
+
+    ZephyrClient consumes async_get_credentials, credentials_expired,
     credentials_generation, mqtt_client_id and async_attach_policy. If any of
     those live only on CredentialsAuth, a custom AbstractAuth satisfies the
     type checker and AttributeErrors at runtime - which is exactly the
-    consumer the abstract class exists for."""
+    consumer the abstract class exists for.
+    """
     auth = _StaticAuth(_stored_tokens(3600), MagicMock())
 
     creds = await auth.async_get_credentials()
@@ -341,35 +396,46 @@ async def test_a_minimal_subclass_satisfies_the_whole_client_contract(fake_aws):
 
 
 def _client_error(code):
+    """Build a GetCredentialsForIdentity ClientError with the given code."""
     return ClientError({"Error": {"Code": code}}, "GetCredentialsForIdentity")
 
 
 def test_classify_maps_not_authorized_client_error_to_auth_error():
+    """Tests that _classify maps NotAuthorizedException to ZephyrAuthError."""
     err = AbstractAuth._classify(_client_error("NotAuthorizedException"))
     assert isinstance(err, ZephyrAuthError)
 
 
 def test_classify_maps_too_many_requests_to_transport_error():
-    """A Cognito rate limit at the hourly refresh is noise, not a
-    rejection - it must not be treated as terminal."""
+    """Tests that _classify maps TooManyRequests to ZephyrTransportError.
+
+    A Cognito rate limit at the hourly refresh is noise, not a
+    rejection - it must not be treated as terminal.
+    """
     err = AbstractAuth._classify(_client_error("TooManyRequestsException"))
     assert isinstance(err, ZephyrTransportError)
 
 
 def test_classify_maps_plain_oserror_to_transport_error():
+    """Tests that _classify maps a plain OSError to ZephyrTransportError."""
     err = AbstractAuth._classify(OSError("connection reset"))
     assert isinstance(err, ZephyrTransportError)
 
 
 def test_classify_matches_pycognito_terminal_exceptions_by_type_name():
-    """pycognito raises ForceChangePasswordException, SoftwareToken/SMS
+    """Tests that _classify matches pycognito exceptions by type name.
+
+    pycognito raises ForceChangePasswordException, SoftwareToken/SMS
     MFAChallengeException etc. directly - never wrapped in ClientError.
     These mean "needs the user", not "retry", so _classify must catch them
     too. Matched on type(err).__name__ (not isinstance) so this module
     never has to import pycognito's exception classes; a locally-defined
-    class with the same name proves the matching is name-based."""
+    class with the same name proves the matching is name-based.
+    """
 
     class ForceChangePasswordException(Exception):
+        """Local stand-in matching a pycognito exception by name only."""
+
         pass
 
     err = AbstractAuth._classify(ForceChangePasswordException("boom"))
@@ -380,8 +446,11 @@ def test_classify_matches_pycognito_terminal_exceptions_by_type_name():
 
 
 def test_zephyr_tokens_repr_hides_secrets():
-    """A refresh token is good for ~30 days and alone is enough to take
-    over the account; it must never land in a log or traceback via repr."""
+    """Tests that repr(ZephyrTokens) hides the token secrets.
+
+    A refresh token is good for ~30 days and alone is enough to take
+    over the account; it must never land in a log or traceback via repr.
+    """
     tokens = _stored_tokens()
     text = repr(tokens)
     assert "REFRESH" not in text
@@ -390,6 +459,7 @@ def test_zephyr_tokens_repr_hides_secrets():
 
 
 def test_credentials_repr_hides_secrets():
+    """Tests that repr(Credentials) omits the secret key and token."""
     creds = Credentials(
         "AKIA", "SECRET", "TOKEN", datetime.now(UTC) + timedelta(seconds=3600)
     )
@@ -402,11 +472,14 @@ def test_credentials_repr_hides_secrets():
 
 
 async def test_credentials_cache_is_keyed_to_identity(fake_aws):
-    """A subclass's tokens object can be swapped for a different account's
+    """Tests that the credentials cache is keyed to the identity.
+
+    A subclass's tokens object can be swapped for a different account's
     underneath the cache. If the new tokens resolve to a different
     identity, the cached credentials must not be served, even though they
     are not yet expired - PROTOCOL.md section 3.3: a client ID built on the
-    wrong identity connects fine and silently drops every message."""
+    wrong identity connects fine and silently drops every message.
+    """
     other_identity = "us-west-2:99999999-8888-7777-6666-555544443333"
     auth = _StaticAuth(_stored_tokens(3600), MagicMock())
 
@@ -432,10 +505,13 @@ async def test_credentials_cache_is_keyed_to_identity(fake_aws):
 
 
 async def test_exchange_transient_failure_propagates_without_refetch(fake_aws):
-    """A stored identity paired with a transient OSError (a socket blip,
+    """Tests that a transient exchange failure propagates without refetch.
+
+    A stored identity paired with a transient OSError (a socket blip,
     not Cognito rejecting the identity) must not trigger a second get_id
     round trip, and must surface through the ZephyrError contract rather
-    than as a raw OSError."""
+    than as a raw OSError.
+    """
     fake_aws["identity"].get_credentials_for_identity.side_effect = OSError(
         "connection reset"
     )
@@ -448,11 +524,14 @@ async def test_exchange_transient_failure_propagates_without_refetch(fake_aws):
 
 
 async def test_throttled_exchange_is_not_retried_with_an_extra_get_id(fake_aws):
-    """The refetch used to fire on ANY ClientError, so Cognito throttling
+    """Tests that a throttled exchange is not retried with an extra get_id.
+
+    The refetch used to fire on ANY ClientError, so Cognito throttling
     the exchange immediately spent a second request on get_id - doubling
     the load against the exact rate limit _classify deliberately treats as
     retryable. Only codes that mean the stored identity itself is wrong may
-    trigger the refetch."""
+    trigger the refetch.
+    """
     fake_aws["identity"].get_credentials_for_identity.side_effect = _client_error(
         "TooManyRequestsException"
     )
@@ -468,7 +547,9 @@ async def test_throttled_exchange_is_not_retried_with_an_extra_get_id(fake_aws):
 
 
 def test_classify_matches_the_real_pycognito_force_change_password_exception():
-    """_classify matches pycognito's terminal exceptions by type NAME, not
+    """Tests that _classify matches the real pycognito exception class.
+
+    _classify matches pycognito's terminal exceptions by type NAME, not
     isinstance, so this module never has to import pycognito's exception
     classes. That means a rename or a module move in a future pycognito
     release would not be caught by type-checking - it would just silently
@@ -476,7 +557,8 @@ def test_classify_matches_the_real_pycognito_force_change_password_exception():
     imports the REAL class from the installed package (not a same-named
     local stand-in, unlike
     test_classify_matches_pycognito_terminal_exceptions_by_type_name above)
-    so a rename fails this test loudly instead."""
+    so a rename fails this test loudly instead.
+    """
     from pycognito.exceptions import ForceChangePasswordException
 
     err = ForceChangePasswordException("must change password")
@@ -491,15 +573,19 @@ class _RecordingAuth(_StaticAuth):
     """Like CredentialsAuth: records every _on_identity_refetched call."""
 
     def __init__(self, tokens, session):
+        """Initialize the record of refetched identity IDs."""
         super().__init__(tokens, session)
         self.refetched_identities: list[str] = []
 
     def _on_identity_refetched(self, identity_id):
+        """Record the refetched identity ID."""
         self.refetched_identities.append(identity_id)
 
 
 async def test_identity_override_resets_when_tokens_change_accounts(fake_aws):
-    """A stored identity_id can go stale - the exchange rejects it and
+    """Tests that the identity override resets when tokens change accounts.
+
+    A stored identity_id can go stale - the exchange rejects it and
     refetches, setting _identity_override (covered by the
     override-write-back and _on_identity_refetched-hook lines that were
     previously uncovered). If the auth's tokens are later swapped for a
@@ -507,7 +593,8 @@ async def test_identity_override_resets_when_tokens_change_accounts(fake_aws):
     the old identity's credentials and client ID under the new tokens is
     the PROTOCOL.md section 3.3 silent-drop failure. The second
     async_get_credentials() call must do a fresh exchange and resolve to
-    the new tokens' own identity, not the stale override."""
+    the new tokens' own identity, not the stale override.
+    """
     refetched_identity = "us-west-2:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
     other_account_identity = "us-west-2:99999999-8888-7777-6666-555544443333"
 
@@ -556,10 +643,13 @@ async def test_identity_override_resets_when_tokens_change_accounts(fake_aws):
 async def test_acquire_populates_the_credentials_cache_so_get_credentials_skips_reexchange(
     fake_aws,
 ):
-    """_acquire runs its own _exchange but, before this fix, never wrote
+    """Tests that _acquire fills the cache so get_credentials skips re-exchange.
+
+    _acquire runs its own _exchange but, before this fix, never wrote
     _credentials_for or cleared _identity_override - so async_get_credentials()'s
     cache check (_credentials_for == current_identity) could never match and
-    every call performed a second, pointless exchange right after the first."""
+    every call performed a second, pointless exchange right after the first.
+    """
     auth = CredentialsAuth("user@example.com", "pw", MagicMock())
     await auth.async_get_tokens()
     calls_after_acquire = fake_aws["identity"].get_credentials_for_identity.call_count
@@ -579,7 +669,8 @@ async def test_replacing_the_cached_credentials_moves_the_generation(fake_aws):
     ZephyrApi asks for tokens on every REST request, so a poll lands here
     and swaps the credentials out from under sockets presigned against the
     old ones - leaving a cache that looks fresh and signatures that are not.
-    A cached read must NOT move it, or every supervisor tick would rebuild."""
+    A cached read must NOT move it, or every supervisor tick would rebuild.
+    """
     auth = CredentialsAuth("user@example.com", "pw", MagicMock())
     assert auth.credentials_generation == 0
 
@@ -606,7 +697,8 @@ async def test_the_presign_pair_survives_a_refresh_landing_mid_fetch(fake_aws):
     separate statement puts an await between them. A refresh landing in that
     window pairs the NEWER counter with the OLDER credentials, so the socket
     presigned from them looks current to the supervisor and nothing
-    re-presigns it before those older credentials expire."""
+    re-presigns it before those older credentials expire.
+    """
     auth = _StaticAuth(_stored_tokens(3600), MagicMock())
     stale = await auth.async_get_credentials()
     fresh = Credentials(
@@ -616,6 +708,7 @@ async def test_the_presign_pair_survives_a_refresh_landing_mid_fetch(fake_aws):
     calls = []
 
     async def superseded():
+        """Serve stale credentials while a refresh replaces the cache."""
         calls.append(1)
         if len(calls) == 1:
             # Handed back the credentials that were current when this call
@@ -637,11 +730,14 @@ async def test_the_presign_pair_survives_a_refresh_landing_mid_fetch(fake_aws):
 
 
 async def test_second_stale_identity_clears_a_leftover_override(fake_aws):
-    """A stale _identity_override left over from an earlier exchange must not
+    """Tests that a second stale identity clears a leftover override.
+
+    A stale _identity_override left over from an earlier exchange must not
     survive a later _acquire that resolves its own, different corrected
     identity - otherwise identity_id/mqtt_client_id keep serving the OLDER
     override forever while the tokens themselves move on, which is the
-    PROTOCOL.md section 3.3 silent-drop failure applied twice in a row."""
+    PROTOCOL.md section 3.3 silent-drop failure applied twice in a row.
+    """
     corrected = "us-west-2:corrected"
     identity = fake_aws["identity"]
     identity.get_credentials_for_identity.side_effect = [
@@ -662,10 +758,13 @@ async def test_second_stale_identity_clears_a_leftover_override(fake_aws):
 async def test_refresh_path_retains_stored_refresh_token_when_cognito_omits_one(
     fake_aws,
 ):
-    """renew_access_token does not necessarily rotate the refresh token, so
+    """Tests that the refresh path retains the stored refresh token.
+
+    renew_access_token does not necessarily rotate the refresh token, so
     pycognito can leave Cognito.refresh_token unset after a refresh. The
     previously stored refresh token must be carried forward, not dropped -
-    losing it silently breaks the NEXT refresh."""
+    losing it silently breaks the NEXT refresh.
+    """
     fake_aws["cognito"].refresh_token = None
     stored = _stored_tokens()
     auth = CredentialsAuth("user@example.com", "pw", MagicMock(), tokens=stored)
@@ -678,10 +777,13 @@ async def test_refresh_path_retains_stored_refresh_token_when_cognito_omits_one(
 async def test_transient_refresh_failure_raises_instead_of_burning_an_srp_login(
     fake_aws,
 ):
-    """A DNS blip, timeout or throttling during renew_access_token is not
+    """Tests that a transient refresh failure raises instead of an SRP fallback.
+
+    A DNS blip, timeout or throttling during renew_access_token is not
     Cognito rejecting the refresh token - it must surface as a retryable
     ZephyrTransportError, not silently fall back to a rate-limited SRP login
-    (PROTOCOL.md section 3.1) that also misreports the actual cause."""
+    (PROTOCOL.md section 3.1) that also misreports the actual cause.
+    """
     fake_aws["cognito"].renew_access_token.side_effect = OSError("connection reset")
     auth = CredentialsAuth(
         "user@example.com", "pw", MagicMock(), tokens=_stored_tokens()
@@ -696,12 +798,15 @@ async def test_transient_refresh_failure_raises_instead_of_burning_an_srp_login(
 async def test_refresh_failure_log_is_scrubbed_of_the_rejection_detail(
     fake_aws, caplog
 ):
-    """The DEBUG refresh-failure log must record only the exception TYPE,
+    """Tests that the refresh-failure log is scrubbed of the rejection detail.
+
+    The DEBUG refresh-failure log must record only the exception TYPE,
     never its message - botocore's ClientError echoes the Message field
     back verbatim, and that field can carry a secret. Drives the same
     NotAuthorizedException -> SRP-fallback path as
     test_rejected_refresh_token_falls_back_to_srp, but asserts on the log
-    instead of the outcome, to catch a future edit that logs str(err)."""
+    instead of the outcome, to catch a future edit that logs str(err).
+    """
     fake_aws["cognito"].renew_access_token.side_effect = ClientError(
         {
             "Error": {
@@ -723,13 +828,16 @@ async def test_refresh_failure_log_is_scrubbed_of_the_rejection_detail(
 
 
 async def test_refresh_uses_the_username_that_minted_the_refresh_token(fake_aws):
-    """SECRET_HASH is HMAC(client_secret, username + client_id) and
+    """Tests that a refresh uses the username that minted the refresh token.
+
+    SECRET_HASH is HMAC(client_secret, username + client_id) and
     pycognito recomputes it on every REFRESH_TOKEN_AUTH call, so the refresh
     must use the username the stored refresh token was minted under - the
     documented reason ZephyrTokens carries one. Building Cognito from the
     constructor argument instead made the field decorative and sent a hash
     Cognito rejects whenever a consumer rebuilt the object with a
-    differently spelled username while restoring the same tokens."""
+    differently spelled username while restoring the same tokens.
+    """
     stored = ZephyrTokens(
         username="old@example.com",
         id_token="OLD-ID",
@@ -749,9 +857,12 @@ async def test_refresh_uses_the_username_that_minted_the_refresh_token(fake_aws)
 
 
 async def test_srp_minted_tokens_carry_the_constructor_username(fake_aws):
-    """The counterpart: an SRP login authenticates as the username this
+    """Tests that SRP-minted tokens carry the constructor username.
+
+    The counterpart: an SRP login authenticates as the username this
     object was constructed with, so its tokens must record that one, not
-    whatever a discarded stored record happened to hold."""
+    whatever a discarded stored record happened to hold.
+    """
     fake_aws["cognito"].renew_access_token.side_effect = _not_authorized()
     stored = ZephyrTokens(
         username="old@example.com",
@@ -769,10 +880,13 @@ async def test_srp_minted_tokens_carry_the_constructor_username(fake_aws):
 
 
 async def test_refresh_path_replays_the_stored_identity_without_refetching(fake_aws):
-    """The refresh path passes stored.identity_id into _exchange, so a
+    """Tests that the refresh path reuses the stored identity without get_id.
+
+    The refresh path passes stored.identity_id into _exchange, so a
     healthy stored identity must be reused as-is - a get_id round trip here
     would mean the refresh path is refetching identities it has no reason
-    to doubt."""
+    to doubt.
+    """
     auth = CredentialsAuth(
         "user@example.com", "pw", MagicMock(), tokens=_stored_tokens()
     )
@@ -782,9 +896,12 @@ async def test_refresh_path_replays_the_stored_identity_without_refetching(fake_
 
 
 def _sentinel_client_error(code, operation):
-    """A botocore error whose MESSAGE carries a value that must never be
+    """Build a ClientError whose Message carries a sentinel secret.
+
+    A botocore error whose MESSAGE carries a value that must never be
     rendered. botocore echoes request parameters and identifiers back in
-    Message, and str(ClientError) interpolates it."""
+    Message, and str(ClientError) interpolates it.
+    """
     return ClientError(
         {"Error": {"Code": code, "Message": "context: SECRET-SENTINEL"}},
         operation,
@@ -792,12 +909,15 @@ def _sentinel_client_error(code, operation):
 
 
 async def test_srp_classification_traceback_omits_the_botocore_message(fake_aws):
-    """_classify scrubs the raw message on purpose. Chaining the original
+    """Tests that an SRP classification traceback omits the botocore message.
+
+    _classify scrubs the raw message on purpose. Chaining the original
     with `from err` puts it straight back: the supervisor's
     _LOGGER.exception renders the whole chain at ERROR, and that is what
     users paste into public issues. `from None` is what keeps the
     scrubbing real - while the type name and AWS code survive, so the
-    failure is still diagnosable."""
+    failure is still diagnosable.
+    """
     fake_aws["cognito"].authenticate.side_effect = _sentinel_client_error(
         "TooManyRequestsException", "InitiateAuth"
     )
@@ -814,9 +934,12 @@ async def test_srp_classification_traceback_omits_the_botocore_message(fake_aws)
 
 
 async def test_attach_policy_error_traceback_omits_the_botocore_message(fake_aws):
-    """Same reasoning at the ZephyrPolicyError site: its message is
+    """Tests that the attach-policy traceback omits the botocore message.
+
+    Same reasoning at the ZephyrPolicyError site: its message is
     deliberately identifier-free, and a chained cause would render the
-    identity ID and request context the wording exists to withhold."""
+    identity ID and request context the wording exists to withhold.
+    """
     fake_aws["iot"].attach_policy.side_effect = _sentinel_client_error(
         "AccessDeniedException", "AttachPolicy"
     )

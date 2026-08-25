@@ -37,6 +37,27 @@ class HoodCapabilities:
 
     Entity creation is gated on these rather than on the model string, so
     the library generalises to Zephyr hoods we have never seen.
+
+    Attributes:
+        thing_name: AWS IoT thing name identifying the hood.
+        serial: Device serial number.
+        model: Vendor model name.
+        mac: Device MAC address.
+        manufacturer: Company name reported by the vendor.
+        max_fan_speed: Highest fan speed, or None when not reported.
+        max_light_level: Highest light level, or None when not reported.
+        supports_recirculating: Whether recirculating mode is supported.
+        supports_tru_hue: Whether Tru-Hue lighting is supported.
+        max_grease_filter_hours: Grease filter service interval, or None
+            when not reported.
+        max_charcoal_filter_hours: Charcoal filter service interval, or
+            None when not reported.
+        labor_warranty: Labor warranty terms as reported.
+        parts_warranty: Parts warranty terms as reported.
+        urls: Non-empty documentation and support URLs from the payload,
+            keyed by their original payload key.
+        raw: The complete original payload. Unmodelled keys are kept as
+            evidence for characterising field semantics later.
     """
 
     thing_name: str
@@ -57,16 +78,39 @@ class HoodCapabilities:
 
     @classmethod
     def from_discover(cls, payload: dict[str, Any]) -> HoodCapabilities:
-        """Build capabilities from the discoverdevice payload.
+        """Builds capabilities from the discoverdevice payload.
 
         Absent and malformed are different failures here. Absent is normal:
         other Zephyr models omit keys this one returns, and entity creation
         is gated on capabilities precisely so the library generalises to
         hoods nobody has tested. Malformed is a real error, and this runs
         once at setup, so it fails loudly.
+
+        Args:
+            payload: Decoded discoverdevice response body.
+
+        Returns:
+            A HoodCapabilities built from the payload, with the payload
+            itself preserved in `raw`.
+
+        Raises:
+            ZephyrDataError: If a numeric capability is present but
+                malformed.
         """
 
         def as_int(key: str) -> int | None:
+            """Coerces the capability at `key` to an int.
+
+            Args:
+                key: Payload key to read.
+
+            Returns:
+                The integer value, or None when the key is absent or
+                its value is empty.
+
+            Raises:
+                ZephyrDataError: If the value is present but malformed.
+            """
             if (value := payload.get(key)) is None or value == "":
                 return None
             # int() would take both of these silently: a JSON true becomes
@@ -121,8 +165,39 @@ class HoodCapabilities:
 class HoodState:
     """Current shadow state.
 
-    Field semantics are documented where known. `act` and the exact units of
-    the use*time counters are unverified - see PROTOCOL.md section 7.
+    Field semantics are documented where known. `act` and the exact units
+    of the use*time counters are unverified - see PROTOCOL.md section 7.
+
+    Attributes:
+        power: Power state, or None when unknown.
+        light: Light level, or None when unknown.
+        fan: Fan speed, or None when unknown.
+        act: `act` value as a string, or None when unknown; semantics
+            unverified.
+        delay_timer: `delaytimer` value, or None when unknown.
+        set_delay_timer: `setdelaytimer` value, or None when unknown.
+        set_recirculating: `setrecirculating` value, or None when
+            unknown.
+        set_clean_air_function: `setcleanairfunction` value, or None
+            when unknown.
+        clean_grease_filters: `cleangreasefilters` value, or None when
+            unknown.
+        clean_charcoal_filters: `cleancharcoalfilters` value, or None
+            when unknown.
+        use_grease_filter_time: Grease filter usage counter; 0 when
+            unreported.
+        use_charcoal_filter_time: Charcoal filter usage counter; 0 when
+            unreported.
+        use_light_time: Light usage counter; 0 when unreported.
+        use_fan_time: Fan usage counter; 0 when unreported.
+        fan_warning: `fanwarning` value, or None when unknown.
+        alarm_fan: `alarmfan` value, or None when unknown.
+        alarm_fault_code: `alarmfaultcode` value, or None when unknown.
+        alarm_grease_filter: `alarmgreasefilter` value, or None when
+            unknown.
+        is_online: Whether the device is online, or None when unknown.
+        fault_codes: Reported fault codes, or None when unknown.
+        raw: The complete `reported` payload this state was parsed from.
     """
 
     power: int | None = None
@@ -149,7 +224,7 @@ class HoodState:
 
     @classmethod
     def from_reported(cls, reported: dict[str, Any]) -> HoodState:
-        """Build state from a shadow `reported` block.
+        """Builds state from a shadow `reported` block.
 
         Absent and malformed both yield None, which is not the same fact as
         zero: a missing `alarmfaultcode` is "unknown", not "no fault". The
@@ -159,9 +234,16 @@ class HoodState:
 
         The four usage counters are the exception - zero is their genuine
         starting value, and the filter-life percentage needs a number.
+
+        Args:
+            reported: Decoded `reported` block from a shadow document.
+
+        Returns:
+            A HoodState with the block preserved in `raw`.
         """
 
         def as_int(key: str) -> int | None:
+            """Coerces `key` to an int, or None when absent or malformed."""
             if (value := reported.get(key)) is None or value == "":
                 return None
             try:
@@ -180,9 +262,11 @@ class HoodState:
                 return None
 
         def as_counter(key: str) -> int:
+            """Coerces `key` to an int, treating absent or malformed as 0."""
             return as_int(key) or 0
 
         def as_bool(key: str) -> bool | None:
+            """Coerces `key` to a bool via as_int, keeping None for unknown."""
             value = as_int(key)
             return None if value is None else bool(value)
 
@@ -219,11 +303,18 @@ class HoodState:
         )
 
     def merge(self, delta: dict[str, Any]) -> HoodState:
-        """Return a new state with `delta` applied over the raw payload.
+        """Builds a new state with `delta` applied over the raw payload.
 
         update/delta and update/accepted carry only changed keys, so a
-        replace-the-whole-object approach would silently zero everything the
-        device did not mention.
+        replace-the-whole-object approach would silently zero everything
+        the device did not mention.
+
+        Args:
+            delta: Changed keys from an update/delta or update/accepted
+                message.
+
+        Returns:
+            A new HoodState reparsed from the merged raw payload.
         """
         merged_raw = {**self.raw, **delta}
         return HoodState.from_reported(merged_raw)

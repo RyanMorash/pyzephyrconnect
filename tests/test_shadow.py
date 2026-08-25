@@ -1,3 +1,5 @@
+"""Tests for pyzephyrconnect.shadow."""
+
 import asyncio
 import json
 import logging
@@ -27,6 +29,7 @@ CREDS = Credentials("k", "s", "t", datetime.now(UTC) + timedelta(hours=1))
 
 
 def test_topics_are_built_from_the_thing_name():
+    """Tests that the shadow topics embed the thing name."""
     t = ShadowTopics(THING)
     assert t.get == f"$aws/things/{THING}/shadow/get"
     assert t.update == f"$aws/things/{THING}/shadow/update"
@@ -34,6 +37,7 @@ def test_topics_are_built_from_the_thing_name():
 
 
 def test_subscription_set_covers_reads_and_rejections():
+    """Tests that subscriptions cover reads and rejections, not writes."""
     subs = ShadowTopics(THING).subscriptions
     assert f"$aws/things/{THING}/shadow/get/accepted" in subs
     assert f"$aws/things/{THING}/shadow/update/delta" in subs
@@ -44,11 +48,13 @@ def test_subscription_set_covers_reads_and_rejections():
 
 @pytest.fixture
 def fake_paho(monkeypatch):
+    """Mocked paho client patched into the shadow module."""
     client = MagicMock()
     client.subscribe.return_value = (0, 1)
     client.publish.return_value = MagicMock(rc=0)
 
     def fire_connack(*args, **kwargs):
+        """Simulate CONNACK and grant every shadow subscription."""
         # Real paho invokes on_connect from its network thread once CONNACK
         # arrives. Without this the mock never fires it, connect() blocks on
         # its event and every connect test fails on a 15s timeout.
@@ -69,10 +75,12 @@ def fake_paho(monkeypatch):
 
 
 async def _default_provider():
+    """Provide the static test credentials."""
     return CREDS
 
 
 def _make(on_message=None):
+    """Build a ShadowClient wired with mock callbacks."""
     return ShadowClient(
         THING, f"{THING}-ha", on_message or MagicMock(), MagicMock(), _default_provider
     )
@@ -103,6 +111,7 @@ async def _connect(shadow):
 
 
 async def test_connect_uses_a_presigned_websocket_path(fake_paho):
+    """Tests that connect sets a presigned SigV4 websocket path."""
     sc = _make()
     await _connect(sc)
 
@@ -114,21 +123,26 @@ async def test_connect_uses_a_presigned_websocket_path(fake_paho):
 
 
 async def test_connect_uses_the_suffixed_client_id(fake_paho):
+    """Tests that connect builds the client with the suffixed ID."""
     await _connect(_make())
     assert shadow_module.mqtt.Client.call_args.kwargs["client_id"] == f"{THING}-ha"
 
 
 async def test_connect_targets_port_443(fake_paho):
+    """Tests that connect_async targets port 443."""
     await _connect(_make())
     args = fake_paho.connect_async.call_args.args
     assert args[1] == 443
 
 
 async def test_connecting_log_omits_the_client_id_and_thing_name(fake_paho, caplog):
-    """Pins the scrubbed DEBUG connect log: it may name the endpoint, but
+    """Tests that the connect log omits client ID and thing name.
+
+    Pins the scrubbed DEBUG connect log: it may name the endpoint, but
     never the per-connection client ID (identity + thing name) or the bare
     thing name - both are personal data, and a careless future edit that
-    logs `self._client_id` directly must fail this test."""
+    logs `self._client_id` directly must fail this test.
+    """
     sc = _shadow()
     with caplog.at_level(logging.DEBUG, logger="pyzephyrconnect.shadow"):
         await _connect(sc)
@@ -139,13 +153,17 @@ async def test_connecting_log_omits_the_client_id_and_thing_name(fake_paho, capl
 
 
 async def test_denied_subscribe_surfaces_as_a_policy_error_from_connect(fake_paho):
-    """The denial must reach the caller through connect() - not by raising
+    """Tests that a denied subscribe raises ZephyrPolicyError.
+
+    The denial must reach the caller through connect() - not by raising
     inside paho's callback, which would silently kill the network thread
-    instead. See the module docstring and _on_subscribe's docstring."""
+    instead. See the module docstring and _on_subscribe's docstring.
+    """
     denied = MagicMock()
     denied.is_failure = True
 
     def fire_connack_then_deny_subscribe(*args, **kwargs):
+        """Simulate CONNACK and then deny every subscription."""
         fake_paho.on_connect(fake_paho, None, {}, 0, None)
         # _on_connect subscribes to 6 topics; deny all of them.
         for _ in range(6):
@@ -158,10 +176,12 @@ async def test_denied_subscribe_surfaces_as_a_policy_error_from_connect(fake_pah
 
 
 async def test_granted_subscribes_let_connect_succeed(fake_paho):
+    """Tests that connect succeeds when all subscribes are granted."""
     granted = MagicMock()
     granted.is_failure = False
 
     def fire_connack_then_grant_subscribes(*args, **kwargs):
+        """Simulate CONNACK and grant every subscription."""
         fake_paho.on_connect(fake_paho, None, {}, 0, None)
         for _ in range(6):
             fake_paho.on_subscribe(fake_paho, None, 1, [granted], None)
@@ -172,6 +192,7 @@ async def test_granted_subscribes_let_connect_succeed(fake_paho):
 
 
 async def test_request_state_publishes_an_empty_get(fake_paho):
+    """Tests that request_state publishes an empty GET payload."""
     sc = _make()
     await _connect(sc)
     await sc.request_state()
@@ -182,10 +203,13 @@ async def test_request_state_publishes_an_empty_get(fake_paho):
 
 
 async def test_publish_state_wraps_fields_in_state_reported(fake_paho):
-    """This device only acts on state.reported - see the module-level note
+    """Tests that publish_state wraps fields in state.reported.
+
+    This device only acts on state.reported - see the module-level note
     in shadow.py. Publishing state.desired is accepted by AWS and silently
     ignored by the hardware, which was the root cause of a real bug; the
-    absence of "desired" anywhere in the payload is the regression guard."""
+    absence of "desired" anywhere in the payload is the regression guard.
+    """
     sc = _make()
     await _connect(sc)
     await sc.publish_state({"light": 1})
@@ -197,6 +221,7 @@ async def test_publish_state_wraps_fields_in_state_reported(fake_paho):
 
 
 async def test_publish_state_rejects_an_empty_payload(fake_paho):
+    """Tests that publish_state raises ZephyrWriteError on an empty dict."""
     sc = _make()
     await _connect(sc)
     with pytest.raises(ZephyrWriteError):
@@ -204,9 +229,12 @@ async def test_publish_state_rejects_an_empty_payload(fake_paho):
 
 
 async def test_reconnect_uses_capped_exponential_backoff(fake_paho):
-    """paho retries indefinitely at a fixed short interval by default. An
+    """Tests that reconnect uses capped exponential backoff.
+
+    paho retries indefinitely at a fixed short interval by default. An
     expired credential would otherwise become a hot reconnect loop against
-    AWS IoT."""
+    AWS IoT.
+    """
     await _connect(_make())
     kwargs = fake_paho.reconnect_delay_set.call_args.kwargs
     assert kwargs["min_delay"] >= 1
@@ -214,8 +242,11 @@ async def test_reconnect_uses_capped_exponential_backoff(fake_paho):
 
 
 async def test_incoming_message_is_dispatched_with_parsed_json(fake_paho):
-    """Callbacks arrive on paho's thread and are marshalled onto the loop
-    with call_soon_threadsafe, so the dispatch needs a loop tick to land."""
+    """Tests that an incoming message is dispatched as parsed JSON.
+
+    Callbacks arrive on paho's thread and are marshalled onto the loop
+    with call_soon_threadsafe, so the dispatch needs a loop tick to land.
+    """
     received = []
     sc = _make(on_message=lambda topic, payload: received.append((topic, payload)))
     await _connect(sc)
@@ -231,9 +262,12 @@ async def test_incoming_message_is_dispatched_with_parsed_json(fake_paho):
 
 
 async def test_malformed_payload_is_dropped_without_dispatching(fake_paho):
-    """A parse error inside a paho callback thread would kill the network
+    """Tests that a malformed payload is dropped without dispatch.
+
+    A parse error inside a paho callback thread would kill the network
     loop and silently stop all updates. The payload must be dropped, and the
-    consumer must not be handed anything."""
+    consumer must not be handed anything.
+    """
     received = []
     sc = _make(on_message=lambda topic, payload: received.append((topic, payload)))
     await _connect(sc)
@@ -248,8 +282,11 @@ async def test_malformed_payload_is_dropped_without_dispatching(fake_paho):
 
 
 async def test_malformed_payload_warning_omits_the_thing_name(fake_paho, caplog):
-    """The full topic ($aws/things/<thingName>/shadow/...) contains personal
-    data. Only the topic leaf (accepted/delta/rejected) may be logged."""
+    """Tests that the malformed-payload warning omits the thing name.
+
+    The full topic ($aws/things/<thingName>/shadow/...) contains personal
+    data. Only the topic leaf (accepted/delta/rejected) may be logged.
+    """
     sc = _make()
     await _connect(sc)
 
@@ -266,8 +303,11 @@ async def test_malformed_payload_warning_omits_the_thing_name(fake_paho, caplog)
 async def test_publish_failure_raises_transport_error_without_the_thing_name(
     fake_paho,
 ):
-    """A failed publish must not leak the full thing-bearing topic into the
-    exception message."""
+    """Tests that a failed publish raises without the thing name.
+
+    A failed publish must not leak the full thing-bearing topic into the
+    exception message.
+    """
     fake_paho.publish.return_value = MagicMock(rc=1)
     sc = _make()
     await _connect(sc)
@@ -280,9 +320,12 @@ async def test_publish_failure_raises_transport_error_without_the_thing_name(
 
 
 def test_dispatch_on_a_closed_loop_returns_without_raising():
-    """paho's network thread must never see a RuntimeError from a
+    """Tests that dispatch on a closed loop returns without raising.
+
+    paho's network thread must never see a RuntimeError from a
     torn-down/closed event loop - that would kill the thread just like an
-    uncaught exception in a callback would."""
+    uncaught exception in a callback would.
+    """
     sc = _make()
     loop = asyncio.new_event_loop()
     loop.close()
@@ -292,11 +335,15 @@ def test_dispatch_on_a_closed_loop_returns_without_raising():
 
 
 async def test_connect_asks_the_provider_for_fresh_credentials(fake_paho):
-    """A presigned URL cannot outlive its signature. Every connect attempt
-    must re-presign, or a reconnect after expiry retries a dead URL."""
+    """Tests that every connect asks the provider for credentials.
+
+    A presigned URL cannot outlive its signature. Every connect attempt
+    must re-presign, or a reconnect after expiry retries a dead URL.
+    """
     calls = []
 
     async def provider():
+        """Credentials provider that counts its invocations."""
         calls.append(1)
         return Credentials("k", "s", "t", datetime.now(UTC) + timedelta(hours=1))
 
@@ -309,9 +356,12 @@ async def test_connect_asks_the_provider_for_fresh_credentials(fake_paho):
 
 
 async def test_tls_context_is_not_built_on_the_event_loop(fake_paho):
-    """paho's tls_set() calls load_default_certs() inline, which Home
+    """Tests that a prebuilt TLS context is handed to paho.
+
+    paho's tls_set() calls load_default_certs() inline, which Home
     Assistant reports as a blocking call on the loop. Hand it a finished
-    context instead."""
+    context instead.
+    """
     shadow = _shadow()
     await _connect(shadow)
 
@@ -334,9 +384,12 @@ async def test_publish_empty_state_raises_a_library_error(fake_paho):
 
 
 async def test_teardown_disconnects_before_stopping_the_network_thread(fake_paho):
-    """disconnect() BEFORE loop_stop(): the network thread is what writes the
+    """Tests that disconnect precedes loop_stop in teardown.
+
+    disconnect() BEFORE loop_stop(): the network thread is what writes the
     DISCONNECT packet, so stopping it first would queue the packet and never
-    send it."""
+    send it.
+    """
     shadow = _shadow()
     await _connect(shadow)
     await shadow.disconnect()
@@ -347,9 +400,12 @@ async def test_teardown_disconnects_before_stopping_the_network_thread(fake_paho
 
 
 def test_teardown_stops_the_network_thread_even_if_disconnect_raises():
-    """loop_stop() is what JOINS paho's network thread. Skipping it because
+    """Tests that loop_stop still runs when disconnect raises.
+
+    loop_stop() is what JOINS paho's network thread. Skipping it because
     disconnect() raised leaks the very thread this function exists to reap -
-    hence the try/finally rather than two plain statements."""
+    hence the try/finally rather than two plain statements.
+    """
     client = MagicMock()
     client.disconnect.side_effect = OSError("socket already gone")
 
@@ -360,9 +416,12 @@ def test_teardown_stops_the_network_thread_even_if_disconnect_raises():
 
 
 async def test_cancelled_handshake_tears_down_the_paho_client(fake_paho):
-    """A cancellation arriving mid-handshake must still tear down the paho
+    """Tests that a cancelled handshake still tears down the client.
+
+    A cancellation arriving mid-handshake must still tear down the paho
     client and its network thread via the shielded teardown in disconnect()
-    - not leave it dangling because the outer connect() task was cancelled."""
+    - not leave it dangling because the outer connect() task was cancelled.
+    """
     fake_paho.connect_async.side_effect = None  # nothing fires; connect blocks
 
     shadow = _shadow()
@@ -395,6 +454,7 @@ async def test_cancelled_handshake_tears_down_the_paho_client(fake_paho):
 
 
 async def test_disconnect_is_idempotent(fake_paho):
+    """Tests that a second disconnect is a no-op instead of raising."""
     shadow = _shadow()
     await _connect(shadow)
 
@@ -405,9 +465,12 @@ async def test_disconnect_is_idempotent(fake_paho):
 
 
 async def test_connect_over_a_live_client_tears_the_old_one_down_first(fake_paho):
-    """connect() is the ~50-minute reconnect path; connecting over a live
+    """Tests that reconnecting tears the old client down first.
+
+    connect() is the ~50-minute reconnect path; connecting over a live
     client must tear the old one down first instead of leaking its network
-    thread and reusing stale readiness events."""
+    thread and reusing stale readiness events.
+    """
     shadow = _shadow()
     await _connect(shadow)
     first_client = shadow._client
@@ -418,15 +481,19 @@ async def test_connect_over_a_live_client_tears_the_old_one_down_first(fake_paho
 
 
 async def test_a_raising_teardown_does_not_mask_a_policy_failure(fake_paho, caplog):
-    """The supervisor keys terminal-vs-retry on the exception TYPE. A
+    """Tests that a raising teardown keeps the policy error.
+
+    The supervisor keys terminal-vs-retry on the exception TYPE. A
     teardown that raises on the way out of a failed handshake must not
     REPLACE the handshake failure: an OSError from loop_stop() standing in
     for a ZephyrPolicyError would tell the supervisor to retry forever
-    against a policy the identity will never have."""
+    against a policy the identity will never have.
+    """
     denied = MagicMock()
     denied.is_failure = True
 
     def fire_connack_then_deny_subscribe(*args, **kwargs):
+        """Simulate CONNACK and then deny every subscription."""
         fake_paho.on_connect(fake_paho, None, {}, 0, None)
         for _ in range(6):
             fake_paho.on_subscribe(fake_paho, None, 1, [denied], None)
@@ -442,8 +509,11 @@ async def test_a_raising_teardown_does_not_mask_a_policy_failure(fake_paho, capl
 
 
 async def test_a_raising_teardown_does_not_mask_a_handshake_timeout(fake_paho):
-    """Same masking, retryable side: the timeout is what tells the caller to
-    retry, and an OSError in its place is unclassifiable."""
+    """Tests that a raising teardown keeps the timeout error.
+
+    Same masking, retryable side: the timeout is what tells the caller to
+    retry, and an OSError in its place is unclassifiable.
+    """
     fake_paho.connect_async.side_effect = None  # nothing fires; connect times out
     fake_paho.disconnect.side_effect = OSError("socket already gone")
 
@@ -452,9 +522,12 @@ async def test_a_raising_teardown_does_not_mask_a_handshake_timeout(fake_paho):
 
 
 async def test_a_raising_teardown_still_drops_the_client_reference(fake_paho):
-    """Swallowing the teardown error must not leave a half-torn-down client
+    """Tests that the client reference drops despite teardown errors.
+
+    Swallowing the teardown error must not leave a half-torn-down client
     behind: disconnect() clears _client before the await, so the next
-    connect() builds a fresh one instead of reusing a dead handle."""
+    connect() builds a fresh one instead of reusing a dead handle.
+    """
     fake_paho.connect_async.side_effect = None
     fake_paho.disconnect.side_effect = OSError("socket already gone")
 
@@ -468,12 +541,15 @@ async def test_a_raising_teardown_still_drops_the_client_reference(fake_paho):
 async def test_a_cancelled_disconnect_completes_the_teardown_before_raising(
     fake_paho, monkeypatch
 ):
-    """asyncio.shield protects the WORK from cancellation, but it delivers
+    """Tests that a cancelled disconnect finishes the teardown first.
+
+    asyncio.shield protects the WORK from cancellation, but it delivers
     CancelledError to the CALLER immediately. A bare `await shield(...)`
     therefore returns while paho's thread is still being reaped: the hood
     lock releases and a reconnect can overlap the old client, which the
     broker resolves by evicting one of them (same client ID). disconnect()
-    must see the teardown through, THEN honour the cancel."""
+    must see the teardown through, THEN honour the cancel.
+    """
     shadow = _shadow()
     await _connect(shadow)
 
@@ -481,9 +557,11 @@ async def test_a_cancelled_disconnect_completes_the_teardown_before_raising(
     gate = asyncio.get_running_loop().create_future()
 
     def gated_to_thread(fn, *args, **kwargs):
+        """Gate asyncio.to_thread work behind the test's future."""
         # Stands in for the worker thread: the teardown does not run until
         # the test opens the gate, so "still in flight" is deterministic.
         async def run():
+            """Run the teardown once the gate opens."""
             await gate
             fn(*args, **kwargs)
             order.append("teardown-done")
@@ -522,7 +600,8 @@ async def test_a_write_is_refused_before_paho_can_queue_it(fake_paho):
     paho puts a qos-1 message into its out-queue BEFORE trying to send it and
     leaves it there on failure, so handing it a message off a dead socket
     schedules an actuation for whenever its own auto-reconnect succeeds -
-    minutes later, with no caller waiting and nothing to cancel it."""
+    minutes later, with no caller waiting and nothing to cancel it.
+    """
     sc = _make()
     await _connect(sc)
     fake_paho.publish.reset_mock()
@@ -546,7 +625,8 @@ async def test_the_dead_client_precheck_tears_the_connection_down_too(fake_paho)
     orphaned a live paho client nothing holds a reference to any more, and
     its auto-reconnect keeps the old session alive under the same client ID
     the supervisor's replacement uses - AWS IoT then evicts one for the
-    other, forever."""
+    other, forever.
+    """
     sc = _make()
     await _connect(sc)
     fake_paho.is_connected.return_value = False
@@ -560,9 +640,12 @@ async def test_the_dead_client_precheck_tears_the_connection_down_too(fake_paho)
 
 
 async def test_a_state_request_refused_by_the_precheck_tears_down_too(fake_paho):
-    """request_state routes through the same wrapper, so it gets the same
+    """Tests that a refused state request tears the connection down.
+
+    request_state routes through the same wrapper, so it gets the same
     semantics: the refusal that proves the session is dead is also what
-    stops paho resurrecting it behind the supervisor's back."""
+    stops paho resurrecting it behind the supervisor's back.
+    """
     sc = _make()
     await _connect(sc)
     fake_paho.is_connected.return_value = False
@@ -583,13 +666,15 @@ async def test_a_hood_rebuilds_with_a_fresh_client_after_a_precheck_refusal(
     the hood drops its reference to it. If either side skips its half the
     hood is stuck - _shadow set but hollow means async_ensure_running
     declines to rebuild, and a live orphaned paho client means the rebuild
-    fights the old session for their shared client ID."""
+    fights the old session for their shared client ID.
+    """
     caps = HoodCapabilities.from_discover(
         json.loads((FIXTURES / "discoverdevice.json").read_text())
     )
     made: list[ShadowClient] = []
 
     def factory(_hood):
+        """Shadow factory that records every client it builds."""
         made.append(_shadow())
         return made[-1]
 
@@ -623,7 +708,8 @@ async def test_a_refused_write_tears_the_connection_down_so_it_cannot_fire_later
     is sitting in _out_messages, and paho's auto-reconnect would deliver it.
     The only way to un-schedule it is to destroy the client object it lives
     in, so this branch disconnects before refusing: every reconnect path here
-    builds a fresh mqtt.Client, so nothing inherits the queue."""
+    builds a fresh mqtt.Client, so nothing inherits the queue.
+    """
     sc = _make()
     await _connect(sc)
     fake_paho.publish.return_value = MagicMock(
@@ -638,9 +724,12 @@ async def test_a_refused_write_tears_the_connection_down_so_it_cannot_fire_later
 
 
 async def test_a_no_conn_state_request_is_torn_down_too(fake_paho):
-    """request_state routes through the same publish path. A GET stranded in
+    """Tests that a NO_CONN state request tears the client down.
+
+    request_state routes through the same publish path. A GET stranded in
     the out-queue comes back as a state report long after the caller gave
-    up, so it gets the same guarantee."""
+    up, so it gets the same guarantee.
+    """
     sc = _make()
     await _connect(sc)
     fake_paho.publish.return_value = MagicMock(
@@ -655,9 +744,12 @@ async def test_a_no_conn_state_request_is_torn_down_too(fake_paho):
 
 
 async def test_a_paho_reconnect_re_issues_the_shadow_get(fake_paho):
-    """paho re-fires on_connect on its OWN auto-reconnect, and nothing else
+    """Tests that a paho auto-reconnect re-issues the shadow GET.
+
+    paho re-fires on_connect on its OWN auto-reconnect, and nothing else
     re-reads the shadow there: without a fresh GET, every state change during
-    the outage stays invisible until the hourly supervisor represign."""
+    the outage stays invisible until the hourly supervisor represign.
+    """
     sc = _make()
     await _connect(sc)
 
@@ -671,10 +763,13 @@ async def test_a_paho_reconnect_re_issues_the_shadow_get(fake_paho):
 async def test_the_reconnect_get_follows_the_subscribes_on_the_same_client(
     fake_paho,
 ):
-    """Ordering is what makes the GET useful: MQTT processes the SUBSCRIBEs
+    """Tests that the reconnect GET follows the subscribes.
+
+    Ordering is what makes the GET useful: MQTT processes the SUBSCRIBEs
     first on this connection, so get/accepted lands on a live subscription.
     And it goes to the CALLBACK's client - self._client is still unset
-    during the first handshake, so using it would skip this entirely."""
+    during the first handshake, so using it would skip this entirely.
+    """
     sc = _make()
     await _connect(sc)
 
