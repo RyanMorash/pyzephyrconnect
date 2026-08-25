@@ -2,7 +2,7 @@
 
 All values reverse-engineered from the vendor iOS app. See PROTOCOL.md.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 REGION = "us-west-2"
 USER_POOL = "us-west-2_McuoKpkna"
@@ -35,7 +35,9 @@ class Endpoints:
     region: str = REGION
     user_pool: str = USER_POOL
     client_id: str = CLIENT_ID
-    client_secret: str = CLIENT_SECRET
+    # repr=False: it is already public (ships in the iOS bundle), but there
+    # is no reason to print it in logs or tracebacks.
+    client_secret: str = field(default=CLIENT_SECRET, repr=False)
     identity_pool: str = IDENTITY_POOL
     iot_endpoint: str = IOT_ENDPOINT
     device_api_base: str = DEVICE_API_BASE

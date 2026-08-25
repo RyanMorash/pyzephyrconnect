@@ -1,10 +1,11 @@
+import time
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
 import pytest
 
 from pyzephyrconnect import auth as auth_module
-from pyzephyrconnect.auth import Credentials, ZephyrAuth
+from pyzephyrconnect.auth import AbstractAuth, Credentials, ZephyrAuth, ZephyrTokens
 from pyzephyrconnect.exceptions import ZephyrAuthError
 
 IDENTITY = "us-west-2:00000000-1111-2222-3333-444455556666"
@@ -154,3 +155,40 @@ def test_credentials_expire_early_by_the_refresh_margin():
     )
     assert nearly.expired is True
     assert plenty.expired is False
+
+
+def _stored_tokens(expires_in=-1):
+    return ZephyrTokens(
+        username="user@example.com",
+        id_token="OLD-ID",
+        refresh_token="REFRESH",
+        identity_id=IDENTITY,
+        expires_at=time.time() + expires_in,
+    )
+
+
+class _StaticAuth(AbstractAuth):
+    """The documented consumer path: implement one method, nothing else."""
+
+    def __init__(self, tokens, session):
+        super().__init__(session)
+        self._static = tokens
+
+    async def async_get_tokens(self):
+        return self._static
+
+
+async def test_a_minimal_subclass_satisfies_the_whole_client_contract(fake_aws):
+    """ZephyrClient consumes async_get_credentials, credentials_expired,
+    mqtt_client_id and async_attach_policy. If any of those live only on
+    CredentialsAuth, a custom AbstractAuth satisfies the type checker and
+    AttributeErrors at runtime - which is exactly the consumer the abstract
+    class exists for."""
+    auth = _StaticAuth(_stored_tokens(3600), MagicMock())
+
+    creds = await auth.async_get_credentials()
+    assert creds.secret_key == "SECRET"
+    assert auth.credentials_expired is False
+    assert auth.mqtt_client_id == f"{IDENTITY}-ha"
+    await auth.async_attach_policy()
+    fake_aws["iot"].attach_policy.assert_called_once()
