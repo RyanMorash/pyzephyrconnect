@@ -496,6 +496,11 @@ In `HoodState.from_reported`, replace the `as_int` helper and the field defaults
 
         act = reported.get("act")
         codes = reported.get("faultCode")
+        if codes is not None and not isinstance(codes, (list, tuple)):
+            # Guard the tuple() below: a scalar faultCode would raise
+            # TypeError out of a hot push path.
+            _LOGGER.warning("faultCode was not a list; treating as unknown")
+            codes = None
 
         return cls(
             power=as_int("power"),
@@ -675,6 +680,12 @@ import aiohttp
 from .const import DEFAULT_ENDPOINTS, Endpoints
 
 
+The existing `Credentials` dataclass gets the same treatment in this task —
+`secret_key` and `session_token` become `field(repr=False)` for the same
+reason. `Endpoints.client_secret` too: it is already public (it ships in the
+iOS bundle) but there is no reason to print it.
+
+```python
 @dataclass(frozen=True, slots=True)
 class ZephyrTokens:
     """Consumer-persistable auth state.
@@ -694,8 +705,12 @@ class ZephyrTokens:
     """
 
     username: str
-    id_token: str
-    refresh_token: str
+    # repr=False on both: a refresh token is valid for ~30 days and is on its
+    # own enough to take over the account. The default dataclass repr would
+    # put it in any log line or traceback that captures this object, and
+    # Home Assistant users paste logs into public issues.
+    id_token: str = field(repr=False)
+    refresh_token: str = field(repr=False)
     identity_id: str
     expires_at: float
 
@@ -1162,8 +1177,28 @@ class CredentialsAuth(AbstractAuth):
             identity_id, credentials = await asyncio.to_thread(
                 self._exchange, tokens.id_token, tokens.identity_id
             )
+            if identity_id != tokens.identity_id:
+                # The stored identity was stale and _exchange refetched it.
+                # This MUST be written back: mqtt_client_id is derived from
+                # it, and an MQTT client ID built on a dead identity gets a
+                # connection where subscribe and publish succeed and every
+                # message is silently dropped (PROTOCOL.md section 3.3).
+                self._tokens = replace(tokens, identity_id=identity_id)
+                if self._token_updater is not None:
+                    self._token_updater(self._tokens)
             self._credentials = credentials
         return self._credentials
+
+    @property
+    def credentials_expired(self) -> bool:
+        """True when the cached AWS credentials need renewing.
+
+        A plain property on purpose. The supervisor must be able to ask "do
+        these need replacing?" without async_get_credentials() renewing them
+        as a side effect, which would make the answer always False and the
+        socket never get rebuilt.
+        """
+        return self._credentials is None or self._credentials.expired
 
     async def async_attach_policy(self) -> None:
         """Bind the IoT policy to this identity.
@@ -1303,7 +1338,18 @@ class ZephyrApi:
         ssl_context: ssl.SSLContext | None = None,
     ) -> None:
         self._auth = auth
-        self._ssl = ssl_context if ssl_context is not None else build_ssl_context()
+        # Deliberately NOT built here. build_ssl_context() calls
+        # SSLContext.load_default_certs and load_verify_locations, both of
+        # which Home Assistant instruments as blocking calls and reports when
+        # they run on the event loop - and this constructor runs on the loop
+        # inside async_setup_entry. Built lazily in a worker thread instead.
+        self._ssl = ssl_context
+
+    async def _get_ssl(self) -> ssl.SSLContext:
+        """The SSL context, built off the event loop on first use."""
+        if self._ssl is None:
+            self._ssl = await asyncio.to_thread(build_ssl_context)
+        return self._ssl
 
     def _headers(self, id_token: str) -> dict[str, str]:
         # Bare token, no "Bearer " prefix - the API rejects the prefixed form.
@@ -1315,11 +1361,12 @@ class ZephyrApi:
 
     async def _post(self, url: str, **kwargs: Any) -> Any:
         tokens = await self._auth.async_get_tokens()
+        ssl_context = await self._get_ssl()
         try:
             async with self._auth.session.post(
                 url,
                 headers=self._headers(tokens.id_token),
-                ssl=self._ssl,
+                ssl=ssl_context,
                 **kwargs,
             ) as response:
                 if response.status == 403:
@@ -1360,7 +1407,7 @@ class ZephyrApi:
         )
 ```
 
-Import `AbstractAuth` from `.auth`.
+Import `AbstractAuth` from `.auth`, and add `import asyncio` to the module imports.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -1474,6 +1521,23 @@ In `src/pyzephyrconnect/shadow.py`, change the constructor and `connect`:
 ```
 
 Replace the remaining `const.IOT_ENDPOINT` and `const.REGION` references in the method body with `self._endpoints.iot_endpoint` and `self._endpoints.region`.
+
+Fix the disconnect ordering, which now runs on a ~50-minute reconnect cycle
+rather than once at shutdown:
+
+```python
+    async def disconnect(self) -> None:
+        if self._client is None:
+            return
+        # disconnect() BEFORE loop_stop(). The network thread is what writes
+        # the DISCONNECT packet; stopping it first means the packet is queued
+        # and never sent, and the broker only notices via keepalive timeout.
+        self._client.disconnect()
+        self._client.loop_stop()
+        self._client = None
+        self._connected.clear()
+        self._subscribed.clear()
+```
 
 In `publish_state`, change the guard:
 
@@ -1730,7 +1794,14 @@ class Hood:
         await self.async_start()
 
     async def async_poll(self) -> HoodState:
-        """Read state over HTTPS. Used at setup and while push is down."""
+        """Read state over HTTPS. Used at setup and while push is down.
+
+        This is also how a terminal supervisor failure reaches the consumer:
+        the supervisor stops on an auth or policy error and flips `connected`
+        to False, which drives the consumer to poll, and this call re-raises
+        the stored error so it can become a reauth prompt rather than a hood
+        that quietly stops updating.
+        """
         state = await self._poll(self.thing_name)
         self.handle_state(state)
         return state
@@ -1946,17 +2017,107 @@ async def test_supervisor_rebuilds_the_socket_before_credentials_expire(wired):
     assert wired["shadow"].request_state.await_count >= 2
 
 
+async def test_refresh_does_not_ask_a_method_that_renews_as_a_side_effect(wired):
+    """async_get_credentials() renews when expired, so testing ITS result
+    always reports "not expired" and the socket never gets rebuilt. The
+    supervisor must ask the non-mutating property instead."""
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+
+    wired["auth"].credentials_expired = False
+    assert await client._refresh_once() is False
+    assert wired["shadow"].connect.await_count == 1      # no rebuild
+
+    wired["auth"].credentials_expired = True
+    assert await client._refresh_once() is True
+    assert wired["shadow"].connect.await_count == 2      # rebuilt
+
+
+async def test_a_transient_failure_does_not_end_supervision(wired):
+    """The failure mode this guards against is not a logged error - it is
+    push dying silently an hour later."""
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+
+    calls = []
+
+    async def flaky():
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError("transient DNS failure")
+        return False
+
+    client._refresh_once = flaky
+    monkeypatch_interval(client, 0)          # see helper in this module
+    await _run_supervisor_ticks(client, 2)
+
+    assert len(calls) == 2                   # kept going after the OSError
+
+
 async def test_supervisor_stops_on_a_policy_error(wired):
     """A denied subscribe closes the whole connection (PROTOCOL.md section 6).
     Retrying that forever is a hot loop that can never succeed."""
-    wired["shadow"].connect = AsyncMock(side_effect=ZephyrPolicyError("denied"))
     client = _client()
     hoods = await client.async_setup()
+    await hoods[0].async_start()
 
-    with pytest.raises(ZephyrPolicyError):
-        await hoods[0].async_start()
-    assert client._supervisor is None or client._supervisor.done()
+    async def denied():
+        raise ZephyrPolicyError("denied")
+
+    client._refresh_once = denied
+    monkeypatch_interval(client, 0)
+    await _run_supervisor_ticks(client, 3)
+
+    assert isinstance(client._supervisor_error, ZephyrPolicyError)
+    assert client.connected is False
+
+
+async def test_a_terminal_error_reaches_the_consumer_via_poll(wired):
+    """The supervisor runs detached, so its failure has to surface somewhere
+    the consumer already looks - otherwise the hood just stops updating."""
+    client = _client()
+    hoods = await client.async_setup()
+    client._supervisor_error = ZephyrAuthError("refresh token revoked")
+
+    with pytest.raises(ZephyrAuthError):
+        await hoods[0].async_poll()
+
+
+async def test_a_refetched_identity_is_written_back(wired):
+    """mqtt_client_id is derived from identity_id. Keeping a dead one gets a
+    connection where subscribe and publish succeed and every message is
+    silently dropped."""
+    auth = wired["auth"]
+    auth.identity_id = "us-west-2:new"
+    client = _client()
+    await client.async_setup()
+
+    assert client.identity_id == "us-west-2:new"
 ```
+
+Add these two helpers to `tests/test_client.py`; the supervisor is a detached
+task, so tests drive it deterministically rather than sleeping:
+
+```python
+def monkeypatch_interval(client, seconds: float) -> None:
+    client._supervisor_interval = seconds
+
+
+async def _run_supervisor_ticks(client, ticks: int) -> None:
+    """Run the supervisor body `ticks` times, then cancel it."""
+    task = asyncio.create_task(client._supervise())
+    for _ in range(ticks + 1):
+        await asyncio.sleep(0)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+```
+
+This requires `_supervise()` to read `self._supervisor_interval` (defaulting
+to `const.SUPERVISOR_INTERVAL_SECONDS`) rather than the constant directly, so
+tests do not have to wait a real minute.
 
 Update the fixture: `wired["auth"]` is now a `CredentialsAuth` double with `async_get_tokens`, `async_get_credentials`, `async_attach_policy` as `AsyncMock`s and a `mqtt_client_id` attribute. `_client()` becomes:
 
@@ -1990,6 +2151,7 @@ class ZephyrClient:
         self._hoods: dict[str, Hood] = {}
         self._connected = False
         self._supervisor: asyncio.Task | None = None
+        self._supervisor_error: ZephyrError | None = None
 
     @classmethod
     def from_credentials(
@@ -2001,6 +2163,7 @@ class ZephyrClient:
         tokens: ZephyrTokens | None = None,
         token_updater: Callable[[ZephyrTokens], None] | None = None,
         endpoints: Endpoints = DEFAULT_ENDPOINTS,
+        ssl_context: ssl.SSLContext | None = None,
     ) -> ZephyrClient:
         """Convenience path: build a CredentialsAuth and a client from it.
 
@@ -2039,7 +2202,11 @@ class ZephyrClient:
         await self._auth.async_get_tokens()
         devices = await self._api.get_own_devices()
         for device in devices:
-            thing_name = device["thingName"]
+            if not (thing_name := device.get("thingName")):
+                # A KeyError here would escape ZephyrError and reach the
+                # consumer as an unknown crash rather than a setup retry.
+                _LOGGER.warning("skipping a device with no thingName")
+                continue
             payload = await self._api.discover_device(thing_name)
             caps = HoodCapabilities.from_discover(payload)
             hood = Hood(caps, self._make_shadow, self._poll_state)
@@ -2058,6 +2225,19 @@ class ZephyrClient:
 
 `_make_shadow(hood)` builds a `ShadowClient` wired to this client's message handler, the auth's `mqtt_client_id`, and `self._auth.async_get_credentials` as the provider, then starts the supervisor if it is not already running.
 
+`_poll_state(thing_name)` re-raises a stored terminal supervisor error before
+doing anything else, so an auth failure that stopped the supervisor becomes a
+`ConfigEntryAuthFailed` on the consumer's next tick rather than a hood that
+quietly stops updating:
+
+```python
+    async def _poll_state(self, thing_name: str) -> HoodState:
+        if self._supervisor_error is not None:
+            raise self._supervisor_error
+        payload = await self._api.discover_device(thing_name)
+        return self._state_from_discover(payload)
+```
+
 `_state_from_discover(payload)` keeps the existing `_PERSONAL_DATA_KEYS` filter verbatim — `discoverdevice` returns a flat dict mixing shadow fields with identifiers, and those must never enter `HoodState.raw`.
 
 `_handle_message(hood, topic, payload)` is the existing `_handle_message` with `thing_name` replaced by the `Hood`, calling `hood.handle_state(...)` instead of writing a dict. Keep every guard: the non-dict shape check, the leaf-only logging, the rejected branch that never logs the payload, the ignored delta, and the broad `except` backstop.
@@ -2073,27 +2253,42 @@ The supervisor:
         expiry and paho reconnects to the same dead URL indefinitely, so
         push must be rebuilt from this side before that happens.
         """
-        try:
-            while True:
+        while True:
+            # The try is INSIDE the loop deliberately. A transient failure -
+            # a DNS blip during one refresh cycle - must not end supervision,
+            # because the consequence is not a logged error, it is push dying
+            # silently an hour later.
+            try:
                 await asyncio.sleep(const.SUPERVISOR_INTERVAL_SECONDS)
                 await self._refresh_once()
-        except asyncio.CancelledError:
-            raise
-        except ZephyrPolicyError:
-            # A denied subscribe closes the whole connection, so reconnecting
-            # can never succeed until the policy is attached. Stop.
-            _LOGGER.error("IoT policy missing; stopping refresh supervisor")
-            raise
-        except Exception:  # noqa: BLE001
-            _LOGGER.exception("refresh supervisor failed")
+            except asyncio.CancelledError:
+                raise
+            except (ZephyrPolicyError, ZephyrAuthError) as err:
+                # Neither of these fixes itself by retrying. A denied
+                # subscribe closes the whole connection and needs the IoT
+                # policy attached; a rejected credential needs the user.
+                # Stop, and leave the error where async_poll() will surface
+                # it - see _supervisor_error below.
+                self._supervisor_error = err
+                self._connected = False
+                _LOGGER.error("refresh supervisor stopping: %s", err)
+                return
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception("refresh cycle failed; retrying next tick")
 
     async def _refresh_once(self) -> bool:
-        """Renew credentials and rebuild sockets if inside the margin."""
-        credentials = await self._auth.async_get_credentials()
-        if not credentials.expired:
+        """Renew credentials and rebuild sockets if inside the margin.
+
+        Asks `credentials_expired` rather than calling
+        async_get_credentials() first: that method renews as a side effect,
+        so testing its result would always report "not expired" and the
+        socket would never be rebuilt.
+        """
+        if not self._auth.credentials_expired:
             return False
         _LOGGER.debug("credentials near expiry; refreshing and reconnecting")
-        await self._auth.async_get_tokens()
+        # Renews the Cognito tokens and re-exchanges for AWS credentials.
+        await self._auth.async_get_credentials()
         for hood in self._hoods.values():
             await hood.async_reconnect()
         return True
