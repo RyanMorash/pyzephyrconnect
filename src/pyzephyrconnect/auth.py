@@ -75,6 +75,7 @@ class ZephyrTokens:
         return time.time() >= (self.expires_at - const.REFRESH_MARGIN_SECONDS)
 
     def as_dict(self) -> dict[str, str | float]:
+        """Return the JSON-serializable form for the consumer to persist."""
         return {
             "username": self.username,
             "id_token": self.id_token,
@@ -156,6 +157,7 @@ class AbstractAuth(ABC):
         session: aiohttp.ClientSession,
         endpoints: Endpoints = DEFAULT_ENDPOINTS,
     ) -> None:
+        """Store the session and endpoints; all derived state starts empty."""
         self.session = session
         self.endpoints = endpoints
         self._credentials: Credentials | None = None
@@ -399,6 +401,12 @@ class AbstractAuth(ABC):
     # -- blocking bodies, run in a worker thread ----------------------
 
     def _identity_client(self) -> Any:
+        """Build an unsigned cognito-identity client for the exchange.
+
+        UNSIGNED because get_id and get_credentials_for_identity
+        authenticate through the Logins token map, not SigV4 - there are no
+        AWS credentials to sign with until this exchange produces them.
+        """
         return boto3.client(
             "cognito-identity",
             region_name=self.endpoints.region,
@@ -420,6 +428,7 @@ class AbstractAuth(ABC):
         logins = {self.endpoints.provider: id_token}
 
         def fetch(iid: str | None) -> tuple[str, dict]:
+            """Resolve `iid` if None, then mint raw credentials for it."""
             resolved = iid or client.get_id(
                 IdentityPoolId=self.endpoints.identity_pool, Logins=logins
             )["IdentityId"]
@@ -523,6 +532,12 @@ class AbstractAuth(ABC):
 
 @dataclass(frozen=True, slots=True)
 class Credentials:
+    """Hour-lived AWS credentials minted by the Cognito identity exchange.
+
+    These SigV4-sign the presigned MQTT WebSocket URL and the IoT policy
+    attach. Deliberately never persisted - see AbstractAuth.
+    """
+
     access_key: str
     # repr=False on both: these are bearer credentials good for an hour. The
     # default dataclass repr would put them in any log line or traceback
@@ -562,6 +577,12 @@ class CredentialsAuth(AbstractAuth):
         token_updater: Callable[[ZephyrTokens], None] | None = None,
         endpoints: Endpoints = DEFAULT_ENDPOINTS,
     ) -> None:
+        """Set up SRP login as `username`, optionally resuming stored tokens.
+
+        `tokens` lets the first acquisition try the stored refresh token
+        before burning a rate-limited SRP login; `token_updater` is called
+        with every new ZephyrTokens so the consumer can persist them.
+        """
         super().__init__(session, endpoints)
         self._username = username
         self._password = password
@@ -593,6 +614,7 @@ class CredentialsAuth(AbstractAuth):
     def _cognito(
         self, *, username: str | None = None, refresh_token: str | None = None
     ) -> Cognito:
+        """Build a pycognito handle for the configured pool, client and secret."""
         return Cognito(
             self.endpoints.user_pool,
             self.endpoints.client_id,
@@ -605,6 +627,11 @@ class CredentialsAuth(AbstractAuth):
         )
 
     def _srp_login(self) -> Cognito:
+        """Log in with the password over SRP, minting fresh tokens.
+
+        The expensive, rate-limited path (PROTOCOL.md section 3.1) - taken
+        only when there is no stored refresh token or Cognito rejected it.
+        """
         user = self._cognito()
         user.authenticate(password=self._password)
         return user
@@ -636,6 +663,11 @@ class CredentialsAuth(AbstractAuth):
     # -- async surface -------------------------------------------------
 
     async def async_get_tokens(self) -> ZephyrTokens:
+        """Serve the cached tokens while fresh; refresh or log in otherwise.
+
+        The unlocked fast path keeps this cheap for ZephyrApi, which calls
+        it on every REST request.
+        """
         if self._tokens is not None and not self._tokens.expired:
             return self._tokens
         async with self._lock:

@@ -49,10 +49,12 @@ class Endpoints:
 
     @property
     def device_api_list(self) -> str:
+        """URL of the getowndevices endpoint."""
         return f"{self.device_api_base}/getowndevices"
 
     @property
     def device_api_discover(self) -> str:
+        """URL of the discoverdevice endpoint."""
         return f"{self.device_api_base}/discoverdevice"
 
 

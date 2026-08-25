@@ -55,6 +55,7 @@ class ZephyrClient:
     """One authenticated account and the hoods under it."""
 
     def __init__(self, auth: AbstractAuth) -> None:
+        """Bind the client to one auth object; no I/O until async_setup()."""
         self._auth = auth
         # Deliberately NOT a separate constructor argument. The auth object
         # already carries the endpoints and ZephyrApi reads them from there,
@@ -310,7 +311,15 @@ class ZephyrClient:
             self._policy_attached_for = identity
 
     def _make_shadow(self, hood: Hood) -> ShadowClient:
+        """Build one hood's ShadowClient. Passed to Hood as its `shadow_factory`.
+
+        Hood._start calls this on every (re)connect, so each rebuild gets a
+        fresh paho client. Also (re)starts the refresh supervisor: the
+        supervisor retires itself when no started hoods remain, and building
+        a shadow is exactly the moment supervision is needed again.
+        """
         async def provider() -> Credentials:
+            """Fetch presign credentials; note their generation on the hood."""
             # The PAIR, in one call. Fetching the credentials and then
             # reading credentials_generation as a separate statement puts an
             # await between them: a refresh landing in that window records
@@ -356,6 +365,12 @@ class ZephyrClient:
         return shadow
 
     def _ensure_supervisor(self) -> None:
+        """Start the refresh supervisor unless a live one is already running.
+
+        A done task counts as not running: the supervisor retires itself
+        when no started hoods remain and stops on terminal errors, so this
+        is what brings supervision back for a later shadow build.
+        """
         if self._supervisor is None or self._supervisor.done():
             # A fresh supervisor supersedes any stored terminal error -
             # otherwise the error outlives the condition that caused it and

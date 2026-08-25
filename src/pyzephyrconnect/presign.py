@@ -31,10 +31,12 @@ _SAFE = "-_.~"
 
 
 def _hmac(key: bytes, msg: str) -> bytes:
+    """HMAC-SHA256 of `msg` under `key`, as raw digest bytes."""
     return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
 
 
 def _signing_key(secret_key: str, datestamp: str, region: str, service: str = SERVICE) -> bytes:
+    """Derive the SigV4 signing key via the date/region/service HMAC chain."""
     k_date = _hmac(f"AWS4{secret_key}".encode("utf-8"), datestamp)
     k_region = _hmac(k_date, region)
     k_service = _hmac(k_region, service)
@@ -42,10 +44,16 @@ def _signing_key(secret_key: str, datestamp: str, region: str, service: str = SE
 
 
 def _credential_scope(datestamp: str, region: str) -> str:
+    """Format the SigV4 credential scope string."""
     return f"{datestamp}/{region}/{SERVICE}/aws4_request"
 
 
 def _query_params(access_key: str, region: str, now: datetime) -> dict[str, str]:
+    """Build the auth query parameters the signature is computed over.
+
+    Deliberately excludes X-Amz-Signature and X-Amz-Security-Token; both
+    are appended to the URL only after signing.
+    """
     amz_date = now.strftime("%Y%m%dT%H%M%SZ")
     datestamp = now.strftime("%Y%m%d")
     scope = _credential_scope(datestamp, region)
@@ -58,6 +66,7 @@ def _query_params(access_key: str, region: str, now: datetime) -> dict[str, str]
 
 
 def _canonical_query(params: dict[str, str]) -> str:
+    """Encode params as a key-sorted, RFC 3986-encoded canonical query string."""
     return "&".join(
         f"{quote(k, safe=_SAFE)}={quote(v, safe=_SAFE)}"
         for k, v in sorted(params.items())

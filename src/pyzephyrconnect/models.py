@@ -67,6 +67,8 @@ class HoodCapabilities:
         """
 
         def as_int(key: str) -> int | None:
+            """Coerce `key` to int; None when absent or empty,
+            ZephyrDataError when malformed."""
             if (value := payload.get(key)) is None or value == "":
                 return None
             # int() would take both of these silently: a JSON true becomes
@@ -162,6 +164,7 @@ class HoodState:
         """
 
         def as_int(key: str) -> int | None:
+            """Coerce `key` to int, degrading absent or malformed values to None."""
             if (value := reported.get(key)) is None or value == "":
                 return None
             try:
@@ -180,9 +183,11 @@ class HoodState:
                 return None
 
         def as_counter(key: str) -> int:
+            """Coerce `key` to int, treating absent or malformed values as 0."""
             return as_int(key) or 0
 
         def as_bool(key: str) -> bool | None:
+            """Coerce `key` to bool via as_int, keeping None for unknown."""
             value = as_int(key)
             return None if value is None else bool(value)
 

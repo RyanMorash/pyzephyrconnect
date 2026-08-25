@@ -48,18 +48,22 @@ class ShadowTopics:
     """Classic shadow topic names for one thing."""
 
     def __init__(self, thing_name: str) -> None:
+        """Anchor every topic under $aws/things/<thing_name>/shadow."""
         self._base = f"$aws/things/{thing_name}/shadow"
 
     @property
     def get(self) -> str:
+        """The read-request topic. The reply arrives on get/accepted."""
         return f"{self._base}/get"
 
     @property
     def get_accepted(self) -> str:
+        """Where the full shadow document arrives after a get."""
         return f"{self._base}/get/accepted"
 
     @property
     def get_rejected(self) -> str:
+        """Errors for a get; 404 means no shadow document exists yet."""
         return f"{self._base}/get/rejected"
 
     @property
@@ -69,22 +73,32 @@ class ShadowTopics:
 
     @property
     def update_accepted(self) -> str:
+        """Confirmed state changes; carries only the fields that changed."""
         return f"{self._base}/update/accepted"
 
     @property
     def update_rejected(self) -> str:
+        """Where the broker reports rejected writes."""
         return f"{self._base}/update/rejected"
 
     @property
     def update_delta(self) -> str:
+        """Desired-vs-reported deltas.
+
+        Subscribed but never merged into cached state: nothing in this
+        system writes state.desired (see publish_state), so a delta here
+        is never device-authored.
+        """
         return f"{self._base}/update/delta"
 
     @property
     def update_documents(self) -> str:
+        """Before/after document pairs for each accepted update."""
         return f"{self._base}/update/documents"
 
     @property
     def subscriptions(self) -> tuple[str, ...]:
+        """Every topic to subscribe to: the responses, not the publish topics."""
         return (
             self.get_accepted,
             self.get_rejected,
@@ -108,6 +122,7 @@ class ShadowClient:
         *,
         endpoints: Endpoints = DEFAULT_ENDPOINTS,
     ) -> None:
+        """Store the wiring; no network I/O happens until connect()."""
         self.topics = ShadowTopics(thing_name)
         self._client_id = client_id
         self._on_message_cb = on_message
@@ -124,6 +139,12 @@ class ShadowClient:
     # -- paho callbacks (background thread) ---------------------------
 
     def _dispatch(self, fn: Callable[..., None], *args: Any) -> None:
+        """Marshal a call from paho's network thread onto the event loop.
+
+        Dropping the call when the loop is missing or closed is
+        deliberate - see the module docstring for why nothing on paho's
+        thread may raise.
+        """
         if self._loop is None or self._loop.is_closed():
             return
         try:
@@ -135,6 +156,13 @@ class ShadowClient:
             return
 
     def _on_connect(self, client, userdata, flags, reason_code, properties=None):
+        """Subscribe to the shadow topics and refresh state on (re)connect.
+
+        Runs on paho's network thread, on the initial CONNACK and again on
+        paho's own auto-reconnects. A refused CONNACK only logs: the
+        readiness events stay unset, so a connect() waiting on them times
+        out with ZephyrTransportError instead of half-succeeding.
+        """
         if reason_code != 0:
             _LOGGER.warning("MQTT connect refused: %s", reason_code)
             return
@@ -166,6 +194,11 @@ class ShadowClient:
         self._dispatch(self._on_connection_cb, True)
 
     def _reset_subscription_state(self, expected: int) -> None:
+        """Arm subscription tracking for a batch of expected SUBACKs.
+
+        Runs on the event loop, dispatched from _on_connect. Zero expected
+        topics counts as already subscribed.
+        """
         self._pending_subscribes = expected
         self._subscribe_error = None
         self._subscribed.clear()
@@ -173,6 +206,7 @@ class ShadowClient:
             self._subscribed.set()
 
     def _on_disconnect(self, client, userdata, flags, reason_code, properties=None):
+        """Mark the session down and notify the owner; runs on paho's thread."""
         self._dispatch(self._connected.clear)
         self._dispatch(self._on_connection_cb, False)
 
@@ -194,6 +228,13 @@ class ShadowClient:
         self._dispatch(self._record_subscribe_result, denied)
 
     def _record_subscribe_result(self, denied: bool) -> None:
+        """Fold one SUBACK result into the readiness state.
+
+        Runs on the event loop, dispatched from _on_subscribe. A denial
+        records a ZephyrPolicyError and sets the subscribed event early,
+        so connect() wakes and raises it instead of waiting out its
+        timeout.
+        """
         if denied:
             if self._subscribe_error is None:
                 self._subscribe_error = ZephyrPolicyError(
@@ -209,6 +250,13 @@ class ShadowClient:
             self._subscribed.set()
 
     def _on_message(self, client, userdata, message):
+        """Decode an incoming publish and hand it to the owner's callback.
+
+        Runs on paho's network thread; the callback itself is dispatched
+        onto the event loop. Malformed JSON is dropped with a warning that
+        names only the topic leaf - the full topic embeds the thing name,
+        which is personal data.
+        """
         try:
             payload = json.loads(message.payload)
         except (ValueError, TypeError):
@@ -319,6 +367,14 @@ class ShadowClient:
             raise
 
     async def disconnect(self) -> None:
+        """Tear down the paho client and join its network thread.
+
+        A no-op with no client. The reference and readiness events are
+        cleared before the first await, so a newer connection completing
+        during a slow teardown is not clobbered. The join runs in a worker
+        thread and is shielded: a cancellation arriving mid-teardown still
+        sees the thread stopped (best-effort) before it propagates.
+        """
         if self._client is None:
             return
         client, self._client = self._client, None
@@ -358,6 +414,11 @@ class ShadowClient:
 
     @staticmethod
     def _teardown(client: mqtt.Client) -> None:
+        """Send DISCONNECT, then join the network thread, in that order.
+
+        Runs in a worker thread: loop_stop() blocks on a thread join that
+        must never happen on the event loop.
+        """
         # disconnect() BEFORE loop_stop(). The network thread is what writes
         # the DISCONNECT packet; stopping it first means the packet is queued
         # and never sent, and the broker only notices via keepalive timeout.

@@ -33,6 +33,7 @@ class Hood:
         poll: Callable[[str], Awaitable[HoodState]],
         prepare: Callable[[], Awaitable[None]],
     ) -> None:
+        """Bind the hood to the account-level callables ZephyrClient wires in."""
         self._capabilities = capabilities
         self._shadow_factory = shadow_factory
         self._poll = poll
@@ -57,10 +58,12 @@ class Hood:
 
     @property
     def thing_name(self) -> str:
+        """The hood's AWS IoT thing name."""
         return self._capabilities.thing_name
 
     @property
     def capabilities(self) -> HoodCapabilities:
+        """What this hood can do, from the discoverdevice endpoint."""
         return self._capabilities
 
     @property
@@ -109,6 +112,12 @@ class Hood:
                 raise
 
     async def async_stop(self) -> None:
+        """Close this hood's shadow connection and drop the intent to run.
+
+        With _should_run cleared the supervisor will not bring the hood
+        back up. This does not retire the account-level supervisor itself -
+        that is ZephyrClient.async_stop's job.
+        """
         async with self._lock:
             self._should_run = False
             await self._stop()
@@ -185,6 +194,12 @@ class Hood:
     # reentrant, so async_reconnect cannot call the public methods.
 
     async def _start(self) -> None:
+        """Attach the IoT policy, connect the shadow, and request initial state.
+
+        Lock-free: callers hold self._lock. A no-op when a socket already
+        exists; if the initial state request fails, the hood is put back in
+        the no-socket shape the supervisor knows how to recover from.
+        """
         if self._shadow is not None:
             # Already connected. Rebuilding here would orphan the previous
             # paho client with its network thread still running.
@@ -225,6 +240,11 @@ class Hood:
             raise
 
     async def _stop(self) -> None:
+        """Tear down the shadow connection, if any.
+
+        Lock-free: callers hold self._lock. Leaves consumer intent
+        (_should_run) untouched - that distinction belongs to the callers.
+        """
         if self._shadow is not None:
             # Swap before the await, and clear _connected right alongside
             # it: a cancellation OR a raise landing on the await would
@@ -266,9 +286,11 @@ class Hood:
                 _LOGGER.exception("state listener raised")
 
     def add_listener(self, callback: StateListener) -> Callable[[], None]:
+        """Register a state listener and return a callable that removes it."""
         self._listeners.append(callback)
 
         def remove() -> None:
+            """Unregister the listener; safe to call more than once."""
             try:
                 self._listeners.remove(callback)
             except ValueError:
@@ -279,6 +301,11 @@ class Hood:
     # -- writes: ACTUATE HARDWARE --------------------------------------
 
     def _check_range(self, name: str, value: int, maximum: int | None) -> None:
+        """Raise ZephyrWriteError when value falls outside 0..maximum.
+
+        Negatives are always refused; the upper bound applies only when
+        this hood advertises a positive maximum.
+        """
         if value < 0:
             raise ZephyrWriteError(f"{name} cannot be negative, got {value}")
         # A hood we have never seen may not advertise a maximum. Absent must
@@ -305,6 +332,15 @@ class Hood:
             await self._publish(fields)
 
     async def _publish(self, fields: dict[str, int]) -> None:
+        """Validate fields and publish them to the shadow. Actuates hardware.
+
+        Lock-free: callers hold self._lock. Refuses empty payloads and
+        anything outside const.WRITABLE_FIELDS; destructive fields go
+        through with a warning. Raises ZephyrNotConnectedError when there
+        is no socket. If the shadow tears its own connection down while
+        refusing the write, the hood is reset to the no-socket shape the
+        supervisor rebuilds from.
+        """
         if self._shadow is None:
             # No thing name in the message: it identifies a home, and
             # exception text ends up in logs users paste publicly.
@@ -348,17 +384,21 @@ class Hood:
             raise
 
     async def async_set_power(self, on: bool) -> None:
+        """Switch hood power on or off."""
         await self.async_set_fields({"power": int(bool(on))})
 
     async def async_set_light(self, level: int) -> None:
+        """Set the light level, range-checked against this hood's maximum."""
         self._check_range("light", level, self._capabilities.max_light_level)
         await self.async_set_fields({"light": level})
 
     async def async_set_fan(self, speed: int) -> None:
+        """Set the fan speed, range-checked against this hood's maximum."""
         self._check_range("fan", speed, self._capabilities.max_fan_speed)
         await self.async_set_fields({"fan": speed})
 
     async def async_set_clean_air(self, on: bool) -> None:
+        """Switch the clean-air function on or off."""
         await self.async_set_fields({"setcleanairfunction": int(bool(on))})
 
     async def async_set_delay_timer(self, value: int) -> None:

@@ -78,10 +78,12 @@ def diff_states(
 
 
 def _redacted(payload: dict[str, Any]) -> dict[str, Any]:
+    """Copy `payload` with identifying values replaced by a placeholder."""
     return {k: ("<redacted>" if k in _REDACT else v) for k, v in payload.items()}
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    """Build the probe CLI's argument parser."""
     parser = argparse.ArgumentParser(
         prog="pyzephyrconnect",
         description="Read and probe a Zephyr range hood's device shadow.",
@@ -102,6 +104,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 async def main(argv: list[str] | None = None) -> int:
+    """Run the probe CLI and return its exit code.
+
+    Any --set request is parsed and validated before credentials are read,
+    so a refused write fails fast without prompting or touching the
+    network. Credentials come from ZEPHYR_USER/ZEPHYR_PASS or interactive
+    prompts. Exit codes: 0 on success, 1 when the account has no devices,
+    2 for invalid or refused arguments.
+    """
     args = _build_parser().parse_args(argv)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -171,6 +181,7 @@ async def main(argv: list[str] | None = None) -> int:
 
 
 def _report(changes: dict[str, tuple[Any, Any]]) -> None:
+    """Print the observed shadow diff, or a note that nothing changed."""
     if not changes:
         print("\nno reported change. The device may have ignored the write, "
               "or it may not echo this field.")
@@ -181,6 +192,7 @@ def _report(changes: dict[str, tuple[Any, Any]]) -> None:
 
 
 def run() -> int:
+    """Run main() under asyncio, mapping ctrl-c to exit status 130."""
     try:
         return asyncio.run(main())
     except KeyboardInterrupt:

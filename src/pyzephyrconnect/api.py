@@ -76,6 +76,7 @@ class ZephyrApi:
         *,
         ssl_context: ssl.SSLContext | None = None,
     ) -> None:
+        """Store the auth object and, optionally, a pre-built SSL context."""
         self._auth = auth
         # Deliberately NOT built here. build_ssl_context() calls
         # SSLContext.load_default_certs and load_verify_locations, both of
@@ -91,6 +92,7 @@ class ZephyrApi:
         return self._ssl
 
     def _headers(self, id_token: str) -> dict[str, str]:
+        """Build the JSON request headers for one device-API call."""
         # Bare token, no "Bearer " prefix - the API rejects the prefixed form.
         return {
             "Authorization": id_token,
@@ -99,6 +101,14 @@ class ZephyrApi:
         }
 
     async def _post(self, url: str, **kwargs: Any) -> Any:
+        """POST to the given URL and return the parsed JSON body as a dict.
+
+        Asks the auth object for tokens on every call and translates each
+        failure into the ZephyrError hierarchy: 403 to ZephyrAuthError,
+        other HTTP errors to ZephyrError, TLS trust failures to
+        ZephyrCertificateError, transport noise and unparseable bodies to
+        ZephyrTransportError, and a non-dict body to ZephyrDataError.
+        """
         tokens = await self._auth.async_get_tokens()
         ssl_context = await self._get_ssl()
         try:
