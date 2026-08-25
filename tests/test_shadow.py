@@ -10,6 +10,7 @@ import pytest
 from pyzephyrconnect import shadow as shadow_module
 from pyzephyrconnect.auth import Credentials
 from pyzephyrconnect.exceptions import (
+    ZephyrNotConnectedError,
     ZephyrPolicyError,
     ZephyrTransportError,
     ZephyrWriteError,
@@ -499,3 +500,108 @@ async def test_a_cancelled_disconnect_completes_the_teardown_before_raising(
 
     assert order == ["teardown-done", "cancel-raised"]
     assert fake_paho.loop_stop.called
+
+
+def _get_publishes(fake_paho) -> list:
+    """Every publish to this thing's shadow/get topic, in order."""
+    return [
+        call
+        for call in fake_paho.publish.call_args_list
+        if call.args[0] == f"$aws/things/{THING}/shadow/get"
+    ]
+
+
+async def test_a_write_is_refused_before_paho_can_queue_it(fake_paho):
+    """A write with no live session must never reach paho at all.
+
+    paho puts a qos-1 message into its out-queue BEFORE trying to send it and
+    leaves it there on failure, so handing it a message off a dead socket
+    schedules an actuation for whenever its own auto-reconnect succeeds -
+    minutes later, with no caller waiting and nothing to cancel it."""
+    sc = _make()
+    await _connect(sc)
+    fake_paho.publish.reset_mock()
+    fake_paho.is_connected.return_value = False
+
+    with pytest.raises(ZephyrNotConnectedError) as excinfo:
+        await sc.publish_state({"light": 1})
+
+    fake_paho.publish.assert_not_called()
+    # The message names a home if it names the thing; it ends up in logs
+    # users paste publicly.
+    assert THING not in str(excinfo.value)
+
+
+async def test_a_refused_write_tears_the_connection_down_so_it_cannot_fire_later(
+    fake_paho,
+):
+    """The socket can still die between the liveness check and the publish.
+
+    MQTT_ERR_NO_CONN means paho took the message and could not send it - it
+    is sitting in _out_messages, and paho's auto-reconnect would deliver it.
+    The only way to un-schedule it is to destroy the client object it lives
+    in, so this branch disconnects before refusing: every reconnect path here
+    builds a fresh mqtt.Client, so nothing inherits the queue."""
+    sc = _make()
+    await _connect(sc)
+    fake_paho.publish.return_value = MagicMock(
+        rc=shadow_module.mqtt.MQTT_ERR_NO_CONN
+    )
+
+    with pytest.raises(ZephyrNotConnectedError):
+        await sc.publish_state({"light": 1})
+
+    assert fake_paho.loop_stop.called      # the queued write died with it
+    assert sc._client is None
+
+
+async def test_a_no_conn_state_request_is_torn_down_too(fake_paho):
+    """request_state routes through the same publish path. A GET stranded in
+    the out-queue comes back as a state report long after the caller gave
+    up, so it gets the same guarantee."""
+    sc = _make()
+    await _connect(sc)
+    fake_paho.publish.return_value = MagicMock(
+        rc=shadow_module.mqtt.MQTT_ERR_NO_CONN
+    )
+
+    with pytest.raises(ZephyrNotConnectedError):
+        await sc.request_state()
+
+    assert fake_paho.loop_stop.called
+    assert sc._client is None
+
+
+async def test_a_paho_reconnect_re_issues_the_shadow_get(fake_paho):
+    """paho re-fires on_connect on its OWN auto-reconnect, and nothing else
+    re-reads the shadow there: without a fresh GET, every state change during
+    the outage stays invisible until the hourly supervisor represign."""
+    sc = _make()
+    await _connect(sc)
+
+    assert len(_get_publishes(fake_paho)) == 1        # the initial handshake
+
+    sc._on_connect(fake_paho, None, {}, 0, None)      # paho auto-reconnected
+
+    assert len(_get_publishes(fake_paho)) == 2
+
+
+async def test_the_reconnect_get_follows_the_subscribes_on_the_same_client(
+    fake_paho,
+):
+    """Ordering is what makes the GET useful: MQTT processes the SUBSCRIBEs
+    first on this connection, so get/accepted lands on a live subscription.
+    And it goes to the CALLBACK's client - self._client is still unset
+    during the first handshake, so using it would skip this entirely."""
+    sc = _make()
+    await _connect(sc)
+
+    names = [call[0] for call in fake_paho.method_calls]
+    last_subscribe = max(i for i, name in enumerate(names) if name == "subscribe")
+    first_publish = min(i for i, name in enumerate(names) if name == "publish")
+    assert first_publish > last_subscribe
+
+    # The callback's client, which the fixture passes as the SAME object the
+    # subscribes went to - self._client is still None at this point on the
+    # first handshake.
+    assert _get_publishes(fake_paho)[0].args[1] == "{}"

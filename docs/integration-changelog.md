@@ -85,6 +85,21 @@ Notes:
   refresh — tokens without it cannot be refreshed.
 - A rejected or expired refresh token falls back to a full SRP login
   automatically. It does not raise.
+- **`ZephyrTokens.from_dict()` raises `ZephyrDataError` on malformed stored
+  data** — a missing field, a non-string field, an empty string, or an
+  expiry that is not a finite number. It validates rather than coercing,
+  because a corrupted value that survives here fails much later and far
+  away: as a `SECRET_HASH` Cognito rejects, or as an MQTT client ID whose
+  messages AWS IoT silently drops. The correct response is to discard the
+  stored record and pass `tokens=None`, which falls back to a full SRP
+  login — not to abort setup:
+
+  ```python
+  try:
+      tokens = ZephyrTokens.from_dict(saved) if saved else None
+  except ZephyrDataError:
+      tokens = None          # discard the record; a fresh login rebuilds it
+  ```
 - If you would rather the library never saw the password at all, subclass
   `AbstractAuth`, implement `async_get_tokens()`, and pass the instance to
   `ZephyrClient(auth)` directly.
@@ -95,18 +110,22 @@ Notes:
 > refresh token is valid for around 30 days by default and is on its own
 > sufficient to take over the account.
 >
-> Two Home Assistant behaviours make this easy to get wrong:
+> Two things to know:
 >
-> - `async_redact_data` matches on **key names at the level it is given**. A
->   redaction set that names the top-level keys will not reach an `id_token`
->   nested one level down inside a sub-dict — those values pass through in
->   full.
+> - `async_redact_data` matches on **key names, at every depth**. It recurses
+>   into nested mappings and into lists of them, so naming `id_token` and
+>   `refresh_token` in the redaction set reaches them however deeply they are
+>   stored, and naming the container key redacts the whole sub-dict. What it
+>   cannot do is recognise a token by its *value*: anything stored under a key
+>   name that is not in the set — a renamed field, or a bare string in a list —
+>   passes through in full. It also returns a redacted **copy**, so the return
+>   value is what must be emitted.
 > - Config entries are stored as plain JSON in `.storage/core.config_entries`.
 >
-> So wherever these tokens are persisted, the redaction list needs to name
-> them — either the individual keys (`id_token`, `refresh_token`) or whatever
-> container they are stored under. Diagnostics output is meant to be safe to
-> paste into a public issue, so this belongs in the same change that
+> So wherever these tokens are persisted, the redaction list needs to name the
+> keys they are actually stored under — the individual keys (`id_token`,
+> `refresh_token`) or their container. Diagnostics output is meant to be safe
+> to paste into a public issue, so this belongs in the same change that
 > introduces persistence, not a follow-up.
 >
 > `identity_id` is worth redacting too. It is not a credential, but it is a
@@ -236,7 +255,17 @@ at expiry, and paho then reconnects to the same now-invalid URL indefinitely.
 Keeping that alive was previously the consumer's job via
 `async_refresh_if_needed()`. It is now a supervisor task inside `ZephyrClient`
 that renews credentials and rebuilds each hood's socket before expiry, started
-by the first `hood.async_start()` and cancelled by `client.async_stop()`.
+by the first `hood.async_start()` **attempt** and cancelled by
+`client.async_stop()`.
+
+Its lifecycle is self-correcting at both ends. A `hood.async_start()` that
+raises rolls that hood's intent back, so it leaves nothing armed behind it,
+and a supervisor that finds no started hoods on a tick retires itself rather
+than holding the client alive and refreshing credentials for nobody. A later
+`hood.async_start()` arms a fresh one. Still wire the teardown up before you
+start any hood — `entry.async_on_unload(client.async_stop)` or equivalent —
+as belt and braces: it is the only thing that reliably retires a supervisor
+mid-tick, and it stops every hood in one call.
 
 **What this means for you:** keeping credentials alive is no longer a reason
 for a consumer to poll on a timer. If a periodic tick is still wanted for
@@ -318,15 +347,23 @@ them.
 
 | Exception | Raised when |
 |---|---|
-| `ZephyrNotConnectedError` | A write or push read happened before `hood.async_start()` |
+| `ZephyrNotConnectedError` | A write (or any other publish-path operation) was attempted without a live shadow connection |
 | `ZephyrWriteError` | A field is not writable, a value is out of range, or the payload is empty |
-| `ZephyrDataError` | A capability field was present but unparseable |
+| `ZephyrDataError` | A capability field was present but unparseable, or `ZephyrTokens.from_dict()` was handed a malformed record |
 
 **Note the first one.** `client.async_set_state` previously raised a bare
 `RuntimeError` when called before the shadow connection for that thing was
 open. `RuntimeError` is not a `ZephyrError`, so any handler catching
 `ZephyrError` around a write would have let it escape. It is now
 `ZephyrNotConnectedError` and is caught by a `ZephyrError` handler.
+
+It is a **write-path** error, not a read one: reads never raise it. `hood.state`
+returns the cached state or `None`, and `hood.async_poll()` reads over HTTPS and
+works whether or not MQTT is up. A write raises it when the hood was never
+started, was stopped, or a rebuild failed — and now also when the connection is
+found dead at the moment of publishing, in which case the library tears the
+connection down so the refused write cannot be delivered later by paho's own
+reconnect. Treat it as "try again once `hood.connected` is `True`".
 
 Unchanged: `ZephyrError`, `ZephyrAuthError`, `ZephyrCertificateError`,
 `ZephyrPolicyError`, `ZephyrTransportError`.

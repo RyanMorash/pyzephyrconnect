@@ -102,7 +102,20 @@ class ZephyrTokens:
                     # The field NAME only - the value may be a token.
                     raise ValueError(key)
                 values[key] = value
-            expires_at = float(data["expires_at"])
+            try:
+                # Only the CONVERSION is guarded. A missing key raises
+                # KeyError, which this except does not name, so it falls
+                # through to the outer handler exactly as before.
+                #
+                # The re-raise below carries the field NAME alone, and
+                # `from None`: float("<garbage>") puts the raw value into its
+                # own message, and the outer `from err` would then thread
+                # that value through the ZephyrDataError's chained traceback
+                # - persisted token material printed in full by any consumer
+                # that logs the exception.
+                expires_at = float(data["expires_at"])
+            except (TypeError, ValueError):
+                raise ValueError("expires_at") from None
             if not math.isfinite(expires_at):
                 # NaN compares False against everything, so `expired` would
                 # be permanently False and the tokens never refreshed -

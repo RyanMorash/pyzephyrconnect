@@ -467,6 +467,26 @@ class ZephyrClient:
             try:
                 await asyncio.sleep(self._supervisor_interval)
                 await self._refresh_once()
+                if not any(
+                    hood._should_run for hood in self._hoods.values()
+                ):
+                    # Nothing left to supervise, so retire rather than tick
+                    # forever. A running task holds this client strongly
+                    # through every sleep (verified uncollectable via gc), so
+                    # a consumer that abandoned the client - a start that
+                    # raised and rolled its intent back, or the last hood
+                    # stopped - would otherwise keep it alive for the process
+                    # lifetime and burn an hourly credential refresh on it.
+                    # Not a permanent decision: a later async_start builds a
+                    # shadow, and _make_shadow's _ensure_supervisor treats a
+                    # DONE task as not running and starts a fresh one.
+                    #
+                    # Checked AFTER _refresh_once, not before: the terminal
+                    # branch below is the only thing that surfaces an auth or
+                    # policy failure to the consumer, and skipping the refresh
+                    # would hide it behind an early return.
+                    _LOGGER.debug("no started hoods left; retiring supervisor")
+                    return
             except asyncio.CancelledError:
                 raise
             except (ZephyrPolicyError, ZephyrAuthError) as err:

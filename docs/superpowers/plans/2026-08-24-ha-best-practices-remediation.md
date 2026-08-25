@@ -2461,6 +2461,8 @@ git commit -m "feat: add the Hood object and make the write allowlist structural
 
 The supervisor is the reason `async_refresh_if_needed()` can be deleted. It runs while any hood is started, renews credentials inside `REFRESH_MARGIN_SECONDS` of expiry, and reconnects each hood. It does **not** re-attach the IoT policy: per `PROTOCOL.md` §3.3 the binding persists on the identity.
 
+It also retires itself: a tick that finds no hood with `_should_run` set returns, because the running task holds the client strongly through every sleep and a consumer that abandoned the client (Home Assistant's `ConfigEntryNotReady` retry builds a fresh one) would otherwise keep a zombie alive that revives hoods onto MQTT client IDs identical to the replacement client's — and `Hood.async_start()` rolls its own intent back when it raises, precisely so an abandoned client leaves nothing armed. Correspondingly, `ShadowClient` refuses a write before handing it to paho unless the client reports `is_connected()`, and if paho refuses one with `MQTT_ERR_NO_CONN` (already parked in its out-queue) the connection is torn down before the error is raised, so a refused write can never actuate the hood later on paho's own reconnect.
+
 - [ ] **Step 1: Write the failing tests**
 
 Rewrite `tests/test_client.py`'s fixture and add:

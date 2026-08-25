@@ -46,9 +46,17 @@ class ZephyrTransportError(ZephyrError):
 
 
 class ZephyrNotConnectedError(ZephyrError):
-    """An operation needed a live shadow connection and there was none.
+    """A publish-path operation had no live shadow connection.
 
-    Call Hood.async_start() before reading push state or writing.
+    Writes, and the shadow GET behind them. Reads never raise this: state()
+    returns the cached value or None, and async_poll() goes over HTTPS and
+    works whether or not MQTT is up.
+
+    Raised when the hood was never started, was stopped, or a rebuild failed
+    - and when the socket is found dead at the moment of publishing, in which
+    case the connection is torn down so the refused write cannot be delivered
+    later by paho's own reconnect. Call Hood.async_start(), or wait for
+    `connected`, and retry.
     """
 
 

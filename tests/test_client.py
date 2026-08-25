@@ -26,6 +26,7 @@ from pyzephyrconnect.exceptions import (
     ZephyrAuthError,
     ZephyrError,
     ZephyrPolicyError,
+    ZephyrTransportError,
 )
 from pyzephyrconnect.hood import Hood
 from pyzephyrconnect.models import HoodState
@@ -308,6 +309,45 @@ async def test_a_setup_that_fails_midway_can_be_retried_cleanly(wired):
 
     assert client._setup_complete is True
     assert [hood.thing_name for hood in hoods] == [THING, OTHER]
+
+
+async def test_a_retried_setup_returns_only_what_the_retry_discovered(wired):
+    """The sibling of the test above, and the one that pins the `_hoods = {}`
+    reset rather than just tolerating it.
+
+    There, both attempts saw the same two devices, so leftovers from the
+    failed attempt were indistinguishable from the retry's own results. Here
+    the account changes between attempts - a device removed in the vendor app
+    while setup was failing - and stale entries become visible: without the
+    reset the retry returns the device that no longer exists."""
+    discover = json.loads((FIXTURES / "discoverdevice.json").read_text())
+    calls = []
+
+    async def discover_device(thing_name):
+        calls.append(thing_name)
+        if thing_name == OTHER and len(calls) == 2:
+            # Fails on the SECOND device of the first attempt only.
+            raise ZephyrError("discoverdevice failed")
+        return {**discover, "thingName": thing_name}
+
+    wired["api"].get_own_devices = AsyncMock(
+        side_effect=[
+            [{"thingName": THING}, {"thingName": OTHER}],
+            [{"thingName": OTHER}],
+        ]
+    )
+    wired["api"].discover_device = AsyncMock(side_effect=discover_device)
+
+    client = _client()
+    with pytest.raises(ZephyrError):
+        await client.async_setup()
+
+    assert [thing for thing in client._hoods] == [THING]   # the leftover
+
+    hoods = await client.async_setup()
+
+    assert [hood.thing_name for hood in hoods] == [OTHER]
+    assert list(client._hoods) == [OTHER]
 
 
 async def test_setup_performs_the_identity_exchange(wired):
@@ -1199,6 +1239,101 @@ async def test_polling_a_terminal_error_raises_a_fresh_instance_each_time(wired)
         await hoods[0].async_poll()
     assert excinfo2.value is not stored
     assert stored.__traceback__ is None
+
+
+async def test_a_supervisor_with_nothing_to_supervise_retires_and_re_arms(wired):
+    """A supervisor with no started hoods must end, not tick forever.
+
+    The running task holds this client strongly through every sleep, so an
+    abandoned client - Home Assistant raises ConfigEntryNotReady and builds a
+    fresh one - would otherwise stay alive for the process lifetime, burning
+    an hourly credential refresh and, worse, reviving its hoods onto MQTT
+    client IDs identical to the replacement client's."""
+    client = _client()
+    hoods = await client.async_setup()
+    monkeypatch_interval(client, 0)
+
+    # The consumer-facing start fails, so Hood.async_start rolls its intent
+    # back and the supervisor _make_shadow just armed has nothing to watch.
+    healthy_connect = wired["shadow"].connect.side_effect
+    wired["shadow"].connect.side_effect = ZephyrTransportError("boom")
+    with pytest.raises(ZephyrTransportError):
+        await hoods[0].async_start()
+
+    supervisor = client._supervisor
+    assert supervisor is not None
+    assert hoods[0]._should_run is False
+
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    assert supervisor.done()
+    assert supervisor.exception() is None       # retired, did not crash
+
+    # Re-armed by the next start: _ensure_supervisor counts a DONE task as
+    # not running, so nothing has to remember to restart it.
+    wired["shadow"].connect.side_effect = healthy_connect
+    await hoods[0].async_start()
+
+    assert client._supervisor is not supervisor
+    assert not client._supervisor.done()
+
+
+async def test_stopping_the_last_hood_retires_the_supervisor_too(wired):
+    """The other way to end up with nothing to supervise. `hood.async_stop()`
+    deliberately does not cancel the supervisor - only `client.async_stop()`
+    does - so the supervisor has to notice for itself."""
+    client = _client()
+    hoods = await client.async_setup()
+    monkeypatch_interval(client, 0)
+    await hoods[0].async_start()
+
+    supervisor = client._supervisor
+    assert supervisor is not None
+    for _ in range(3):
+        await asyncio.sleep(0)
+    assert not supervisor.done()                # still wanted
+
+    await hoods[0].async_stop()
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    assert supervisor.done()
+    assert supervisor.exception() is None
+
+
+async def test_a_socketless_wanted_hood_recovers_instead_of_reconnecting(wired):
+    """needs_represign requires a live socket, not just intent plus a stale
+    generation.
+
+    A hood the supervisor stopped after a terminal error keeps its intent and
+    loses its shadow, and its recorded generation stays frozen at whatever it
+    last presigned under - so a later credential change makes the generations
+    mismatch on a hood that has no socket to represign. That must take the
+    recovery branch (async_ensure_running), not async_reconnect, whose _stop
+    half has nothing to tear down and whose rebuilt-count would lie."""
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+    await hoods[0]._stop_for_supervisor()       # intent survives, socket gone
+
+    assert hoods[0]._should_run is True
+    assert hoods[0]._shadow is None
+
+    wired["auth"].credentials_generation += 1
+    current = wired["auth"].credentials_generation
+    assert hoods[0].needs_represign(current) is False
+
+    reconnected: list[str] = []
+
+    async def record_reconnect():
+        reconnected.append("reconnect")
+
+    hoods[0].async_reconnect = record_reconnect
+
+    assert await client._refresh_once() is False    # not the rebuild branch
+    assert reconnected == []
+    assert wired["shadow"].connect.await_count == 2  # recovery brought it back
 
 
 async def test_a_running_supervisor_is_not_replaced(wired):

@@ -1,4 +1,5 @@
 import time
+import traceback
 
 import pytest
 
@@ -85,3 +86,21 @@ def test_from_dict_rejects_a_non_finite_expiry():
     data["expires_at"] = float("nan")
     with pytest.raises(ZephyrDataError):
         ZephyrTokens.from_dict(data)
+
+
+def test_an_unparseable_expiry_never_reaches_the_traceback():
+    """float("<garbage>") names the value it could not convert in its own
+    message, and the outer `raise ... from err` threads that message into the
+    ZephyrDataError's chained traceback - so a consumer that logs the
+    exception prints a field out of persisted token storage in full. Only the
+    field NAME may escape; the value is caller data of unknown sensitivity."""
+    leaked = "eyJhbGciOiJIUzI1NiJ9-not-a-number"
+    data = _tokens().as_dict()
+    data["expires_at"] = leaked
+
+    with pytest.raises(ZephyrDataError) as excinfo:
+        ZephyrTokens.from_dict(data)
+
+    rendered = "".join(traceback.format_exception(excinfo.value))
+    assert leaked not in rendered
+    assert "expires_at" in rendered        # the field name still says which

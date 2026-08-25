@@ -24,10 +24,24 @@ import paho.mqtt.client as mqtt
 from . import const
 from .auth import Credentials
 from .const import DEFAULT_ENDPOINTS, Endpoints
-from .exceptions import ZephyrPolicyError, ZephyrTransportError, ZephyrWriteError
+from .exceptions import (
+    ZephyrNotConnectedError,
+    ZephyrPolicyError,
+    ZephyrTransportError,
+    ZephyrWriteError,
+)
 from .presign import build_presigned_url
 
 _LOGGER = logging.getLogger(__name__)
+
+
+class _PublishQueued(Exception):
+    """Internal: paho accepted the message but had no socket to send it.
+
+    Never escapes this module. _publish is synchronous and cannot tear the
+    connection down itself, so it raises this for its async callers to act
+    on - they disconnect, then raise ZephyrNotConnectedError.
+    """
 
 
 class ShadowTopics:
@@ -128,6 +142,26 @@ class ShadowClient:
         self._dispatch(self._reset_subscription_state, len(topics))
         for topic in topics:
             client.subscribe(topic, qos=1)
+        try:
+            # paho re-fires on_connect on ITS OWN auto-reconnect, and nothing
+            # else re-reads the shadow there: every state change during the
+            # outage stays invisible until the hourly supervisor represign
+            # rebuilds the socket and Hood._start issues a fresh GET. The
+            # broker processes the SUBSCRIBEs above first on this same
+            # connection, so get/accepted lands on a live subscription. On the
+            # initial connect this merely duplicates Hood._start's
+            # request_state - a second empty GET, which is harmless.
+            #
+            # The callback's `client`, NOT self._client: during the first
+            # handshake connect() has not assigned self._client yet, so this
+            # would silently skip exactly the path it exists to cover.
+            #
+            # Runs on paho's network thread, so it may never raise - see the
+            # module docstring. Best-effort: the next represign re-reads
+            # anyway.
+            client.publish(self.topics.get, "{}", qos=1)
+        except Exception:  # noqa: BLE001
+            pass
         self._dispatch(self._connected.set)
         self._dispatch(self._on_connection_cb, True)
 
@@ -338,9 +372,31 @@ class ShadowClient:
             client.loop_stop()
 
     def _publish(self, topic: str, payload: dict[str, Any]) -> None:
-        if self._client is None:
-            raise ZephyrTransportError("not connected")
+        """Hand one message to paho. Callers must use _publish_or_disconnect.
+
+        Raises _PublishQueued (never seen outside this module) when paho
+        accepted the message with no socket to write it on.
+        """
+        # is_connected() reflects post-CONNACK state (paho sets it in
+        # _handle_connack BEFORE dispatching on_connect), so this is the real
+        # question - "is there a session that can carry this write?" - not
+        # "did we ever build a client object?". Refusing here is what keeps a
+        # write from being parked in paho's out-queue in the first place;
+        # connect() only returns after the _connected event, so the
+        # handshake-time request_state still passes.
+        if self._client is None or not self._client.is_connected():
+            # No thing name in the message: it identifies a home, and
+            # exception text ends up in logs users paste publicly.
+            raise ZephyrNotConnectedError("hood is not connected")
         info = self._client.publish(topic, json.dumps(payload), qos=1)
+        if info.rc == mqtt.MQTT_ERR_NO_CONN:
+            # The socket died between the check above and this call. paho
+            # inserts a qos>0 message into _out_messages BEFORE trying to
+            # send it and, on NO_CONN, leaves it there in the "needs
+            # publishing" state - so paho's own auto-reconnect would deliver
+            # this write minutes later and actuate the hood with no caller
+            # waiting. Signal the async layer to tear the connection down.
+            raise _PublishQueued
         if info.rc != mqtt.MQTT_ERR_SUCCESS:
             # Name the operation (get/update), not the full topic - the full
             # topic contains the thing name, which is personal data.
@@ -349,9 +405,36 @@ class ShadowClient:
                 f"publish to shadow/{operation} failed: rc={info.rc}"
             )
 
+    async def _publish_or_disconnect(
+        self, topic: str, payload: dict[str, Any]
+    ) -> None:
+        """Publish, and destroy the connection rather than leave a write queued.
+
+        A refused write must never actuate hardware later. Tearing the
+        connection down discards the queued message with the paho client
+        object itself - every reconnect path here builds a FRESH mqtt.Client
+        (connect() replaces it, disconnect() drops the reference), so nothing
+        inherits the out-queue and the write can never fire.
+
+        Both callers route through this, so `request_state` gets the same
+        guarantee: a GET stranded in the out-queue would come back as a state
+        report long after the caller gave up.
+        """
+        try:
+            self._publish(topic, payload)
+        except _PublishQueued:
+            # Best-effort teardown; the caller still gets the refusal below
+            # either way, and the write must not be reported as accepted.
+            with contextlib.suppress(Exception):
+                await self.disconnect()
+            # `from None`: the internal signal carries no information the
+            # caller can use, and chaining it into the traceback only adds a
+            # frame naming this module's internals.
+            raise ZephyrNotConnectedError("hood is not connected") from None
+
     async def request_state(self) -> None:
         """Ask for the full shadow. The reply lands on get/accepted."""
-        self._publish(self.topics.get, {})
+        await self._publish_or_disconnect(self.topics.get, {})
 
     async def publish_state(self, fields: dict[str, Any]) -> None:
         """WRITE PATH - actuates hardware.
@@ -371,4 +454,6 @@ class ShadowClient:
         """
         if not fields:
             raise ZephyrWriteError("refusing to publish an empty reported state")
-        self._publish(self.topics.update, {"state": {"reported": fields}})
+        await self._publish_or_disconnect(
+            self.topics.update, {"state": {"reported": fields}}
+        )

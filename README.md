@@ -34,11 +34,19 @@ from a previous session and a callback to save new ones, and a restart
 skips the SRP login entirely:
 
 ```python
-from pyzephyrconnect import ZephyrClient, ZephyrTokens
+from pyzephyrconnect import ZephyrClient, ZephyrTokens, ZephyrDataError
+
+try:
+    tokens = ZephyrTokens.from_dict(saved) if saved else None
+except ZephyrDataError:
+    # from_dict validates rather than coercing, so a corrupted or partial
+    # record raises here instead of failing much later as a SECRET_HASH
+    # Cognito rejects. Discard it - a full SRP login rebuilds it.
+    tokens = None
 
 client = ZephyrClient.from_credentials(
     username, password, session,
-    tokens=ZephyrTokens.from_dict(saved) if saved else None,
+    tokens=tokens,
     token_updater=lambda t: save(t.as_dict()),
 )
 ```

@@ -87,7 +87,26 @@ class Hood:
         """Open this hood's shadow connection and request current state."""
         async with self._lock:
             self._should_run = True
-            await self._start()
+            try:
+                await self._start()
+            except BaseException:
+                # A CONSUMER-facing start that raises must leave the hood
+                # genuinely stopped. Home Assistant's ConfigEntryNotReady
+                # pattern abandons the client whose setup failed and builds a
+                # fresh one on the retry; intent surviving here would let the
+                # supervisor bring the abandoned hood back up in the
+                # background, and its per-connection MQTT client IDs are
+                # IDENTICAL to the replacement client's - AWS IoT treats two
+                # live connections sharing an ID as one session and evicts
+                # the working one for the zombie.
+                #
+                # Only this path rolls back. The supervisor-internal paths
+                # (async_reconnect, async_ensure_running, _stop_for_supervisor)
+                # call _start/_stop directly and keep the intent-survival
+                # semantics unchanged: nobody asked for those, so a transient
+                # failure there must stay recoverable on the next tick.
+                self._should_run = False
+                raise
 
     async def async_stop(self) -> None:
         async with self._lock:
@@ -306,7 +325,27 @@ class Hood:
                 "or zeroes a counter that cannot be reconstructed",
                 ", ".join(sorted(destructive)),
             )
-        await self._shadow.publish_state(dict(fields))
+        try:
+            await self._shadow.publish_state(dict(fields))
+        except ZephyrNotConnectedError:
+            # The shadow refused the write and destroyed its own connection
+            # to do it (a message paho had already queued can only be
+            # un-scheduled by discarding the client object it lives in). The
+            # ShadowClient survives that with no paho client inside it, and
+            # _shadow staying set is the shape nothing recovers from:
+            # async_ensure_running declines to rebuild while _shadow is not
+            # None, and needs_represign sees a generation that still matches,
+            # so push would stay dark until the next credential rotation.
+            # Put it back in the no-socket shape the supervisor knows how to
+            # recover from - the same move _start makes when its own initial
+            # request_state fails - and let the next tick rebuild.
+            #
+            # Cleared here rather than awaited away: the connection is
+            # already gone, and reporting connected=True with no socket
+            # misleads the derived client.connected.
+            self._shadow = None
+            self._connected = False
+            raise
 
     async def async_set_power(self, on: bool) -> None:
         await self.async_set_fields({"power": int(bool(on))})

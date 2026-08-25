@@ -268,17 +268,58 @@ async def test_destructive_write_is_pinned_and_logged(caplog):
     assert any(record.levelno == logging.WARNING for record in caplog.records)
 
 
-async def test_intent_survives_a_failed_start():
-    """A failed async_start() must not demote consumer intent back to
+async def test_intent_survives_a_failed_supervisor_rebuild():
+    """A rebuild NOBODY asked for must not demote consumer intent back to
     'never started' - async_ensure_running is the sole recovery path and it
-    keys off _should_run, not off having a socket."""
+    keys off _should_run, not off having a socket.
+
+    The supervisor-internal paths (async_reconnect, async_ensure_running,
+    _stop_for_supervisor) go straight to _start/_stop and keep this
+    semantics. Only the consumer-facing async_start rolls intent back - see
+    test_a_failed_consumer_start_rolls_back_intent."""
     made = []
 
     def factory(_h):
         shadow = MagicMock()
         shadow.connect = AsyncMock(
-            side_effect=ZephyrTransportError("boom") if not made else None
+            side_effect=ZephyrTransportError("boom") if len(made) == 1 else None
         )
+        shadow.request_state = AsyncMock()
+        shadow.disconnect = AsyncMock()
+        made.append(shadow)
+        return shadow
+
+    hood = Hood(_caps(), factory, AsyncMock(), AsyncMock())
+    await hood.async_start()                      # made[0] connects
+
+    with pytest.raises(ZephyrTransportError):
+        await hood.async_reconnect()              # made[1] fails mid-rebuild
+
+    assert hood._should_run is True
+    assert hood._shadow is None
+
+    await hood.async_ensure_running()
+
+    assert len(made) == 3
+    made[2].connect.assert_awaited()
+    made[2].request_state.assert_awaited()
+
+
+async def test_a_failed_consumer_start_rolls_back_intent():
+    """A start the CONSUMER asked for that raises must leave the hood
+    genuinely stopped.
+
+    Home Assistant's ConfigEntryNotReady pattern abandons the client whose
+    setup failed and builds a fresh one on the retry. Leaving intent set
+    would let this client's supervisor bring the abandoned hood up in the
+    background, and its per-connection MQTT client IDs are identical to the
+    replacement client's - AWS IoT treats two live connections sharing an ID
+    as one session and evicts the working one for the zombie."""
+    made = []
+
+    def factory(_h):
+        shadow = MagicMock()
+        shadow.connect = AsyncMock(side_effect=ZephyrTransportError("boom"))
         shadow.request_state = AsyncMock()
         shadow.disconnect = AsyncMock()
         made.append(shadow)
@@ -289,23 +330,27 @@ async def test_intent_survives_a_failed_start():
     with pytest.raises(ZephyrTransportError):
         await hood.async_start()
 
-    assert hood._should_run is True
+    assert hood._should_run is False
+    assert hood._shadow is None
 
-    await hood.async_ensure_running()
+    await hood.async_ensure_running()             # the next supervisor tick
 
-    assert len(made) == 2
-    made[1].connect.assert_awaited()
-    made[1].request_state.assert_awaited()
+    assert len(made) == 1                         # not revived
 
 
-async def test_a_failed_initial_state_request_leaves_the_hood_recoverable():
+async def test_a_failed_state_request_leaves_the_hood_recoverable():
     """request_state() raising AFTER _shadow was set produced the worst
-    possible shape: the hood LOOKED healthy - async_start returns early and
+    possible shape: the hood LOOKED healthy - a later start returns early and
     async_ensure_running declines to rebuild while _shadow is not None - but
-    the initial state GET never happened and nothing ever retried it. _start
-    must put the hood back into the no-socket state the supervisor knows how
-    to recover from, and tear the half-built client down rather than leak
-    its paho network thread."""
+    the state GET never happened and nothing ever retried it. _start must put
+    the hood back into the no-socket state the supervisor knows how to
+    recover from, and tear the half-built client down rather than leak its
+    paho network thread.
+
+    Driven through the supervisor's rebuild here, which is where recovery
+    has to work: a consumer-facing async_start that raises rolls intent back
+    on purpose (see test_a_failed_consumer_start_rolls_back_intent), so
+    there is deliberately nothing left to recover on that path."""
     made = []
 
     def factory(_h):
@@ -313,24 +358,25 @@ async def test_a_failed_initial_state_request_leaves_the_hood_recoverable():
         shadow.connect = AsyncMock()
         shadow.disconnect = AsyncMock()
         shadow.request_state = AsyncMock(
-            side_effect=ZephyrTransportError("boom") if not made else None
+            side_effect=ZephyrTransportError("boom") if len(made) == 1 else None
         )
         made.append(shadow)
         return shadow
 
     hood = Hood(_caps(), factory, AsyncMock(), AsyncMock())
+    await hood.async_start()             # made[0] connects and reads state
 
     with pytest.raises(ZephyrTransportError):
-        await hood.async_start()
+        await hood.async_reconnect()     # made[1]'s request_state raises
 
     assert hood._shadow is None          # not left looking connected
     assert hood._should_run is True      # consumer intent survives
-    made[0].disconnect.assert_awaited_once()
+    made[1].disconnect.assert_awaited_once()
 
     await hood.async_ensure_running()    # the next supervisor tick
 
-    assert len(made) == 2
-    made[1].request_state.assert_awaited()
+    assert len(made) == 3
+    made[2].request_state.assert_awaited()
 
 
 async def test_async_stop_clears_intent_so_ensure_running_stays_off():
@@ -426,3 +472,43 @@ async def test_typed_power_and_delay_timer_publish_shapes():
 
     await hood.async_set_delay_timer(300)
     shadow.publish_state.assert_awaited_with({"setdelaytimer": 300})
+
+
+async def test_a_write_refused_by_a_dead_socket_leaves_a_recoverable_hood():
+    """ShadowClient tears its own connection down when paho refuses a write
+    it has already queued - the only way to stop that write actuating the
+    hood on paho's next reconnect. The hood must not keep pointing at the
+    hollowed-out client afterwards: async_ensure_running declines to rebuild
+    while _shadow is set, and needs_represign sees a generation that still
+    matches, so push would stay dark until the next credential rotation."""
+    made = []
+
+    def factory(_h):
+        shadow = MagicMock()
+        shadow.connect = AsyncMock()
+        shadow.disconnect = AsyncMock()
+        shadow.request_state = AsyncMock()
+        shadow.publish_state = AsyncMock(
+            side_effect=ZephyrNotConnectedError("hood is not connected")
+            if not made
+            else None
+        )
+        made.append(shadow)
+        return shadow
+
+    hood = Hood(_caps(), factory, AsyncMock(), AsyncMock())
+    await hood.async_start()
+    hood.handle_connection_change(True)
+
+    with pytest.raises(ZephyrNotConnectedError):
+        await hood.async_set_light(1)
+
+    assert hood._shadow is None
+    assert hood.connected is False
+    assert hood._should_run is True        # the consumer still wants it up
+
+    await hood.async_ensure_running()      # the next supervisor tick
+
+    assert len(made) == 2
+    await hood.async_set_light(1)
+    made[1].publish_state.assert_awaited_with({"light": 1})
