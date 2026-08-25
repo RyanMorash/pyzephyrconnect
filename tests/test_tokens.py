@@ -88,6 +88,33 @@ def test_from_dict_rejects_a_non_finite_expiry():
         ZephyrTokens.from_dict(data)
 
 
+def test_from_dict_rejects_a_huge_expiry():
+    """A persisted expires_at can be an arbitrarily large int (e.g.
+    corrupted storage), and float() on an int too large to represent raises
+    OverflowError rather than ValueError. from_dict must still raise the
+    documented ZephyrDataError, not let OverflowError escape."""
+    data = _tokens().as_dict()
+    data["expires_at"] = 10**400
+    with pytest.raises(ZephyrDataError):
+        ZephyrTokens.from_dict(data)
+
+
+def test_a_huge_expiry_never_reaches_the_traceback():
+    """Same leak concern as the unparseable-string case: the huge int must
+    not be threaded into the ZephyrDataError's chained traceback via
+    OverflowError's own message."""
+    huge = 10**400
+    data = _tokens().as_dict()
+    data["expires_at"] = huge
+
+    with pytest.raises(ZephyrDataError) as excinfo:
+        ZephyrTokens.from_dict(data)
+
+    rendered = "".join(traceback.format_exception(excinfo.value))
+    assert str(huge) not in rendered
+    assert "expires_at" in rendered        # the field name still says which
+
+
 def test_an_unparseable_expiry_never_reaches_the_traceback():
     """float("<garbage>") names the value it could not convert in its own
     message, and the outer `raise ... from err` threads that message into the

@@ -114,7 +114,12 @@ class ZephyrTokens:
                 # - persisted token material printed in full by any consumer
                 # that logs the exception.
                 expires_at = float(data["expires_at"])
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
+                # OverflowError: a persisted expires_at can be an
+                # arbitrarily large int (e.g. corrupted storage), and
+                # float() on an int too large to represent raises
+                # OverflowError rather than ValueError. `from None` still
+                # applies - the huge value must not enter the message.
                 raise ValueError("expires_at") from None
             if not math.isfinite(expires_at):
                 # NaN compares False against everything, so `expired` would

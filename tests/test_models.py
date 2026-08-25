@@ -141,6 +141,18 @@ def test_malformed_state_field_degrades_to_none_and_warns(caplog):
     assert "power" in caplog.text
 
 
+def test_infinite_state_field_degrades_to_none_and_warns(caplog):
+    """json.loads accepts Infinity by default, so a shadow payload can
+    genuinely carry a float("inf") value. int(float("inf")) raises
+    OverflowError rather than ValueError - this parser runs on every push
+    and must degrade to None + WARNING like any other malformed value, not
+    let OverflowError escape and drop the whole state update."""
+    with caplog.at_level("WARNING"):
+        state = HoodState.from_reported({"power": float("inf")})
+    assert state.power is None
+    assert "power" in caplog.text
+
+
 def test_present_zero_is_preserved(shadow):
     state = HoodState.from_reported(shadow["state"]["reported"])
     assert state.power == 0
@@ -174,6 +186,15 @@ def test_capabilities_reject_a_boolean():
     A JSON true is never a capability count."""
     with pytest.raises(ZephyrDataError):
         HoodCapabilities.from_discover({"maxFanSpeed": True})
+
+
+def test_capabilities_reject_an_infinite_value():
+    """json.loads accepts Infinity by default, so a discoverdevice payload
+    can genuinely carry a float("inf") capability. This parser runs once at
+    setup and is contracted to fail loudly on malformed input - it must
+    raise ZephyrDataError, never a raw OverflowError."""
+    with pytest.raises(ZephyrDataError):
+        HoodCapabilities.from_discover({"maxFanSpeed": float("inf")})
 
 
 def test_capabilities_accept_an_integral_float():

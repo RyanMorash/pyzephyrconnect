@@ -84,7 +84,14 @@ class HoodCapabilities:
                 )
             try:
                 return int(value)
-            except (TypeError, ValueError) as err:
+            except (TypeError, ValueError, OverflowError) as err:
+                # OverflowError is defense-in-depth: json.loads accepts
+                # Infinity/NaN by default, and the is_integer() guard above
+                # already rejects a float Infinity/NaN before int() ever
+                # sees it. Nothing currently reaches int() able to trigger
+                # it, but the contract is "malformed input raises
+                # ZephyrDataError", full stop - this must not depend on the
+                # guard above staying in that exact order.
                 raise ZephyrDataError(
                     f"capability {key!r} was present but unparseable: {value!r}"
                 ) from err
@@ -159,7 +166,12 @@ class HoodState:
                 return None
             try:
                 return int(value)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
+                # OverflowError: json.loads accepts Infinity/NaN by default,
+                # and int(float("inf")) raises OverflowError rather than
+                # ValueError. This parser runs on every shadow push and must
+                # degrade a bad value to None, not let it drop the whole
+                # state update.
                 _LOGGER.warning(
                     "Could not coerce %r value %r to int; treating as unknown",
                     key,
