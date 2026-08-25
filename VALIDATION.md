@@ -90,13 +90,15 @@ raises `power` itself.
 → Power gets its own `switch` entity, and the fan and light entities must
 **not** write `power` alongside the level.
 
-**2. `setdelaytimer` — seconds, arbitrary values.**
-Not minutes. The vendor app's two presets are a UI choice; the device
-accepts any value. The device derives `delaytimer` and counts it down
-itself in 60-second steps, reporting about once a minute.
+**2. `setdelaytimer` — seconds, not preset-snapped.**
+Not minutes. The vendor app's two presets are a UI choice rather than a
+device constraint: values off the presets are accepted, proven up to 3600
+seconds. The device derives `delaytimer` and counts it down itself in
+60-second steps, reporting about once a minute.
 
-→ HA `number` entity, converting minutes to seconds on write. The ceiling
-is still unprobed (`PROTOCOL.md` §7).
+→ HA `number` entity, converting minutes to seconds on write, and carrying
+its own maximum — the device's ceiling is unprobed (`PROTOCOL.md` §7), so
+the entity bound is a UI cap, not a known device limit.
 
 **3. Filter counters — minutes, against a maximum in hours.**
 Confirmed, and cross-checked against the vendor app rather than inferred:

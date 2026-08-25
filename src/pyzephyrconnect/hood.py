@@ -518,9 +518,11 @@ class Hood:
         """Arms the delay-off timer, in SECONDS.
 
         Seconds, not minutes - established by step 6 of the hardware runbook
-        and recorded in PROTOCOL.md 5. The device accepts arbitrary values;
-        the vendor app exposing only two presets is a UI choice, not a device
-        constraint. The upper bound is still unprobed.
+        and recorded in PROTOCOL.md section 5. The vendor app exposing only
+        two presets is a UI choice rather than a device constraint: values
+        off the presets are accepted, proven up to 3600. Past that the
+        device's own ceiling is unprobed, so a larger value may be clamped
+        or rejected by the hardware rather than by this method.
 
         The device derives and decrements `delaytimer` from this itself, so
         only `setdelaytimer` is written.

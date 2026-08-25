@@ -248,7 +248,8 @@ client = mqtt.Client(
     client_id=client_id,          # see "Client ID" below
     transport="websockets", protocol=mqtt.MQTTv311)
 client.ws_set_options(path=f"{parts.path}?{parts.query}")
-client.tls_set_context(ssl.create_default_context())
+# Off-thread: building the context on the event loop blocks. See below.
+client.tls_set_context(await asyncio.to_thread(ssl.create_default_context))
 client.connect_async(IOT_ENDPOINT, 443, keepalive=30)
 ```
 
@@ -256,7 +257,9 @@ The presigned URL embeds a signature over credentials that expire in an
 hour, so **every reconnect must re-presign**. Reusing the URL retries a
 signature AWS IoT has already stopped accepting — and paho's own
 auto-reconnect will do exactly that, indefinitely, unless something
-rebuilds the socket (§7).
+rebuilds the socket. Credentials last an hour (§3.2), so the library runs a
+supervisor that re-presigns and rebuilds each hood's socket ahead of
+expiry; anything reimplementing this transport needs the equivalent.
 
 ### Topics
 
@@ -313,12 +316,14 @@ while `power` reads `0`, and the device raises `power` itself in response.
 So a client exposes power as its own control, and must *not* write `power`
 alongside a fan or light level.
 
-**`setdelaytimer` — seconds, arbitrary values.**
-Not minutes, and not preset-snapped: the vendor app offers two presets, but
-that is a UI choice and the device accepts any value. The device derives
-`delaytimer` from it and counts down itself in 60-second steps, reporting
-roughly once a minute — so `delaytimer` is device-authored and writing it is
-unnecessary. The upper bound is unknown (§7).
+**`setdelaytimer` — seconds, not preset-snapped.**
+Not minutes. The vendor app offers two presets, but that is a UI choice
+rather than a device constraint: values off the presets are accepted. The
+proven domain is non-negative seconds up to 3600. Beyond that the ceiling
+is unprobed (§7) — do not describe the field as unbounded. The device
+derives `delaytimer` from it and counts down itself in 60-second steps,
+reporting roughly once a minute, so `delaytimer` is device-authored and
+writing it is unnecessary.
 
 **Filter counters — counter in minutes, capability maximum in hours.**
 `usegreasefiltertime` / `usecharcoalfiltertime` count **minutes**, while
