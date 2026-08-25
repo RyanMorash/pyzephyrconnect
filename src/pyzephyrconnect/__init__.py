@@ -13,6 +13,7 @@ from .exceptions import (
     ZephyrTransportError,
     ZephyrWriteError,
 )
+from .hood import Hood
 from .models import HoodCapabilities, HoodState
 
 __version__ = "0.1.0"
@@ -32,6 +33,7 @@ __all__ = [
     "ZephyrNotConnectedError",
     "ZephyrWriteError",
     "ZephyrDataError",
+    "Hood",
     "HoodCapabilities",
     "HoodState",
     "__version__",
