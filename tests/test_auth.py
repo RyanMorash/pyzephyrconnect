@@ -3,10 +3,11 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
 import pytest
+from botocore.exceptions import ClientError
 
 from pyzephyrconnect import auth as auth_module
 from pyzephyrconnect.auth import AbstractAuth, Credentials, ZephyrAuth, ZephyrTokens
-from pyzephyrconnect.exceptions import ZephyrAuthError
+from pyzephyrconnect.exceptions import ZephyrAuthError, ZephyrTransportError
 
 IDENTITY = "us-west-2:00000000-1111-2222-3333-444455556666"
 
@@ -192,3 +193,113 @@ async def test_a_minimal_subclass_satisfies_the_whole_client_contract(fake_aws):
     assert auth.mqtt_client_id == f"{IDENTITY}-ha"
     await auth.async_attach_policy()
     fake_aws["iot"].attach_policy.assert_called_once()
+
+
+# -- _classify --------------------------------------------------------
+
+
+def _client_error(code):
+    return ClientError({"Error": {"Code": code}}, "GetCredentialsForIdentity")
+
+
+def test_classify_maps_not_authorized_client_error_to_auth_error():
+    err = AbstractAuth._classify(_client_error("NotAuthorizedException"))
+    assert isinstance(err, ZephyrAuthError)
+
+
+def test_classify_maps_too_many_requests_to_transport_error():
+    """A Cognito rate limit at the hourly refresh is noise, not a
+    rejection - it must not be treated as terminal."""
+    err = AbstractAuth._classify(_client_error("TooManyRequestsException"))
+    assert isinstance(err, ZephyrTransportError)
+
+
+def test_classify_maps_plain_oserror_to_transport_error():
+    err = AbstractAuth._classify(OSError("connection reset"))
+    assert isinstance(err, ZephyrTransportError)
+
+
+def test_classify_matches_pycognito_terminal_exceptions_by_type_name():
+    """pycognito raises ForceChangePasswordException, SoftwareToken/SMS
+    MFAChallengeException etc. directly - never wrapped in ClientError.
+    These mean "needs the user", not "retry", so _classify must catch them
+    too. Matched on type(err).__name__ (not isinstance) so this module
+    never has to import pycognito's exception classes; a locally-defined
+    class with the same name proves the matching is name-based."""
+
+    class ForceChangePasswordException(Exception):
+        pass
+
+    err = AbstractAuth._classify(ForceChangePasswordException("boom"))
+    assert isinstance(err, ZephyrAuthError)
+
+
+# -- repr security ------------------------------------------------------
+
+
+def test_zephyr_tokens_repr_hides_secrets():
+    """A refresh token is good for ~30 days and alone is enough to take
+    over the account; it must never land in a log or traceback via repr."""
+    tokens = _stored_tokens()
+    text = repr(tokens)
+    assert "REFRESH" not in text
+    assert tokens.refresh_token not in text
+    assert tokens.id_token not in text
+
+
+def test_credentials_repr_hides_secrets():
+    creds = Credentials(
+        "AKIA", "SECRET", "TOKEN", datetime.now(UTC) + timedelta(seconds=3600)
+    )
+    text = repr(creds)
+    assert "SECRET" not in text
+    assert "TOKEN" not in text
+
+
+# -- credential cache keyed to identity ----------------------------------
+
+
+async def test_credentials_cache_is_keyed_to_identity(fake_aws):
+    """A subclass's tokens object can be swapped for a different account's
+    underneath the cache. If the new tokens resolve to a different
+    identity, the cached credentials must not be served, even though they
+    are not yet expired - PROTOCOL.md section 3.3: a client ID built on the
+    wrong identity connects fine and silently drops every message."""
+    other_identity = "us-west-2:99999999-8888-7777-6666-555544443333"
+    auth = _StaticAuth(_stored_tokens(3600), MagicMock())
+
+    first = await auth.async_get_credentials()
+    assert first.secret_key == "SECRET"
+    assert fake_aws["identity"].get_credentials_for_identity.call_count == 1
+
+    auth._static = ZephyrTokens(
+        username="user@example.com",
+        id_token="NEW-ID",
+        refresh_token="REFRESH",
+        identity_id=other_identity,
+        expires_at=time.time() + 3600,
+    )
+
+    second = await auth.async_get_credentials()
+
+    assert fake_aws["identity"].get_credentials_for_identity.call_count == 2
+    assert second is not first
+
+
+# -- _exchange transient-failure gating ----------------------------------
+
+
+async def test_exchange_transient_failure_propagates_without_refetch(fake_aws):
+    """A stored identity paired with a transient OSError (a socket blip,
+    not Cognito rejecting the identity) must not trigger a second get_id
+    round trip, and must surface through the ZephyrError contract rather
+    than as a raw OSError."""
+    fake_aws["identity"].get_credentials_for_identity.side_effect = OSError(
+        "connection reset"
+    )
+    auth = _StaticAuth(_stored_tokens(3600), MagicMock())
+
+    with pytest.raises(ZephyrTransportError):
+        await auth.async_get_credentials()
+
+    assert fake_aws["identity"].get_id.call_count == 0

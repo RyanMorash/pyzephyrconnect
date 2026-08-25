@@ -118,6 +118,16 @@ class AbstractAuth(ABC):
         self.session = session
         self.endpoints = endpoints
         self._credentials: Credentials | None = None
+        # Identity the cached _credentials were minted for. An AbstractAuth
+        # instance is documented as one account, but nothing stops a
+        # subclass from swapping in a different account's tokens underneath
+        # it (e.g. a config-entry reload reusing the same object) - without
+        # this, async_get_credentials would keep serving the old identity's
+        # cached credentials as "not expired" instead of noticing the swap
+        # and re-exchanging. That is the PROTOCOL.md section 3.3 failure
+        # mode: a client ID built on the wrong identity connects fine and
+        # silently drops every message.
+        self._credentials_for: str | None = None
         # Set when the exchange discovers a stored identity_id is stale.
         # Runtime authority over tokens.identity_id from that point on.
         self._identity_override: str | None = None
@@ -172,6 +182,10 @@ class AbstractAuth(ABC):
         these need replacing?" without async_get_credentials() renewing them
         as a side effect, which would make the answer always False and the
         socket never get rebuilt.
+
+        Deliberately NOT identity-aware: the supervisor calls this without
+        tokens in hand, so it can only read expiry. async_get_credentials()
+        is what actually gates the cache on identity, via _credentials_for.
         """
         return self._credentials is None or self._credentials.expired
 
@@ -183,14 +197,21 @@ class AbstractAuth(ABC):
         """
         tokens = await self.async_get_tokens()
         self._seen_tokens = tokens
-        if not self.credentials_expired:
+        current_identity = self._identity_override or tokens.identity_id
+        if not self.credentials_expired and self._credentials_for == current_identity:
             assert self._credentials is not None
             return self._credentials
         async with self._aws_lock:
-            if not self.credentials_expired:
+            # Re-resolve: another waiter may have updated _identity_override
+            # or refreshed _credentials while this coroutine was blocked.
+            current_identity = self._identity_override or tokens.identity_id
+            if (
+                not self.credentials_expired
+                and self._credentials_for == current_identity
+            ):
                 assert self._credentials is not None
                 return self._credentials
-            stored_identity = self._identity_override or tokens.identity_id
+            stored_identity = current_identity
             try:
                 identity_id, credentials = await asyncio.to_thread(
                     self._exchange, tokens.id_token, stored_identity
@@ -212,6 +233,7 @@ class AbstractAuth(ABC):
                 self._identity_override = identity_id
                 self._on_identity_refetched(identity_id)
             self._credentials = credentials
+            self._credentials_for = identity_id
             return self._credentials
 
     async def async_attach_policy(self) -> None:
@@ -251,11 +273,27 @@ class AbstractAuth(ABC):
             "AccessDeniedException",
         }:
             return ZephyrAuthError(f"credentials rejected: {code}")
-        return ZephyrTransportError(f"cloud request failed: {err}")
+        # pycognito raises its own terminal exceptions that never go through
+        # botocore/ClientError - a forced password change or an MFA
+        # challenge means "needs the user", not "retry". Matched on the
+        # type name (not isinstance) so this module does not have to import
+        # pycognito's exception classes.
+        if type(err).__name__ in {
+            "ForceChangePasswordException",
+            "SoftwareTokenMFAChallengeException",
+            "SMSMFAChallengeException",
+            "MFAChallengeException",
+        }:
+            return ZephyrAuthError(f"credentials rejected: {type(err).__name__}")
+        # No raw exception text here: botocore's ParamValidationError (and
+        # others) can echo parameter values back in the message, which may
+        # include tokens - and this lands in ERROR logs users paste into
+        # public issues.
+        return ZephyrTransportError(f"cloud request failed: {type(err).__name__}")
 
     # -- blocking bodies, run in a worker thread ----------------------
 
-    def _identity_client(self):
+    def _identity_client(self) -> Any:
         return boto3.client(
             "cognito-identity",
             region_name=self.endpoints.region,
@@ -285,8 +323,15 @@ class AbstractAuth(ABC):
 
         try:
             resolved, raw = fetch(identity_id)
-        except Exception:
-            if identity_id is None:
+        except Exception as err:
+            if not identity_id:
+                # Nothing stored to have been stale - give up immediately.
+                raise
+            if not isinstance(err, ClientError):
+                # A transient error (socket, timeout, DNS) rather than
+                # Cognito rejecting the stored identity. Refetching would
+                # not help and only spends a second round trip before the
+                # caller's own retry - propagate it as-is.
                 raise
             _LOGGER.debug("stored identity ID rejected; refetching")
             resolved, raw = fetch(None)
