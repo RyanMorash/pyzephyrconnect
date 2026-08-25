@@ -330,9 +330,7 @@ async def test_ssl_context_is_built_once_and_cached(monkeypatch):
     monkeypatch.setattr(
         api_module, "build_ssl_context", lambda: calls.append(1) or real()
     )
-    session = FakeSession(
-        FakeResponse({"devices": []}), FakeResponse({"devices": []})
-    )
+    session = FakeSession(FakeResponse({"devices": []}), FakeResponse({"devices": []}))
     api = ZephyrApi(_fake_auth(session))
     await api.get_own_devices()
     await api.get_own_devices()

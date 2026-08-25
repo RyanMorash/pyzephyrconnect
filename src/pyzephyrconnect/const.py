@@ -2,6 +2,7 @@
 
 All values reverse-engineered from the vendor iOS app. See PROTOCOL.md.
 """
+
 from dataclasses import dataclass, field
 
 REGION = "us-west-2"
@@ -88,19 +89,23 @@ SUPERVISOR_INTERVAL_SECONDS = 60
 # is a counter, an alarm, or device-reported telemetry. Note: delaytimer is
 # device-reported only; the device derives and decrements it from setdelaytimer,
 # so writing delaytimer is unnecessary.
-WRITABLE_FIELDS = frozenset({
-    "power",
-    "light",
-    "fan",
-    "setdelaytimer",
-    "setcleanairfunction",
-    "setrecirculating",
-    "resetgreasefilter",
-})
+WRITABLE_FIELDS = frozenset(
+    {
+        "power",
+        "light",
+        "fan",
+        "setdelaytimer",
+        "setcleanairfunction",
+        "setrecirculating",
+        "resetgreasefilter",
+    }
+)
 
 # Writes that are destructive or change device configuration. The probe
 # requires an extra confirmation for these.
-DANGEROUS_FIELDS = frozenset({
-    "resetgreasefilter",   # zeroes an unrecoverable usage counter
-    "setrecirculating",    # changes filter accounting
-})
+DANGEROUS_FIELDS = frozenset(
+    {
+        "resetgreasefilter",  # zeroes an unrecoverable usage counter
+        "setrecirculating",  # changes filter accounting
+    }
+)

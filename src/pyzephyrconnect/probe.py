@@ -82,8 +82,7 @@ def validate_write(field: str, *, confirmed: bool, forced: bool) -> None:
         )
     if not confirmed:
         raise PermissionError(
-            f"refusing to write {field!r} without --confirm; this actuates "
-            "hardware"
+            f"refusing to write {field!r} without --confirm; this actuates hardware"
         )
     if field in const.DANGEROUS_FIELDS and not forced:
         raise PermissionError(
@@ -137,16 +136,31 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="pyzephyrconnect",
         description="Read and probe a Zephyr range hood's device shadow.",
     )
-    parser.add_argument("--watch", action="store_true",
-                        help="stream shadow updates until interrupted")
-    parser.add_argument("--seconds", type=int, default=300,
-                        help="how long --watch listens (default: 300)")
-    parser.add_argument("--set", dest="assignment", metavar="FIELD=VALUE",
-                        help="write one field to the shadow")
-    parser.add_argument("--confirm", action="store_true",
-                        help="required for any write; actuates hardware")
-    parser.add_argument("--force", action="store_true",
-                        help="additionally required for destructive writes")
+    parser.add_argument(
+        "--watch", action="store_true", help="stream shadow updates until interrupted"
+    )
+    parser.add_argument(
+        "--seconds",
+        type=int,
+        default=300,
+        help="how long --watch listens (default: 300)",
+    )
+    parser.add_argument(
+        "--set",
+        dest="assignment",
+        metavar="FIELD=VALUE",
+        help="write one field to the shadow",
+    )
+    parser.add_argument(
+        "--confirm",
+        action="store_true",
+        help="required for any write; actuates hardware",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="additionally required for destructive writes",
+    )
     parser.add_argument("--thing", help="thing name (default: first device)")
     parser.add_argument("--verbose", action="store_true")
     return parser
@@ -202,8 +216,10 @@ async def main(argv: list[str] | None = None) -> int:
         else:
             hood = hoods[0]
         caps = hood.capabilities
-        print(f"device: {caps.model} (fan {_range(caps.max_fan_speed)}, "
-              f"light {_range(caps.max_light_level)})")
+        print(
+            f"device: {caps.model} (fan {_range(caps.max_fan_speed)}, "
+            f"light {_range(caps.max_light_level)})"
+        )
 
         try:
             await hood.async_start()
@@ -238,8 +254,10 @@ async def main(argv: list[str] | None = None) -> int:
 def _report(changes: dict[str, tuple[Any, Any]]) -> None:
     """Prints the observed shadow diff, or a note that nothing changed."""
     if not changes:
-        print("\nno reported change. The device may have ignored the write, "
-              "or it may not echo this field.")
+        print(
+            "\nno reported change. The device may have ignored the write, "
+            "or it may not echo this field."
+        )
         return
     print("\nchanged:")
     for key, (old, new) in sorted(changes.items()):

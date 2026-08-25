@@ -22,9 +22,7 @@ ALGORITHM = "AWS4-HMAC-SHA256"
 CANONICAL_URI = "/mqtt"
 SIGNED_HEADERS = "host"
 # SHA-256 of the empty string; a presigned GET has no body.
-EMPTY_PAYLOAD_HASH = (
-    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-)
+EMPTY_PAYLOAD_HASH = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 # RFC 3986 unreserved characters. urllib's default safe set is "/", which is
 # wrong for canonical query encoding.
 _SAFE = "-_.~"
@@ -35,7 +33,9 @@ def _hmac(key: bytes, msg: str) -> bytes:
     return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
 
 
-def _signing_key(secret_key: str, datestamp: str, region: str, service: str = SERVICE) -> bytes:
+def _signing_key(
+    secret_key: str, datestamp: str, region: str, service: str = SERVICE
+) -> bytes:
     """Derives the SigV4 signing key via the date/region/service chain.
 
     Args:
@@ -159,8 +159,10 @@ def build_presigned_url(
             scope,
             hashlib.sha256(
                 canonical_request(
-                    access_key=access_key, endpoint=endpoint,
-                    region=region, now=now,
+                    access_key=access_key,
+                    endpoint=endpoint,
+                    region=region,
+                    now=now,
                 ).encode("utf-8")
             ).hexdigest(),
         ]

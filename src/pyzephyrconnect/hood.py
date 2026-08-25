@@ -367,8 +367,7 @@ class Hood:
         # not become a blanket refusal to write.
         if isinstance(maximum, int) and maximum > 0 and value > maximum:
             raise ZephyrWriteError(
-                f"{name} must be between 0 and {maximum} on this hood, "
-                f"got {value}"
+                f"{name} must be between 0 and {maximum} on this hood, got {value}"
             )
 
     async def async_set_fields(self, fields: dict[str, int]) -> None:
@@ -422,8 +421,7 @@ class Hood:
             # No thing name in the message: it identifies a home, and
             # exception text ends up in logs users paste publicly.
             raise ZephyrNotConnectedError(
-                "hood is not connected (never started, stopped, or a "
-                "rebuild failed)"
+                "hood is not connected (never started, stopped, or a rebuild failed)"
             )
         if not fields:
             raise ZephyrWriteError("refusing to publish an empty reported state")

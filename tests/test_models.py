@@ -1,4 +1,5 @@
 """Tests for pyzephyrconnect.models."""
+
 import json
 from pathlib import Path
 

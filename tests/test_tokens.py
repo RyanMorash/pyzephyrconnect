@@ -140,7 +140,7 @@ def test_a_huge_expiry_never_reaches_the_traceback():
 
     rendered = "".join(traceback.format_exception(excinfo.value))
     assert str(huge) not in rendered
-    assert "expires_at" in rendered        # the field name still says which
+    assert "expires_at" in rendered  # the field name still says which
 
 
 def test_an_unparseable_expiry_never_reaches_the_traceback():
@@ -161,4 +161,4 @@ def test_an_unparseable_expiry_never_reaches_the_traceback():
 
     rendered = "".join(traceback.format_exception(excinfo.value))
     assert leaked not in rendered
-    assert "expires_at" in rendered        # the field name still says which
+    assert "expires_at" in rendered  # the field name still says which

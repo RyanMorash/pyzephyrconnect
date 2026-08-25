@@ -68,9 +68,7 @@ def fake_paho(monkeypatch):
             client.on_subscribe(client, None, 1, [granted], None)
 
     client.connect_async.side_effect = fire_connack
-    monkeypatch.setattr(
-        shadow_module.mqtt, "Client", MagicMock(return_value=client)
-    )
+    monkeypatch.setattr(shadow_module.mqtt, "Client", MagicMock(return_value=client))
     return client
 
 
@@ -371,7 +369,9 @@ async def test_tls_context_is_not_built_on_the_event_loop(fake_paho):
     ctx = client.tls_set_context.call_args.args[0]
     # Design Risks 10-11: a default context - CERT_REQUIRED, hostname
     # checking on, and NOT the TWCA-augmented REST context.
-    assert ctx.verify_mode is ssl.VERIFY_DEFAULT or ctx.verify_mode.name == "CERT_REQUIRED"
+    assert (
+        ctx.verify_mode is ssl.VERIFY_DEFAULT or ctx.verify_mode.name == "CERT_REQUIRED"
+    )
     assert ctx.check_hostname is True
 
 
@@ -558,6 +558,7 @@ async def test_a_cancelled_disconnect_completes_the_teardown_before_raising(
 
     def gated_to_thread(fn, *args, **kwargs):
         """Gate asyncio.to_thread work behind the test's future."""
+
         # Stands in for the worker thread: the teardown does not run until
         # the test opens the gate, so "still in flight" is deterministic.
         async def run():
@@ -687,15 +688,15 @@ async def test_a_hood_rebuilds_with_a_fresh_client_after_a_precheck_refusal(
     with pytest.raises(ZephyrNotConnectedError):
         await hood.async_set_light(1)
 
-    assert made[0]._client is None         # the dead session is really gone
-    assert hood._shadow is None            # ...and nothing points at it
-    assert hood._should_run is True        # the consumer still wants it up
+    assert made[0]._client is None  # the dead session is really gone
+    assert hood._shadow is None  # ...and nothing points at it
+    assert hood._should_run is True  # the consumer still wants it up
 
     # The rebuilt socket is live again, as a real one would be.
     fake_paho.is_connected.return_value = True
-    await hood.async_ensure_running()      # the next supervisor tick
+    await hood.async_ensure_running()  # the next supervisor tick
 
-    assert len(made) == 2                  # a FRESH client, not the hollow one
+    assert len(made) == 2  # a FRESH client, not the hollow one
     assert hood._shadow is made[1]
 
 
@@ -712,14 +713,12 @@ async def test_a_refused_write_tears_the_connection_down_so_it_cannot_fire_later
     """
     sc = _make()
     await _connect(sc)
-    fake_paho.publish.return_value = MagicMock(
-        rc=shadow_module.mqtt.MQTT_ERR_NO_CONN
-    )
+    fake_paho.publish.return_value = MagicMock(rc=shadow_module.mqtt.MQTT_ERR_NO_CONN)
 
     with pytest.raises(ZephyrNotConnectedError):
         await sc.publish_state({"light": 1})
 
-    assert fake_paho.loop_stop.called      # the queued write died with it
+    assert fake_paho.loop_stop.called  # the queued write died with it
     assert sc._client is None
 
 
@@ -732,9 +731,7 @@ async def test_a_no_conn_state_request_is_torn_down_too(fake_paho):
     """
     sc = _make()
     await _connect(sc)
-    fake_paho.publish.return_value = MagicMock(
-        rc=shadow_module.mqtt.MQTT_ERR_NO_CONN
-    )
+    fake_paho.publish.return_value = MagicMock(rc=shadow_module.mqtt.MQTT_ERR_NO_CONN)
 
     with pytest.raises(ZephyrNotConnectedError):
         await sc.request_state()
@@ -753,9 +750,9 @@ async def test_a_paho_reconnect_re_issues_the_shadow_get(fake_paho):
     sc = _make()
     await _connect(sc)
 
-    assert len(_get_publishes(fake_paho)) == 1        # the initial handshake
+    assert len(_get_publishes(fake_paho)) == 1  # the initial handshake
 
-    sc._on_connect(fake_paho, None, {}, 0, None)      # paho auto-reconnected
+    sc._on_connect(fake_paho, None, {}, 0, None)  # paho auto-reconnected
 
     assert len(_get_publishes(fake_paho)) == 2
 

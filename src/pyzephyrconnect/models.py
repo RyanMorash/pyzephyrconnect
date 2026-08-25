@@ -154,9 +154,7 @@ class HoodCapabilities:
             max_charcoal_filter_hours=as_int("maxCharcoalfilterTimer"),
             labor_warranty=str(payload.get("laborWarranty", "")),
             parts_warranty=str(payload.get("partsWarranty", "")),
-            urls=MappingProxyType(
-                {k: payload[k] for k in _URL_KEYS if payload.get(k)}
-            ),
+            urls=MappingProxyType({k: payload[k] for k in _URL_KEYS if payload.get(k)}),
             raw=MappingProxyType(dict(payload)),
         )
 

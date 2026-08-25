@@ -1,4 +1,5 @@
 """Tests for pyzephyrconnect.exceptions."""
+
 import pyzephyrconnect
 from pyzephyrconnect.exceptions import (
     ZephyrDataError,

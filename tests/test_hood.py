@@ -77,7 +77,7 @@ async def test_out_of_range_is_refused_before_anything_is_published():
     await hood.async_start()
 
     with pytest.raises(ZephyrWriteError):
-        await hood.async_set_fan(7)          # reference hood maxes at 6
+        await hood.async_set_fan(7)  # reference hood maxes at 6
     shadow.publish_state.assert_not_awaited()
 
 
@@ -189,12 +189,12 @@ async def test_ensure_running_recovers_a_hood_whose_rebuild_failed():
         return shadow
 
     hood = Hood(_caps(), factory, AsyncMock(), AsyncMock())
-    await hood.async_start()                      # made[0] connects
+    await hood.async_start()  # made[0] connects
 
     with pytest.raises(ZephyrTransportError):
-        await hood.async_reconnect()              # made[1] fails; _shadow None
+        await hood.async_reconnect()  # made[1] fails; _shadow None
 
-    await hood.async_ensure_running()             # made[2] recovers
+    await hood.async_ensure_running()  # made[2] recovers
     assert len(made) == 3
     made[2].request_state.assert_awaited()
 
@@ -236,7 +236,7 @@ async def test_a_write_during_a_reconnect_waits_rather_than_failing():
 
     write = asyncio.create_task(hood.async_set_light(1))
     await asyncio.sleep(0)
-    assert not write.done()          # waiting on the lock, not raising
+    assert not write.done()  # waiting on the lock, not raising
 
     release.set()
     await reconnect
@@ -339,10 +339,10 @@ async def test_intent_survives_a_failed_supervisor_rebuild():
         return shadow
 
     hood = Hood(_caps(), factory, AsyncMock(), AsyncMock())
-    await hood.async_start()                      # made[0] connects
+    await hood.async_start()  # made[0] connects
 
     with pytest.raises(ZephyrTransportError):
-        await hood.async_reconnect()              # made[1] fails mid-rebuild
+        await hood.async_reconnect()  # made[1] fails mid-rebuild
 
     assert hood._should_run is True
     assert hood._shadow is None
@@ -386,9 +386,9 @@ async def test_a_failed_consumer_start_rolls_back_intent():
     assert hood._should_run is False
     assert hood._shadow is None
 
-    await hood.async_ensure_running()             # the next supervisor tick
+    await hood.async_ensure_running()  # the next supervisor tick
 
-    assert len(made) == 1                         # not revived
+    assert len(made) == 1  # not revived
 
 
 async def test_a_failed_state_request_leaves_the_hood_recoverable():
@@ -421,16 +421,16 @@ async def test_a_failed_state_request_leaves_the_hood_recoverable():
         return shadow
 
     hood = Hood(_caps(), factory, AsyncMock(), AsyncMock())
-    await hood.async_start()             # made[0] connects and reads state
+    await hood.async_start()  # made[0] connects and reads state
 
     with pytest.raises(ZephyrTransportError):
-        await hood.async_reconnect()     # made[1]'s request_state raises
+        await hood.async_reconnect()  # made[1]'s request_state raises
 
-    assert hood._shadow is None          # not left looking connected
-    assert hood._should_run is True      # consumer intent survives
+    assert hood._shadow is None  # not left looking connected
+    assert hood._should_run is True  # consumer intent survives
     made[1].disconnect.assert_awaited_once()
 
-    await hood.async_ensure_running()    # the next supervisor tick
+    await hood.async_ensure_running()  # the next supervisor tick
 
     assert len(made) == 3
     made[2].request_state.assert_awaited()
@@ -577,9 +577,9 @@ async def test_a_write_refused_by_a_dead_socket_leaves_a_recoverable_hood():
 
     assert hood._shadow is None
     assert hood.connected is False
-    assert hood._should_run is True        # the consumer still wants it up
+    assert hood._should_run is True  # the consumer still wants it up
 
-    await hood.async_ensure_running()      # the next supervisor tick
+    await hood.async_ensure_running()  # the next supervisor tick
 
     assert len(made) == 2
     await hood.async_set_light(1)

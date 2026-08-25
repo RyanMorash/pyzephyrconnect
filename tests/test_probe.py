@@ -91,9 +91,7 @@ def test_diff_reports_newly_appearing_keys():
     A field the device only reports once set is exactly what the
     validation sequence is hunting for.
     """
-    assert diff_states({"fan": 0}, {"fan": 0, "newField": 7}) == {
-        "newField": (None, 7)
-    }
+    assert diff_states({"fan": 0}, {"fan": 0, "newField": 7}) == {"newField": (None, 7)}
 
 
 def test_diff_of_identical_states_is_empty():
@@ -188,9 +186,7 @@ async def test_async_stop_runs_even_when_a_post_start_step_raises(monkeypatch):
     auth.credentials_expired = False
     auth.async_get_tokens = AsyncMock()
     auth.async_get_credentials = AsyncMock(
-        return_value=Credentials(
-            "k", "s", "t", datetime.now(UTC) + timedelta(hours=1)
-        )
+        return_value=Credentials("k", "s", "t", datetime.now(UTC) + timedelta(hours=1))
     )
     auth.async_attach_policy = AsyncMock()
 
@@ -206,13 +202,9 @@ async def test_async_stop_runs_even_when_a_post_start_step_raises(monkeypatch):
     # from_credentials() constructs a CredentialsAuth internally; patching
     # the class is how the double gets injected without touching probe.py's
     # call site.
-    monkeypatch.setattr(
-        client_module, "CredentialsAuth", MagicMock(return_value=auth)
-    )
+    monkeypatch.setattr(client_module, "CredentialsAuth", MagicMock(return_value=auth))
     monkeypatch.setattr(client_module, "ZephyrApi", MagicMock(return_value=api))
-    monkeypatch.setattr(
-        client_module, "ShadowClient", MagicMock(return_value=shadow)
-    )
+    monkeypatch.setattr(client_module, "ShadowClient", MagicMock(return_value=shadow))
     monkeypatch.setenv("ZEPHYR_USER", "user@example.com")
     monkeypatch.setenv("ZEPHYR_PASS", "hunter2")
 
@@ -253,9 +245,7 @@ async def test_thing_mismatch_exits_2_without_touching_the_device(monkeypatch):
     auth.credentials_expired = False
     auth.async_get_tokens = AsyncMock()
     auth.async_get_credentials = AsyncMock(
-        return_value=Credentials(
-            "k", "s", "t", datetime.now(UTC) + timedelta(hours=1)
-        )
+        return_value=Credentials("k", "s", "t", datetime.now(UTC) + timedelta(hours=1))
     )
     auth.async_attach_policy = AsyncMock()
 
@@ -269,13 +259,9 @@ async def test_thing_mismatch_exits_2_without_touching_the_device(monkeypatch):
     shadow.request_state = AsyncMock()
     shadow.publish_state = AsyncMock()
 
-    monkeypatch.setattr(
-        client_module, "CredentialsAuth", MagicMock(return_value=auth)
-    )
+    monkeypatch.setattr(client_module, "CredentialsAuth", MagicMock(return_value=auth))
     monkeypatch.setattr(client_module, "ZephyrApi", MagicMock(return_value=api))
-    monkeypatch.setattr(
-        client_module, "ShadowClient", MagicMock(return_value=shadow)
-    )
+    monkeypatch.setattr(client_module, "ShadowClient", MagicMock(return_value=shadow))
     monkeypatch.setenv("ZEPHYR_USER", "user@example.com")
     monkeypatch.setenv("ZEPHYR_PASS", "hunter2")
 
