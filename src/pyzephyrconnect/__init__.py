@@ -4,9 +4,12 @@ from .client import ZephyrClient
 from .exceptions import (
     ZephyrAuthError,
     ZephyrCertificateError,
+    ZephyrDataError,
     ZephyrError,
+    ZephyrNotConnectedError,
     ZephyrPolicyError,
     ZephyrTransportError,
+    ZephyrWriteError,
 )
 from .models import HoodCapabilities, HoodState
 
@@ -19,6 +22,9 @@ __all__ = [
     "ZephyrCertificateError",
     "ZephyrPolicyError",
     "ZephyrTransportError",
+    "ZephyrNotConnectedError",
+    "ZephyrWriteError",
+    "ZephyrDataError",
     "HoodCapabilities",
     "HoodState",
     "__version__",

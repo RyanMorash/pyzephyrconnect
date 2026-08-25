@@ -36,4 +36,33 @@ class ZephyrPolicyError(ZephyrError):
 
 
 class ZephyrTransportError(ZephyrError):
-    """MQTT connect, subscribe or publish failed."""
+    """A network, timeout or throttling failure. Retryable.
+
+    Deliberately distinct from ZephyrAuthError: the supervisor treats auth
+    errors as terminal (they need the user), while transport errors are
+    retried on the next tick. Wrapping a DNS blip in ZephyrAuthError turns
+    a Wi-Fi hiccup into a reauth prompt.
+    """
+
+
+class ZephyrNotConnectedError(ZephyrError):
+    """An operation needed a live shadow connection and there was none.
+
+    Call Hood.async_start() before reading push state or writing.
+    """
+
+
+class ZephyrWriteError(ZephyrError):
+    """A shadow write was refused before it left the process.
+
+    Either the field is not in WRITABLE_FIELDS, or the value is outside the
+    range the device's own capabilities declare. Nothing was published.
+    """
+
+
+class ZephyrDataError(ZephyrError):
+    """A payload field was present but could not be parsed.
+
+    Distinct from an absent field, which is not an error - other Zephyr
+    models legitimately omit keys this one returns.
+    """
