@@ -102,6 +102,11 @@ class ZephyrTokens:
         AWS IoT silently drops. Corruption has to fail here, at the
         boundary the README tells consumers to call.
 
+        The four string fields are checked as-is, never converted.
+        `expires_at` alone is converted: anything float() accepts,
+        including a numeric string, is taken, and the result must be
+        finite.
+
         Args:
             data: Mapping previously produced by as_dict and restored
                 from the consumer's storage.
@@ -110,8 +115,9 @@ class ZephyrTokens:
             The validated tokens.
 
         Raises:
-            ZephyrDataError: If any field is missing, empty, of the wrong
-                type, or (for expires_at) not a finite number.
+            ZephyrDataError: If a string field is missing, empty, or not
+                a str, or if expires_at is missing, cannot be converted
+                to float, or converts to a non-finite value.
         """
         try:
             values: dict[str, str] = {}

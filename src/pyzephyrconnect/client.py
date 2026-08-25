@@ -116,7 +116,8 @@ class ZephyrClient:
         """Builds a CredentialsAuth and a client from it, as a convenience.
 
         Supply `tokens` from a previous session and `token_updater` to
-        persist new ones, and a restart will skip the SRP login entirely.
+        persist new ones, and a restart skips the SRP login for as long
+        as the stored refresh token is still accepted.
 
         Args:
             username: The Zephyr account username.
@@ -248,10 +249,12 @@ class ZephyrClient:
     async def async_stop(self) -> None:
         """Stops every hood and retires the supervisor.
 
-        Stopping a hood directly via `hood.async_stop()` does NOT retire the
-        supervisor - only THIS method does. The supervisor is scoped to the
-        client, not to any one hood, and keeps ticking (renewing credentials,
-        reconnecting whatever is still `_should_run`) until this cancels it.
+        Stopping a hood directly via `hood.async_stop()` does not cancel
+        the supervisor: scoped to the client rather than any one hood, it
+        keeps ticking (renewing credentials, reconnecting whatever is
+        still `_should_run`) and retires itself only on its next cycle
+        once no started hoods remain. This method is the immediate path -
+        every hood stopped, then the supervisor cancelled outright.
 
         Raises:
             asyncio.CancelledError: If the caller cancelled this shutdown.
