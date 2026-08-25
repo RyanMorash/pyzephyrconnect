@@ -620,21 +620,19 @@ async def test_the_message_closure_is_pinned_to_its_own_hood(wired):
     await hoods[0].async_start()
     await hoods[1].async_start()
 
-    on_message_a = client_module.ShadowClient.call_args_list[0].args[2]
-
-    state_b_before = hoods[1].state
-    seen_b = []
-    hoods[1].add_listener(seen_b.append)
-
-    on_message_a(
-        f"$aws/things/{THING}/shadow/get/accepted",
+    # hoods[0] IS next(iter(self._hoods.values())), so driving index 0
+    # cannot tell the closure apart from a first-hood lookup.
+    on_message_b = client_module.ShadowClient.call_args_list[1].args[2]
+    state_a_before = hoods[0].state
+    seen_a = []
+    hoods[0].add_listener(seen_a.append)
+    on_message_b(
+        f"$aws/things/{OTHER}/shadow/get/accepted",
         {"state": {"reported": {"power": 1, "fan": 3}}},
     )
-
-    assert hoods[0].state is not None
-    assert hoods[0].state.power == 1
-    assert hoods[1].state is state_b_before
-    assert seen_b == []
+    assert hoods[1].state is not None and hoods[1].state.power == 1
+    assert hoods[0].state is state_a_before
+    assert seen_a == []
 
 
 async def test_a_malformed_message_does_not_escape_onto_the_loop(wired, caplog):
@@ -865,6 +863,28 @@ async def test_a_terminal_error_reaches_the_consumer_via_poll(wired):
         await hoods[0].async_poll()
 
 
+async def test_polling_a_terminal_error_raises_a_fresh_instance_each_time(wired):
+    """`raise type(err)(*err.args) from err` must build a NEW exception on
+    every poll. Re-raising the stored object itself would append frames to
+    ITS __traceback__ on every call - unbounded while a consumer keeps
+    polling through a terminal error that never clears."""
+    client = _client()
+    hoods = await client.async_setup()
+    client._supervisor_error = ZephyrAuthError("x")
+    stored = client._supervisor_error
+    assert stored.__traceback__ is None
+
+    with pytest.raises(ZephyrAuthError) as excinfo1:
+        await hoods[0].async_poll()
+    assert excinfo1.value is not stored
+    assert stored.__traceback__ is None
+
+    with pytest.raises(ZephyrAuthError) as excinfo2:
+        await hoods[0].async_poll()
+    assert excinfo2.value is not stored
+    assert stored.__traceback__ is None
+
+
 async def test_a_running_supervisor_is_not_replaced(wired):
     client = _client()
     hoods = await client.async_setup()
@@ -908,6 +928,73 @@ async def test_async_stop_cancels_and_awaits_the_supervisor(wired):
     await client.async_stop()
 
     assert supervisor.done()
+    assert client._supervisor is None
+    assert hoods[0]._should_run is False
+    wired["shadow"].disconnect.assert_awaited()
+
+
+async def test_async_stop_isolates_one_hoods_teardown_failure(wired):
+    """Each hood owns its own socket and paho thread, so one hood's
+    disconnect blowing up must not strand the other - async_stop's per-hood
+    try/except must still tear down (and clear _should_run on) hood B even
+    though hood A's disconnect raised."""
+    first = json.loads((FIXTURES / "discoverdevice.json").read_text())
+    second = json.loads((FIXTURES / "discoverdevice.json").read_text())
+    second["thingName"] = OTHER
+    wired["api"].get_own_devices = AsyncMock(
+        return_value=[{"thingName": THING}, {"thingName": OTHER}]
+    )
+    wired["api"].discover_device = AsyncMock(
+        side_effect=lambda thing: first if thing == THING else second
+    )
+
+    shadow_a = MagicMock()
+    shadow_a.connect = AsyncMock()
+    shadow_a.disconnect = AsyncMock(side_effect=OSError("teardown failed"))
+    shadow_a.request_state = AsyncMock()
+
+    shadow_b = MagicMock()
+    shadow_b.connect = AsyncMock()
+    shadow_b.disconnect = AsyncMock()
+    shadow_b.request_state = AsyncMock()
+
+    client_module.ShadowClient.side_effect = (
+        lambda thing_name, *a, **k: shadow_a if thing_name == THING else shadow_b
+    )
+
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+    await hoods[1].async_start()
+
+    await client.async_stop()          # must not raise
+
+    shadow_a.disconnect.assert_awaited_once()
+    shadow_b.disconnect.assert_awaited_once()
+    assert hoods[0]._should_run is False
+    assert hoods[1]._should_run is False
+
+
+async def test_async_stop_suppresses_a_supervisor_that_raised(wired):
+    """`with contextlib.suppress(BaseException)` around awaiting the
+    supervisor must swallow ANY exception it finished with, not just
+    CancelledError - narrowing that guard would skip the hood-stopping loop
+    entirely, leaking a paho thread per hood, and leave `_supervisor` set so
+    `_ensure_supervisor` never restarts it."""
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+
+    async def boom():
+        raise RuntimeError("supervisor died")
+
+    task = asyncio.create_task(boom())
+    await asyncio.sleep(0)
+    assert task.done()
+    client._supervisor = task
+
+    await client.async_stop()          # must not raise
+
     assert client._supervisor is None
     assert hoods[0]._should_run is False
     wired["shadow"].disconnect.assert_awaited()
