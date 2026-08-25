@@ -1,0 +1,10 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Home Assistant integration issue
+    url: https://github.com/home-assistant/core/issues
+    about: >-
+      If the problem is with the Home Assistant integration rather than this
+      library's protocol handling, report it against Home Assistant Core.
+  - name: Zephyr Connect integration issue
+    url: https://github.com/RyanMorash/ha_zephyr/issues
+    about: Problems with entities, config flow or setup belong here.

@@ -1,0 +1,31 @@
+name: Bug report
+description: A protocol or library defect in pyzephyrconnect
+labels: ["bug"]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: pyzephyrconnect version
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Hood model
+      description: From the vendor app, or the modelName field in diagnostics.
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: >-
+        Redact thingName, SN, MAC and location before pasting — they identify
+        your home.
+      render: text
