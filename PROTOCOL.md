@@ -325,6 +325,11 @@ derives `delaytimer` from it and counts down itself in 60-second steps,
 reporting roughly once a minute, so `delaytimer` is device-authored and
 writing it is unnecessary.
 
+The countdown has been watched to zero: when `delaytimer` reaches 0 the
+hood shuts off. So this is a real device-side delay-off function, not a
+display counter a client is expected to act on — nothing needs to watch
+for zero and issue its own `power` write.
+
 **Filter counters — counter in minutes, capability maximum in hours.**
 `usegreasefiltertime` / `usecharcoalfiltertime` count **minutes**, while
 `maxGreasefilterTimer` / `maxCharcoalfilterTimer` are **hours**. Conflating
@@ -418,24 +423,21 @@ run-time counter units, and `setcleanairfunction`. Credential refresh, reconnect
 polling/push decision, listed as open in earlier revisions, are implemented
 in the library. What follows is what is genuinely still unknown.
 
-1. **The `setdelaytimer` ceiling.** The device accepts arbitrary values
-   (§5), but the maximum is unprobed and validated at exactly one point: 60
-   minutes worked. One write above an hour establishes whether a larger
-   value is accepted, clamped, or rejected.
-2. **Whether the hood actually stops when `delaytimer` reaches 0.** The
-   countdown has been observed running; it has not been watched to zero end
-   to end.
-3. **`act` beyond `"Disabled"`.** The field is understood as a mode string
+1. **The `setdelaytimer` ceiling.** Off-preset values are accepted (§5),
+   but the maximum is unprobed and the domain is validated at exactly one
+   point: 3600 seconds worked. One write above an hour establishes whether
+   a larger value is accepted, clamped, or rejected.
+2. **`act` beyond `"Disabled"`.** The field is understood as a mode string
    but no other value has ever been observed. Treat it as free-form; do not
    build an enum on one sample.
-4. **Charcoal filter reset.** There is no `resetcharcoalfilter` field in the
+3. **Charcoal filter reset.** There is no `resetcharcoalfilter` field in the
    shadow. If the vendor app offers a charcoal reset, watch
    `update/accepted` while pressing it — it may reuse `resetgreasefilter`,
    or be app-side only. Until this is known, a recirculating hood gets a
    charcoal-life figure with no way to reset it.
-5. **`fanwarning` vs `alarmfan`.** Neither has ever fired, so what
+4. **`fanwarning` vs `alarmfan`.** Neither has ever fired, so what
    distinguishes them is unknown. Record both if either ever trips.
-6. **`resetgreasefilter` (runbook step 9) — deliberately deferred.** It
+5. **`resetgreasefilter` (runbook step 9) — deliberately deferred.** It
    zeroes `usegreasefiltertime`, which cannot be reconstructed. Do not run
    it until the grease filter is actually being cleaned.
 

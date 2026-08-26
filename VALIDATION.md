@@ -94,7 +94,8 @@ raises `power` itself.
 Not minutes. The vendor app's two presets are a UI choice rather than a
 device constraint: values off the presets are accepted, proven up to 3600
 seconds. The device derives `delaytimer` and counts it down itself in
-60-second steps, reporting about once a minute.
+60-second steps, reporting about once a minute, and at zero the hood shuts
+off — the countdown has been watched to zero end to end.
 
 → HA `number` entity, converting minutes to seconds on write, and carrying
 its own maximum — the device's ceiling is unprobed (`PROTOCOL.md` §7), so
