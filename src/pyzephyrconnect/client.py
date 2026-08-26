@@ -112,6 +112,7 @@ class ZephyrClient:
         tokens: ZephyrTokens | None = None,
         token_updater: Callable[[ZephyrTokens], None] | None = None,
         endpoints: Endpoints = DEFAULT_ENDPOINTS,
+        client_id_suffix: str = const.CLIENT_ID_SUFFIX,
     ) -> ZephyrClient:
         """Builds a CredentialsAuth and a client from it, as a convenience.
 
@@ -129,9 +130,16 @@ class ZephyrClient:
                 usually means a storage write; a consumer that needs I/O
                 should schedule it rather than perform it inline.
             endpoints: The cloud endpoints both REST and MQTT target.
+            client_id_suffix: Suffix identifying this consumer in the MQTT
+                client ID, defaulting to const.CLIENT_ID_SUFFIX. Pass your
+                own stable string so this consumer does not evict another
+                one running against the same account - see AbstractAuth.
 
         Returns:
             A ZephyrClient bound to the newly built CredentialsAuth.
+
+        Raises:
+            ValueError: If client_id_suffix is not a non-empty string.
         """
         return cls(
             CredentialsAuth(
@@ -141,6 +149,7 @@ class ZephyrClient:
                 tokens=tokens,
                 token_updater=token_updater,
                 endpoints=endpoints,
+                client_id_suffix=client_id_suffix,
             )
         )
 
@@ -150,8 +159,8 @@ class ZephyrClient:
 
         Reads the identity straight off the auth object. Do not reconstruct
         it by stripping the suffix off mqtt_client_id - that derives a source
-        from its own derivative and returns a wrong value the day
-        CLIENT_ID_SUFFIX changes.
+        from its own derivative and returns a wrong value for every consumer
+        that configures its own auth.client_id_suffix.
 
         Raises:
             ZephyrAuthError: If read before the first credential exchange,
@@ -388,9 +397,11 @@ class ZephyrClient:
             # from the original design, controller-authorized): two things
             # sharing an 8-char prefix got IDENTICAL client IDs under the
             # truncated form, which is the exact same-ID eviction this
-            # suffix exists to prevent. identity (~50 chars) + "-" + a
-            # 40-hex thing name stays comfortably under AWS IoT's 128-char
-            # client-ID limit.
+            # suffix exists to prevent. identity (~50 chars) + the auth
+            # object's client-ID suffix + "-" + a 40-hex thing name stays
+            # under AWS IoT's 128-char client-ID limit for any sane suffix -
+            # the ~35 characters left over are what AbstractAuth's
+            # client_id_suffix docstring asks consumers to stay inside.
             f"{self._auth.mqtt_client_id}-{hood.thing_name}",
             lambda topic, payload: self._handle_message(hood, topic, payload),
             hood.handle_connection_change,

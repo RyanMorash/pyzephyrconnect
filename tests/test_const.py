@@ -17,6 +17,18 @@ def test_aws_constants_are_pinned():
     assert const.POLICY_NAME == "RangeHoodPolicy"
 
 
+def test_the_default_client_id_suffix_is_the_neutral_one():
+    """Tests that the shipped default client-ID suffix stays "-py".
+
+    Not a reverse-engineered value - a library default consumers inherit.
+    It has to be non-empty (an empty suffix leaves the bare identity ID,
+    which is what the phone app connects as, and the two evict each other)
+    and it has to stay neutral: a consumer-specific default would collide
+    with the consumer that overrode it to the same string.
+    """
+    assert const.CLIENT_ID_SUFFIX == "-py"
+
+
 def test_alarm_and_counter_fields_are_not_writable():
     """Tests that alarm and counter fields stay out of WRITABLE_FIELDS.
 

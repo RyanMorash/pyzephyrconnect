@@ -10,6 +10,7 @@ import pytest
 from botocore.exceptions import ClientError
 
 from pyzephyrconnect import auth as auth_module
+from pyzephyrconnect import const
 from pyzephyrconnect.auth import (
     AbstractAuth,
     Credentials,
@@ -317,7 +318,7 @@ async def test_identity_id_is_read_not_reconstructed(fake_aws):
     await auth.async_get_tokens()
 
     assert auth.identity_id == IDENTITY
-    assert auth.mqtt_client_id == f"{auth.identity_id}-ha"
+    assert auth.mqtt_client_id == f"{auth.identity_id}-py"
 
 
 async def test_identity_id_survives_a_refresh(fake_aws):
@@ -343,16 +344,53 @@ async def test_mqtt_client_id_keeps_the_region_prefix_and_suffix(fake_aws):
     auth = CredentialsAuth("user@example.com", "pw", MagicMock())
     await auth.async_get_tokens()
 
-    assert auth.mqtt_client_id == f"{IDENTITY}-ha"
+    # Against the constant, not a literal: what this test pins is that the
+    # suffix is applied at all and the region prefix survives. The default's
+    # VALUE is pinned once, in test_const.
+    assert auth.mqtt_client_id == f"{IDENTITY}{const.CLIENT_ID_SUFFIX}"
     assert auth.mqtt_client_id.startswith("us-west-2:")
+
+
+async def test_a_consumer_supplied_suffix_replaces_the_default(fake_aws):
+    """Tests that a consumer-supplied suffix replaces the default one.
+
+    The suffix identifies the CONSUMER, not the library: a Home Assistant
+    integration and some other script on the same account each need their
+    own, or AWS IoT treats their two live connections as one session and
+    evicts one for the other.
+    """
+    auth = CredentialsAuth(
+        "user@example.com", "pw", MagicMock(), client_id_suffix="-ha"
+    )
+    await auth.async_get_tokens()
+
+    assert auth.client_id_suffix == "-ha"
+    assert auth.mqtt_client_id == f"{IDENTITY}-ha"
+    # The suffix is appended to the identity, never substituted into it.
+    assert auth.identity_id == IDENTITY
+
+
+@pytest.mark.parametrize("suffix", ["", None, 5, b"-py"])
+def test_an_unusable_client_id_suffix_is_refused_at_construction(suffix):
+    """Tests that an unusable client-ID suffix is refused at construction.
+
+    Both failures are silent if they reach the socket. An empty suffix makes
+    the client ID the BARE identity ID, which is what the phone app connects
+    as, so the two evict each other in a reconnect loop. A non-str is worse:
+    the f-string would render None as the literal "None" - the same silent
+    coercion ZephyrTokens.from_dict refuses - and AWS IoT would then drop
+    every message under a client ID the policy does not cover.
+    """
+    with pytest.raises(ValueError, match="client_id_suffix"):
+        CredentialsAuth("user@example.com", "pw", MagicMock(), client_id_suffix=suffix)
 
 
 class _StaticAuth(AbstractAuth):
     """The documented consumer path: implement one method, nothing else."""
 
-    def __init__(self, tokens, session):
+    def __init__(self, tokens, session, **kwargs):
         """Initialize with the static tokens to serve."""
-        super().__init__(session)
+        super().__init__(session, **kwargs)
         self._static = tokens
 
     async def async_get_tokens(self):
@@ -384,9 +422,25 @@ async def test_a_minimal_subclass_satisfies_the_whole_client_contract(fake_aws):
     pair_creds, pair_generation = await auth.async_get_presign_credentials()
     assert pair_creds is creds
     assert pair_generation == auth.credentials_generation
-    assert auth.mqtt_client_id == f"{IDENTITY}-ha"
+    assert auth.mqtt_client_id == f"{IDENTITY}-py"
     await auth.async_attach_policy()
     fake_aws["iot"].attach_policy.assert_called_once()
+
+
+async def test_a_subclass_can_choose_its_own_suffix(fake_aws):
+    """Tests that an AbstractAuth subclass can choose its own suffix.
+
+    The option lives on the abstract class, so the consumer that wrote its
+    own auth - the one most likely to be a second client on the account -
+    can set it by forwarding one keyword, not by reimplementing
+    mqtt_client_id and re-deriving the region-prefixed identity by hand.
+    """
+    auth = _StaticAuth(_stored_tokens(3600), MagicMock(), client_id_suffix="-custom")
+    # identity_id (and so mqtt_client_id) only becomes readable once the
+    # exchange has run - the same order ZephyrClient.async_setup() follows.
+    await auth.async_get_credentials()
+
+    assert auth.mqtt_client_id == f"{IDENTITY}-custom"
 
 
 # -- _classify --------------------------------------------------------

@@ -72,9 +72,13 @@ class Endpoints:
 
 DEFAULT_ENDPOINTS = Endpoints()
 
-# Suffix appended to the Cognito identity ID to form the MQTT client ID, so
-# the library can coexist with the phone app instead of evicting it.
-CLIENT_ID_SUFFIX = "-ha"
+# Default suffix appended to the Cognito identity ID to form the MQTT client
+# ID, so the library can coexist with the phone app instead of evicting it.
+# Consumers override it per auth object via AbstractAuth's client_id_suffix
+# argument - a Home Assistant integration passes "-ha", another consumer
+# something of its own - so two consumers on one account do not evict each
+# other either. Any stable non-empty string works (PROTOCOL.md section 5).
+CLIENT_ID_SUFFIX = "-py"
 
 # Credentials last 1 hour. Refresh early enough to rebuild the socket.
 REFRESH_MARGIN_SECONDS = 600

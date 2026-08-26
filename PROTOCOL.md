@@ -369,15 +369,20 @@ constraint is either absent or a prefix match.
 Settled shape, one connection per hood:
 
 ```
-<identity_id>-ha-<thingName>          # e.g. us-west-2:uuid-ha-aaaa...eeee
+<identity_id><suffix>-<thingName>     # e.g. us-west-2:uuid-py-aaaa...eeee
 ```
 
 What matters is that *some* suffix is present, so this client and the
 vendor app do not evict each other, and that it then varies per thing, so
 two hoods on one account do not evict each other either. The suffix string
-itself is arbitrary: `-ha` is simply the value this library ships, as
-`const.CLIENT_ID_SUFFIX`, and any stable non-empty string works. Keep the
-region prefix on the identity ID (§3.2).
+itself is arbitrary: `-py` is simply the default this library ships, as
+`const.CLIENT_ID_SUFFIX`, and any stable non-empty string works. Consumers
+set their own — a Home Assistant integration would pass `-ha` — through
+`AbstractAuth`'s `client_id_suffix` argument, which is what keeps two
+*consumers* on one account from evicting each other as well. Keep the
+region prefix on the identity ID (§3.2), and keep the suffix short: AWS IoT
+caps the whole client ID at 128 characters, and the per-thing part is
+appended after it.
 
 ### Transport gotchas
 

@@ -392,6 +392,15 @@ Unchanged: `ZephyrError`, `ZephyrAuthError`, `ZephyrCertificateError`,
   endpoints=Endpoints(device_api_base="https://staging.example/prod"))`. The
   defaults are the current production values, so omitting it changes nothing.
   Useful for tests that would otherwise monkeypatch module globals.
+- **The MQTT client-ID suffix is configurable.**
+  `ZephyrClient.from_credentials(..., client_id_suffix="-ha")`, and the same
+  keyword on `CredentialsAuth` and `AbstractAuth`. It defaults to `"-py"`.
+  Pass your own if anything else may connect to the same account: AWS IoT
+  treats two live connections sharing a client ID as one session and evicts
+  one for the other, so two consumers on the default suffix would flap. Must
+  be a non-empty string — `ValueError` at construction otherwise, because an
+  empty one leaves the bare identity ID, which is what the vendor phone app
+  connects as.
 
 ---
 
@@ -405,11 +414,13 @@ fails silently rather than loudly:
 - `update/delta` messages are ignored by the library. Nothing writes
   `desired`, so any delta is stale or foreign, and merging one produces a
   phantom state change.
-- Every MQTT client ID starts with `identity_id + const.CLIENT_ID_SUFFIX`
+- Every MQTT client ID starts with `identity_id + auth.client_id_suffix`
   (region prefix included) — a suffix on the bare identity ID is what lets
   this coexist with the vendor phone app instead of evicting it — and each
   hood's connection appends a per-device suffix on top, because AWS IoT
-  evicts concurrent same-ID sessions.
+  evicts concurrent same-ID sessions. The suffix defaults to
+  `const.CLIENT_ID_SUFFIX` (`"-py"`) and is per auth object, so it must be
+  non-empty and stable for the life of a connection.
 - The IoT policy is attached before connecting. An open connection does not
   pick up newly attached permissions; without it, connect/subscribe/publish
   all succeed and every message is silently dropped.

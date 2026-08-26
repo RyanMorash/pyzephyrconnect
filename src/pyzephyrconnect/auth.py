@@ -179,6 +179,9 @@ class AbstractAuth(ABC):
         session: The aiohttp client session, owned by the consumer.
         endpoints: Cloud endpoint set every Cognito and IoT call runs
             against.
+        client_id_suffix: Appended to the identity ID to build
+            mqtt_client_id. Set once at construction; read on every
+            connect, so it must not change under a live socket.
         credentials_generation: Monotonic counter identifying the current
             AWS credentials, incremented at every site that installs a
             fresh set. A socket presigned under an older generation
@@ -190,15 +193,39 @@ class AbstractAuth(ABC):
         self,
         session: aiohttp.ClientSession,
         endpoints: Endpoints = DEFAULT_ENDPOINTS,
+        *,
+        client_id_suffix: str = const.CLIENT_ID_SUFFIX,
     ) -> None:
-        """Stores the session and endpoints; all derived state starts empty.
+        """Stores the session, endpoints and suffix; derived state starts empty.
 
         Args:
             session: aiohttp client session, owned by the consumer.
             endpoints: Cloud endpoint set to authenticate against.
+            client_id_suffix: Appended to the identity ID to form the MQTT
+                client ID, defaulting to const.CLIENT_ID_SUFFIX. Give each
+                consumer that may run against the same account its own
+                stable value: AWS IoT treats two live connections sharing a
+                client ID as one session and evicts one for the other. Keep
+                it short - AWS IoT caps the whole client ID at 128
+                characters, and ZephyrClient appends "-<thingName>" per hood
+                on top of identity ID plus suffix.
+
+        Raises:
+            ValueError: If client_id_suffix is not a non-empty string.
         """
+        if not isinstance(client_id_suffix, str) or not client_id_suffix:
+            # Refused here rather than at connect time. An empty suffix makes
+            # mqtt_client_id the BARE identity ID, which is what the vendor
+            # phone app connects as, and the two then evict each other in a
+            # reconnect loop (PROTOCOL.md section 5). A non-str is worse: the
+            # f-string in mqtt_client_id would happily render None as the
+            # literal "None" - the same silent coercion ZephyrTokens.from_dict
+            # refuses - and AWS IoT would drop every message under a client ID
+            # the policy does not cover.
+            raise ValueError("client_id_suffix must be a non-empty string")
         self.session = session
         self.endpoints = endpoints
+        self.client_id_suffix = client_id_suffix
         self._credentials: Credentials | None = None
         # Monotonic counter identifying the CURRENT AWS credentials.
         # Incremented at every site that assigns a fresh self._credentials,
@@ -260,17 +287,19 @@ class AbstractAuth(ABC):
 
     @property
     def mqtt_client_id(self) -> str:
-        """The identity ID plus a stable suffix.
+        """The identity ID plus this auth object's client-ID suffix.
 
         The IoT policy pins the client ID to the identity. Using the bare
-        identity ID makes this library and the phone app evict each other.
-        Derived from identity_id, never the other way around.
+        identity ID makes this library and the phone app evict each other,
+        which is what the suffix - const.CLIENT_ID_SUFFIX unless the
+        consumer supplied its own - is there to prevent. Derived from
+        identity_id, never the other way around.
 
         Raises:
             ZephyrAuthError: If no tokens have been acquired yet (via
                 identity_id).
         """
-        return f"{self.identity_id}{const.CLIENT_ID_SUFFIX}"
+        return f"{self.identity_id}{self.client_id_suffix}"
 
     @property
     def credentials_expired(self) -> bool:
@@ -684,6 +713,7 @@ class CredentialsAuth(AbstractAuth):
         tokens: ZephyrTokens | None = None,
         token_updater: Callable[[ZephyrTokens], None] | None = None,
         endpoints: Endpoints = DEFAULT_ENDPOINTS,
+        client_id_suffix: str = const.CLIENT_ID_SUFFIX,
     ) -> None:
         """Sets up SRP login as `username`, optionally resuming stored tokens.
 
@@ -697,8 +727,13 @@ class CredentialsAuth(AbstractAuth):
             token_updater: Called with every new ZephyrTokens so the
                 consumer can persist them.
             endpoints: Cloud endpoint set to authenticate against.
+            client_id_suffix: Suffix identifying this consumer in the MQTT
+                client ID; see AbstractAuth.
+
+        Raises:
+            ValueError: If client_id_suffix is not a non-empty string.
         """
-        super().__init__(session, endpoints)
+        super().__init__(session, endpoints, client_id_suffix=client_id_suffix)
         self._username = username
         self._password = password
         self._tokens = tokens

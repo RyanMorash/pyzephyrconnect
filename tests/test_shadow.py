@@ -80,7 +80,7 @@ async def _default_provider():
 def _make(on_message=None):
     """Build a ShadowClient wired with mock callbacks."""
     return ShadowClient(
-        THING, f"{THING}-ha", on_message or MagicMock(), MagicMock(), _default_provider
+        THING, f"{THING}-py", on_message or MagicMock(), MagicMock(), _default_provider
     )
 
 
@@ -88,7 +88,7 @@ def _shadow(credentials_provider=_default_provider, **kwargs):
     """A ShadowClient on the new 5-argument constructor."""
     return ShadowClient(
         THING,
-        "us-west-2:abc-ha",
+        "us-west-2:abc-py",
         lambda topic, payload: None,
         lambda connected: None,
         credentials_provider,
@@ -123,7 +123,7 @@ async def test_connect_uses_a_presigned_websocket_path(fake_paho):
 async def test_connect_uses_the_suffixed_client_id(fake_paho):
     """Tests that connect builds the client with the suffixed ID."""
     await _connect(_make())
-    assert shadow_module.mqtt.Client.call_args.kwargs["client_id"] == f"{THING}-ha"
+    assert shadow_module.mqtt.Client.call_args.kwargs["client_id"] == f"{THING}-py"
 
 
 async def test_connect_targets_port_443(fake_paho):
@@ -146,7 +146,7 @@ async def test_connecting_log_omits_the_client_id_and_thing_name(fake_paho, capl
         await _connect(sc)
 
     assert "connecting to" in caplog.text
-    assert "us-west-2:abc-ha" not in caplog.text
+    assert "us-west-2:abc-py" not in caplog.text
     assert THING not in caplog.text
 
 
