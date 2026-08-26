@@ -1,40 +1,42 @@
-# pyzephyrconnect API changes — for the Home Assistant integration
+# pyzephyrconnect 0.1.0 — API notes
 
-**Audience:** the agent maintaining `ha_zephyr` (`custom_components/zephyr_connect`).
+**Audience:** anyone writing against the library.
 
-**Status of the library:** `pyzephyrconnect` has never been released. There are
-no tags and PyPI 404s. These changes therefore land as the initial `0.1.0`,
-not as a breaking `0.2.0` — there is no previous version to fall back to, no
-version gate to write, and no compatibility shim to detect. Every change below
-is unconditional.
+`pyzephyrconnect` has never been released. There are no earlier tags and PyPI
+404s, so `0.1.0` is the initial public API rather than a break from a previous
+one — there is no version to fall back to, no version gate to write, and no
+compatibility shim to detect. If you tracked the `main` branch before the tag,
+read the sections below as the deltas from that shape. If you are starting at
+`0.1.0`, read them as a description of what the API does and why.
 
-**First step:** the integration currently requires
-`pyzephyrconnect @ git+https://github.com/RyanMorash/pyzephyrconnect@main`.
-Once this work lands and `v0.1.0` is tagged, pin the tag rather than tracking
-a moving branch:
+Pin the tag rather than tracking a moving branch:
 
-```json
-"requirements": ["pyzephyrconnect @ git+https://github.com/RyanMorash/pyzephyrconnect@v0.1.0"]
+```
+pyzephyrconnect @ git+https://github.com/RyanMorash/pyzephyrconnect@v0.1.0
 ```
 
 ---
 
-## Why this changed
+## Why the API looks like this
 
-The library was reviewed against Home Assistant's three library-authoring
-pages (`api_lib_index`, `api_lib_auth`, `api_lib_data_models`). Packaging and
-release engineering already complied. Four architectural things did not:
+Four rules shaped it, each replacing something the pre-tag shape did:
 
-1. The library held the username and password for the process lifetime and
-   re-ran a full SRP login on every restart. The auth page says never to store
-   auth data in the library.
-2. Every endpoint was a hardcoded module constant. The auth page requires that
-   developers be able to specify API locations.
-3. Writes went through a raw dict of vendor field names, with the write
-   allowlist enforced only in a CLI. The data-models page puts control methods
-   on the model object.
-4. Every state field defaulted to `0`, so a missing alarm read as "no alarm"
-   and a missing power reading read as "off".
+1. **The library does not store credentials.** It used to hold the username
+   and password for the process lifetime and re-run a full SRP login on every
+   restart. Auth now sits behind an abstract token surface, and where tokens
+   live is the consumer's decision.
+2. **Endpoints are injectable.** Every endpoint used to be a hardcoded module
+   constant, which put staging and test targets out of reach without
+   monkeypatching module globals.
+3. **Controls are typed methods on the model object.** Writes used to go
+   through a raw dict of vendor field names, with the write allowlist enforced
+   only in the CLI.
+4. **Absent is not zero.** Every state field used to default to `0`, so a
+   missing alarm read as "no alarm" and a missing power reading read as "off".
+
+These are general library-design rules, not house style for any one consumer;
+they came out of a review against Home Assistant's library-authoring guidance,
+which is where the library's first consumer lives.
 
 ---
 
@@ -74,8 +76,8 @@ client = ZephyrClient.from_credentials(
 choose to persist it. Where that lives is your call — see the warning below
 before deciding.
 
-`ZephyrTokens.as_dict()` returns JSON-serializable primitives only, so it is
-safe to store in a config entry. It carries `username`, `id_token`,
+`ZephyrTokens.as_dict()` returns JSON-serializable primitives only, so it will
+survive any ordinary JSON store. It carries `username`, `id_token`,
 `refresh_token`, `identity_id` and `expires_at` (epoch seconds).
 
 Notes:
@@ -85,6 +87,9 @@ Notes:
   refresh — tokens without it cannot be refreshed.
 - A rejected or expired refresh token falls back to a full SRP login
   automatically. It does not raise.
+- `token_updater` runs on the event loop, so it must not block. A consumer
+  that needs real I/O to persist should schedule it rather than perform it
+  inline.
 - **`ZephyrTokens.from_dict()` raises `ZephyrDataError` on malformed stored
   data** — a missing field, a non-string field, an empty string, or an
   expiry that is not a finite number. It validates rather than coercing,
@@ -106,59 +111,54 @@ Notes:
   `AbstractAuth`, implement `async_get_tokens()`, and pass the instance to
   `ZephyrClient(auth)` directly.
 
-> ### Redact the tokens in diagnostics before shipping persistence
+> ### Treat persisted tokens as credentials
 >
 > `ZephyrTokens.as_dict()` contains `id_token` and `refresh_token`. A Cognito
 > refresh token is valid for around 30 days by default and is on its own
 > sufficient to take over the account.
 >
-> Two things to know:
+> Two consequences worth planning for:
 >
-> - `async_redact_data` matches on **key names, at every depth**. It recurses
->   into nested mappings and into lists of them, so naming `id_token` and
->   `refresh_token` in the redaction set reaches them however deeply they are
->   stored, and naming the container key redacts the whole sub-dict. What it
->   cannot do is recognise a token by its *value*: anything stored under a key
->   name that is not in the set — a renamed field, or a bare string in a list —
->   passes through in full. It also returns a redacted **copy**, so the return
->   value is what must be emitted.
-> - Config entries are stored as plain JSON in `.storage/core.config_entries`.
+> - Whatever you persist that record into becomes a credential store, whether
+>   or not it was designed as one. Most application state stores are plain
+>   files readable by anything running as the same user.
+> - Anything that exports or copies that record — a diagnostic dump, a bug
+>   report attachment, a debug log — carries the tokens with it unless it
+>   strips them by key name. `identity_id` is worth stripping too: not a
+>   credential, but a stable account identifier in the same category as a
+>   serial number or MAC.
 >
-> So wherever these tokens are persisted, the redaction list needs to name the
-> keys they are actually stored under — the individual keys (`id_token`,
-> `refresh_token`) or their container. Diagnostics output is meant to be safe
-> to paste into a public issue, so this belongs in the same change that
-> introduces persistence, not a follow-up.
->
-> `identity_id` is worth redacting too. It is not a credential, but it is a
-> stable account identifier in the same category as a serial number or MAC.
+> The library keeps them out of its own output: `ZephyrTokens` sets
+> `repr=False` on both token fields, so they do not land in tracebacks or log
+> lines that happen to capture the object. That protects the library's
+> surface, not yours.
 >
 > Persistence is optional. `from_credentials` works without `tokens` and
 > `token_updater` and simply re-runs the SRP login on each restart, which
-> avoids introducing a second live credential entirely.
+> avoids introducing a second long-lived credential entirely.
 
-### `identity_id` is unchanged, and is the right config entry unique ID
+### `identity_id` is unchanged, and is a stable account identifier
 
 `client.identity_id` still returns the full `us-west-2:uuid` string.
 
-It is a sound permanent unique ID for the account's config entry. Cognito
-Identity Pools key an identity on the *provider's* user identifier, which for
-a User Pool provider is the immutable `sub` claim — not the email, not the
-password. So it survives a password change, survives an email change, is
-idempotent across `get_id` calls, and does not change on token refresh. It is
-also the right granularity for an account-level entry: one account can own
-several hoods, so `thingName` identifies a device rather than the account, and
-the email address is both mutable and personal data.
+It is durable enough to key an account on permanently. Cognito Identity Pools
+key an identity on the *provider's* user identifier, which for a User Pool
+provider is the immutable `sub` claim — not the email, not the password. So it
+survives a password change, survives an email change, is idempotent across
+`get_id` calls, and does not change on token refresh. It is also
+account-level rather than device-level: one account can own several hoods, so
+`thingName` identifies a device while `identity_id` identifies the account,
+and the email address is both mutable and personal data.
 
 The one theoretical failure is the vendor recreating their identity pool,
 which would reissue every user's ID. Not worth designing around: the IoT
-policy attachments are keyed on identity IDs too, so that event breaks the
-integration outright and a churned unique ID is the least of it.
+policy attachments are keyed on identity IDs too, so that event breaks every
+client outright and a churned identifier is the least of it.
 
 `identity_id` is now read directly off the auth object rather than
-reconstructed by stripping the `-ha` suffix off the MQTT client ID. Availability
-is unchanged — it raises `ZephyrAuthError` until tokens have been acquired, and
-`async_setup()` acquires them, so the existing config-flow ordering still works.
+reconstructed by stripping the suffix off the MQTT client ID. Availability is
+unchanged — it raises `ZephyrAuthError` until tokens have been acquired, and
+`async_setup()` acquires them.
 
 ---
 
@@ -192,10 +192,10 @@ Every method that took a `thing_name` is gone; the `Hood` knows its own.
 callback still receives a `HoodState` on the event loop (never from paho's
 network thread).
 
-New: `hood.connected` — whether **this** hood's push connection is up. Use it
-for per-device availability. `client.connected` still exists but is now
-derived: `True` while at least one hood's connection is up, so on a
-multi-hood account it is an aggregate, not a per-device signal.
+New: `hood.connected` — whether **this** hood's push connection is up, which
+is the per-device signal. `client.connected` still exists but is now derived:
+`True` while at least one hood's connection is up, so on a multi-hood account
+it is an aggregate rather than a per-device answer.
 
 Unchanged on `ZephyrClient`: `async_setup()`, `async_stop()`, `identity_id`.
 (`connected` remains but with derived semantics — see above. `async_setup()`
@@ -221,10 +221,17 @@ code.
 | `async_set_state(thing, {"setrecirculating": n})` | `await hood.async_set_recirculating(bool)` |
 
 `async_set_delay_timer` passes its value straight through to `setdelaytimer`.
-**The field's units are not established** — whether the device reads seconds
-or minutes, and whether it snaps to presets, is an open hardware-validation
-question (the library's `VALIDATION.md`, question 2). Do not present a
-unit to users until that validation has run.
+**The units are seconds**, established against the reference hood and recorded
+in `PROTOCOL.md` §5. Values off the vendor app's two presets are accepted,
+proven up to 3600 seconds; past that the device's own ceiling is unprobed
+(`PROTOCOL.md` §7), so a larger value may be clamped or rejected by the
+hardware rather than by this method. A caller working in minutes multiplies
+by 60.
+
+`power` is a master switch with memory rather than a precondition: `fan` and
+`light` write through while `power` reads `0`, and the device raises `power`
+itself. So `async_set_fan` and `async_set_light` deliberately do not write
+`power` alongside the level.
 
 ### New: range validation
 
@@ -241,8 +248,8 @@ on hardware.
 
 `hood.async_set_fields({field: value})` writes arbitrary fields from
 `const.WRITABLE_FIELDS` and raises `ZephyrWriteError` for anything else. It
-exists for the diagnostic probe CLI, which maps unknown field semantics. The
-integration should use the typed methods.
+exists for the diagnostic probe CLI, which maps unknown field semantics.
+Prefer the typed methods everywhere else.
 
 ---
 
@@ -264,33 +271,34 @@ Its lifecycle is self-correcting at both ends. A `hood.async_start()` that
 raises rolls that hood's intent back, so it leaves nothing armed behind it,
 and a supervisor that finds no started hoods on a tick retires itself rather
 than holding the client alive and refreshing credentials for nobody. A later
-`hood.async_start()` arms a fresh one. Still wire the teardown up before you
-start any hood — `entry.async_on_unload(client.async_stop)` or equivalent —
-as belt and braces: it is the only thing that reliably retires a supervisor
-mid-tick, and it stops every hood in one call.
+`hood.async_start()` arms a fresh one. Still wire teardown up before you start
+any hood, so that `client.async_stop()` runs however the consumer shuts down:
+it is the only thing that reliably retires a supervisor mid-tick, and it stops
+every hood in one call.
 
 **What this means for you:** keeping credentials alive is no longer a reason
-for a consumer to poll on a timer. If a periodic tick is still wanted for
-other reasons — a safety-net re-read after push has been briefly unhealthy, or
-degraded HTTPS reads while MQTT is down — `hood.async_poll()` and
-`client.connected` both still exist for that.
+to poll on a timer. If a periodic tick is still wanted for other reasons — a
+safety-net re-read after push has been briefly unhealthy, or degraded HTTPS
+reads while MQTT is down — `hood.async_poll()` and `client.connected` both
+still exist for that.
 
 A terminal failure inside the supervisor stops it, disconnects the hoods
 (flipping `connected` to `False`), and re-raises from the next
-`hood.async_poll()` — the intended path to a reauth flow, so a consumer that
-never polls will not learn about it. **Only genuine credential rejections
-(`ZephyrAuthError`) and a missing IoT policy (`ZephyrPolicyError`) are
-terminal.** Transient failures — DNS, timeouts, Cognito throttling — surface
-as the retryable `ZephyrTransportError` and the supervisor keeps going, so
-mapping `ZephyrAuthError` to a reauth prompt is safe: it will not fire for a
-Wi-Fi blip. The supervisor also self-heals: a hood whose reconnect failed
-transiently is retried every tick until it comes back.
+`hood.async_poll()` — the intended path for surfacing a re-authentication
+requirement, so a consumer that never polls will not learn about it. **Only
+genuine credential rejections (`ZephyrAuthError`) and a missing IoT policy
+(`ZephyrPolicyError`) are terminal.** Transient failures — DNS, timeouts,
+Cognito throttling — surface as the retryable `ZephyrTransportError` and the
+supervisor keeps going, so treating `ZephyrAuthError` as "this account must
+log in again" is safe: it will not fire for a Wi-Fi blip. The supervisor also
+self-heals: a hood whose reconnect failed transiently is retried every tick
+until it comes back.
 
 ---
 
 ## 5. Absent is no longer zero
 
-This is the change most likely to alter entity behaviour.
+This is the change most likely to alter observable behaviour.
 
 ### `HoodState`
 
@@ -308,13 +316,13 @@ genuine starting value and the filter-life percentage needs a number:
 `use_grease_filter_time`, `use_charcoal_filter_time`, `use_light_time`,
 `use_fan_time`.
 
-**Watch for boolean coercion.** `bool(None)` is `False`, so any
+**Watch for boolean coercion.** `bool(None)` is `False`, so
 `bool(state.alarm_fault_code)` or `state.alarm_fan or state.fan_warning`
-expression will silently continue to report "no problem" for a field that is
-actually unknown. That is the exact failure this change exists to eliminate,
-so those need to become explicit — returning `None` from an `is_on` property
-makes Home Assistant show the entity as unknown, which is usually what you
-want for a fault sensor with no data.
+silently keeps reporting "no problem" for a field that is actually unknown.
+That is the exact failure this change exists to eliminate, so those tests need
+to become explicit. What you then do with "unknown" — surface it, or fold it
+back into a default — is your call; the library's job is to keep the
+distinction available rather than to decide it for you.
 
 ### `HoodCapabilities`
 
@@ -323,8 +331,8 @@ The numeric capability fields are now `int | None`:
 `max_charcoal_filter_hours`.
 
 - **Absent** → `None`. Not an error. Other Zephyr models legitimately omit
-  keys the reference device returns, and gating entity creation on
-  capabilities is what lets this work on untested hoods.
+  keys the reference device returns, and gating on capabilities rather than
+  assuming them is what lets a consumer work on untested hoods.
 - **Present but malformed** → raises the new `ZephyrDataError`. This runs once
   at setup, so it fails loudly rather than producing a wrong capability set.
 
@@ -375,9 +383,9 @@ Unchanged: `ZephyrError`, `ZephyrAuthError`, `ZephyrCertificateError`,
 ## 7. Smaller things
 
 - **`py.typed` is now shipped.** The library was already fully annotated but
-  was invisible to type checkers under PEP 561. mypy will now actually check
-  integration code against these signatures — expect it to surface the `None`
-  handling from §5 for you.
+  was invisible to type checkers under PEP 561. A type checker will now
+  actually check calling code against these signatures — expect it to surface
+  the `None` handling from §5 for you.
 - **`boto3` is now a declared dependency.** It was always imported directly
   and resolved only transitively through `pycognito`. No action needed.
 - **Endpoints are injectable.** `ZephyrClient.from_credentials(...,
@@ -397,29 +405,33 @@ fails silently rather than loudly:
 - `update/delta` messages are ignored by the library. Nothing writes
   `desired`, so any delta is stale or foreign, and merging one produces a
   phantom state change.
-- Every MQTT client ID starts with `identity_id + "-ha"` (region prefix
-  included) — that prefix is what lets this coexist with the vendor phone app
-  instead of evicting it — and each hood's connection appends a per-device
-  suffix, because AWS IoT evicts concurrent same-ID sessions.
+- Every MQTT client ID starts with `identity_id + const.CLIENT_ID_SUFFIX`
+  (region prefix included) — a suffix on the bare identity ID is what lets
+  this coexist with the vendor phone app instead of evicting it — and each
+  hood's connection appends a per-device suffix on top, because AWS IoT
+  evicts concurrent same-ID sessions.
 - The IoT policy is attached before connecting. An open connection does not
   pick up newly attached permissions; without it, connect/subscribe/publish
   all succeed and every message is silently dropped.
 - The vendor REST API takes a bare ID token with no `Bearer ` prefix.
 - `thingName`, `SN`, `MAC` and `location` are personal data — `location`
-  carries precise coordinates. Keep them redacted in diagnostics and out of
-  logs.
+  carries precise coordinates. Keep them out of logs and out of anything you
+  export.
 
-## Still open, unrelated to this change
+## Still open
 
-The library's own `VALIDATION.md` runbook states that the shadow write path is
-unverified and that no consumer should write to it until hardware validation
-is complete. That validation has not happened yet.
+The `VALIDATION.md` runbook has since been run against the reference hood
+(`AK7400AS`), so the questions that used to sit here are answered: `power`
+does not gate the light and fan, `setdelaytimer` takes seconds and is not
+preset-snapped, the filter counters are minutes against a maximum in hours,
+and `usefantime` / `uselighttime` are hours. All of it is recorded in
+`PROTOCOL.md` §5.
 
-The write API described in §3 exists and works, but the *semantics* of several
-fields are still unestablished — `PROTOCOL.md` §7 lists what remains. Notably,
-whether `power` gates the light and fan, whether `setdelaytimer` accepts
-arbitrary values or snaps to presets, and the units of the `use*time` counters.
-Those three answers materially affect what entities should exist.
+What is genuinely still unknown is listed in `PROTOCOL.md` §7 — the
+`setdelaytimer` ceiling, `act` values beyond `"Disabled"`, whether a
+charcoal-filter reset exists at all, and what distinguishes `fanwarning` from
+`alarmfan`. None of it changes the API described here, but each one bounds
+what a consumer can honestly present.
 
-This is a product decision rather than an API one and is out of scope for this
-changelog, but it is worth resolving deliberately rather than by default.
+Writes actuate hardware throughout. `resetgreasefilter` in particular zeroes a
+counter that cannot be reconstructed, and ships untested by design.

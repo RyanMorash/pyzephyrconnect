@@ -1,7 +1,7 @@
 """Vendor REST endpoints.
 
-The session is injected rather than owned, so Home Assistant can pass its
-shared client session. The SSL context (system trust plus the TWCA
+The session is injected rather than owned, so a consumer can pass in its
+own shared client session. The SSL context (system trust plus the TWCA
 workaround anchors) is applied per request, which means a shared session
 needs no special construction.
 """
