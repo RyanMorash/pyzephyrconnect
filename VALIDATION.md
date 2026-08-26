@@ -88,8 +88,8 @@ running before (observed restoring fan 6 and light 1 together). `fan` and
 raises `power` itself.
 
 → `power` is an independent field, so `hood.async_set_power()` stands on
-its own and neither `async_set_fan()` nor `async_set_light()` writes
-`power` alongside the level.
+its own and neither `hood.async_set_fan()` nor `hood.async_set_light()`
+writes `power` alongside the level.
 
 **2. `setdelaytimer` — seconds, not preset-snapped.**
 Not minutes. The vendor app's two presets are a UI choice rather than a
