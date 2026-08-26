@@ -335,8 +335,22 @@ them is wrong by 60x. Cross-checked against the vendor app's own display:
 remaining = 1 - used_minutes / (life_hours * 60)
 ```
 
-This does **not** extend to `usefantime` / `uselighttime`, whose units are
-still unestablished — see §7.
+**`usefantime` / `uselighttime` — hours.**
+Lifetime run-time counters, and a *different unit from the filter counters
+above* — those are minutes, these are hours. Getting this backwards is the
+same 60x error in the other direction.
+
+Two independent lines of evidence. Both counters held flat across five
+minutes of fan runtime while `usegreasefiltertime` moved, which rules out
+minutes outright. And the readings (`usefantime` 1979, `uselighttime` 2833)
+reconcile with the hood's approximate age and usage on hours, where the
+finer-grained alternatives do not.
+
+Note the basis: this is an estimate against known usage, not a timed
+measurement. It is sound for the 60x question that matters, and the
+remaining doubt is narrow. If a fan-runtime figure ever surfaces in the
+vendor app, it is worth a confirming glance — the same cross-check that
+settled the filter formula.
 
 **`setcleanairfunction` — an operating mode, not a setting.**
 Enabling it starts the fan at speed 1.
@@ -399,40 +413,29 @@ other. Keep the region prefix on the identity ID (§3.2).
 
 The `VALIDATION.md` runbook has been run against the reference hood
 (`AK7400AS`), except step 9. What it established is folded into §5 —
-`power` semantics, `setdelaytimer` units, the filter-life formula, and
-`setcleanairfunction`. Credential refresh, reconnect handling and the
+`power` semantics, `setdelaytimer` units, the filter-life formula, the
+run-time counter units, and `setcleanairfunction`. Credential refresh, reconnect handling and the
 polling/push decision, listed as open in earlier revisions, are implemented
 in the library. What follows is what is genuinely still unknown.
 
-1. **`usefantime` / `uselighttime` units.** Inferred as hours, never
-   measured. Not covered by the filter-counter answer in §5: those are the
-   *filter* counters, and these are separate fields. All that is actually
-   known is that both held flat across five minutes of fan runtime while
-   `usegreasefiltertime` moved, so they are coarser than minutes. This
-   matters more than it looks — a consumer exposing them as a monotonic
-   duration feeds long-term statistics, where a 60x unit error silently
-   corrupts history rather than showing up as an obvious wrong number.
-   Cheapest check: read `usefantime` either side of an hour of running, or
-   compare against any runtime figure the vendor app displays — the same
-   cross-check that settled the filter formula.
-2. **The `setdelaytimer` ceiling.** The device accepts arbitrary values
+1. **The `setdelaytimer` ceiling.** The device accepts arbitrary values
    (§5), but the maximum is unprobed and validated at exactly one point: 60
    minutes worked. One write above an hour establishes whether a larger
    value is accepted, clamped, or rejected.
-3. **Whether the hood actually stops when `delaytimer` reaches 0.** The
+2. **Whether the hood actually stops when `delaytimer` reaches 0.** The
    countdown has been observed running; it has not been watched to zero end
    to end.
-4. **`act` beyond `"Disabled"`.** The field is understood as a mode string
+3. **`act` beyond `"Disabled"`.** The field is understood as a mode string
    but no other value has ever been observed. Treat it as free-form; do not
    build an enum on one sample.
-5. **Charcoal filter reset.** There is no `resetcharcoalfilter` field in the
+4. **Charcoal filter reset.** There is no `resetcharcoalfilter` field in the
    shadow. If the vendor app offers a charcoal reset, watch
    `update/accepted` while pressing it — it may reuse `resetgreasefilter`,
    or be app-side only. Until this is known, a recirculating hood gets a
    charcoal-life figure with no way to reset it.
-6. **`fanwarning` vs `alarmfan`.** Neither has ever fired, so what
+5. **`fanwarning` vs `alarmfan`.** Neither has ever fired, so what
    distinguishes them is unknown. Record both if either ever trips.
-7. **`resetgreasefilter` (runbook step 9) — deliberately deferred.** It
+6. **`resetgreasefilter` (runbook step 9) — deliberately deferred.** It
    zeroes `usegreasefiltertime`, which cannot be reconstructed. Do not run
    it until the grease filter is actually being cleaned.
 

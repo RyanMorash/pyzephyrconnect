@@ -76,9 +76,11 @@ Read and write paths both verified against a Zephyr AK7400AS. `power`,
 `light`, `fan`, `setdelaytimer` (seconds) and `setcleanairfunction` have
 established semantics; `resetgreasefilter` ships untested by design.
 
-Still unestablished: the `act` mode strings, the `usefantime` /
-`uselighttime` units, and the delay-timer ceiling. See
-[PROTOCOL.md](PROTOCOL.md) §7.
+Filter counters are in minutes, run-time counters in hours - see
+[PROTOCOL.md](PROTOCOL.md) §5 before deriving anything from them.
+
+Still unestablished: the `act` mode strings and the delay-timer ceiling.
+See [PROTOCOL.md](PROTOCOL.md) §7.
 
 ## License
 

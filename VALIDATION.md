@@ -108,11 +108,20 @@ Confirmed, and cross-checked against the vendor app rather than inferred:
 remaining = 1 - used_minutes / (life_hours * 60)
 ```
 
-→ Note the scope. This settles `usegreasefiltertime` and
-`usecharcoalfiltertime` only. `usefantime` and `uselighttime` are separate
-fields whose units are **still unestablished** — they held flat across five
-minutes of running while `usegreasefiltertime` moved, so they are coarser
-than minutes, and that is all that is known. See `PROTOCOL.md` §7 item 1.
+→ Note the scope. This settles the **filter** counters,
+`usegreasefiltertime` and `usecharcoalfiltertime`.
+
+**Bonus answer — the run-time counters are hours.** `usefantime` and
+`uselighttime` are separate fields on a different unit. They held flat
+across five minutes of running while `usegreasefiltertime` moved (so: not
+minutes), and the readings reconcile with the hood's approximate age and
+usage on hours rather than on any finer tick. That is an estimate against
+known usage rather than a timed measurement — enough for the 60x question,
+and worth a confirming glance if the vendor app ever shows a runtime
+figure. Recorded in `PROTOCOL.md` §5.
+
+Careful here: filter counters are **minutes**, run-time counters are
+**hours**. They sit next to each other in the same payload.
 
 ## Also worth noting while you're there
 
