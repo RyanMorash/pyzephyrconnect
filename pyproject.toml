@@ -5,12 +5,12 @@ build-backend = "hatchling.build"
 [project]
 name = "pyzephyrconnect"
 version = "0.1.0"
-description = "Python client for Zephyr/Gemtek range hoods via AWS IoT device shadows"
+description = "Python client for Zephyr Connect"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "GPL-3.0-or-later"
 license-files = ["LICENSE"]
-authors = [{ name = "Ryan Morash" }]
+authors = [{ name = "Ryan Morash", email = "ryan@morash.me"}]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -39,8 +39,8 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/RyanMorash/pyzephyrconnect"
-"Bug Tracker" = "https://github.com/RyanMorash/pyzephyrconnect/issues"
+github = "https://github.com/RyanMorash/pyzephyrconnect"
+issues = "https://github.com/RyanMorash/pyzephyrconnect/issues"
 
 [tool.hatch.build.targets.wheel]
 # packages already walks the whole src/pyzephyrconnect tree, including
