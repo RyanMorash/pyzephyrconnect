@@ -72,9 +72,15 @@ counter that cannot be reconstructed.
 
 ## Status
 
-Read path verified against a Zephyr AK7400AS. Write path is under
-validation; field semantics for `act` and the units of the `use*time`
-counters are not yet established.
+Read and write paths both verified against a Zephyr AK7400AS. `power`,
+`light`, `fan`, `setdelaytimer` (seconds) and `setcleanairfunction` have
+established semantics; `resetgreasefilter` ships untested by design.
+
+Filter counters are in minutes, run-time counters in hours - see
+[PROTOCOL.md](PROTOCOL.md) §5 before deriving anything from them.
+
+Still unestablished: the `act` mode strings and the delay-timer ceiling.
+See [PROTOCOL.md](PROTOCOL.md) §7.
 
 ## License
 
