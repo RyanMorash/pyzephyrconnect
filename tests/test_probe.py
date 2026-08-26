@@ -200,7 +200,7 @@ async def test_async_stop_runs_even_when_a_post_start_step_raises(monkeypatch):
     auth = MagicMock()
     auth.endpoints = DEFAULT_ENDPOINTS
     auth.identity_id = "us-west-2:abc"
-    auth.mqtt_client_id = "us-west-2:abc-ha"
+    auth.mqtt_client_id = "us-west-2:abc-py"
     auth.credentials_expired = False
     auth.async_get_tokens = AsyncMock()
     auth.async_get_credentials = AsyncMock(
@@ -259,7 +259,7 @@ async def test_thing_mismatch_exits_2_without_touching_the_device(monkeypatch):
     auth = MagicMock()
     auth.endpoints = DEFAULT_ENDPOINTS
     auth.identity_id = "us-west-2:abc"
-    auth.mqtt_client_id = "us-west-2:abc-ha"
+    auth.mqtt_client_id = "us-west-2:abc-py"
     auth.credentials_expired = False
     auth.async_get_tokens = AsyncMock()
     auth.async_get_credentials = AsyncMock(

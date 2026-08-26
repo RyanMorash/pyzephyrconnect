@@ -19,6 +19,7 @@ import pytest
 
 from conftest import FakeResponse, FakeSession
 from pyzephyrconnect import client as client_module
+from pyzephyrconnect import const
 from pyzephyrconnect.auth import Credentials, CredentialsAuth, ZephyrTokens
 from pyzephyrconnect.client import ZephyrClient
 from pyzephyrconnect.const import DEFAULT_ENDPOINTS, Endpoints
@@ -51,7 +52,7 @@ def _auth_double(endpoints=DEFAULT_ENDPOINTS, order=None):
     auth = MagicMock()
     auth.endpoints = endpoints
     auth.identity_id = "us-west-2:abc"
-    auth.mqtt_client_id = "us-west-2:abc-ha"
+    auth.mqtt_client_id = "us-west-2:abc-py"
     auth.credentials_expired = False  # explicit bool, never a Mock
     # Explicit int for the same reason: the supervisor compares this against
     # each hood's recorded generation, and a bare Mock attribute compares
@@ -559,12 +560,12 @@ async def test_a_refetched_identity_reaches_new_shadow_client_ids(wired):
     hoods = await client.async_setup()
 
     auth.identity_id = "us-west-2:new"
-    auth.mqtt_client_id = "us-west-2:new-ha"
+    auth.mqtt_client_id = "us-west-2:new-py"
     client._make_shadow(hoods[0])
 
     assert client.identity_id == "us-west-2:new"
     args = client_module.ShadowClient.call_args.args
-    assert args[1] == f"us-west-2:new-ha-{THING}"
+    assert args[1] == f"us-west-2:new-py-{THING}"
 
 
 def test_identity_id_raises_before_async_setup():
@@ -611,6 +612,36 @@ def test_from_credentials_threads_tokens_and_endpoints_through():
     assert client._endpoints is endpoints
     # Restored tokens make the identity readable without a network call.
     assert client.identity_id == "us-west-2:restored"
+
+
+def test_from_credentials_threads_the_client_id_suffix_through():
+    """Tests that from_credentials threads the client-ID suffix through.
+
+    The convenience constructor is how most consumers build the auth object,
+    so a suffix that stops here leaves every one of them on the default -
+    two consumers on one account would then share a client ID and evict each
+    other, which is the failure the suffix exists to prevent.
+    """
+    tokens = ZephyrTokens(
+        username="u",
+        id_token="i",
+        refresh_token="r",
+        identity_id="us-west-2:restored",
+        expires_at=time.time() + 3600,
+    )
+    client = ZephyrClient.from_credentials(
+        "u", "p", MagicMock(), tokens=tokens, client_id_suffix="-ha"
+    )
+
+    # Restored tokens make the client ID readable without a network call.
+    assert client._auth.mqtt_client_id == "us-west-2:restored-ha"
+
+
+def test_from_credentials_defaults_the_client_id_suffix_to_the_constant():
+    """Tests that from_credentials defaults the suffix to the constant."""
+    client = ZephyrClient.from_credentials("u", "p", MagicMock())
+
+    assert client._auth.client_id_suffix == const.CLIENT_ID_SUFFIX
 
 
 def test_from_credentials_passes_token_updater_through(monkeypatch):
@@ -791,7 +822,7 @@ async def test_the_mqtt_client_id_is_per_connection(wired):
 
     args = client_module.ShadowClient.call_args.args
     assert args[0] == THING
-    assert args[1] == f"us-west-2:abc-ha-{THING}"
+    assert args[1] == f"us-west-2:abc-py-{THING}"
     assert args[1] != wired["auth"].mqtt_client_id
 
 

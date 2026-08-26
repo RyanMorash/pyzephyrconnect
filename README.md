@@ -56,6 +56,25 @@ client = ZephyrClient.from_credentials(
 To keep the password out of the library completely, subclass `AbstractAuth`
 and implement `async_get_tokens()`.
 
+## MQTT client ID
+
+AWS IoT treats two live connections sharing a client ID as one session and
+evicts one for the other, so every connection is identified by the account's
+Cognito identity plus a suffix identifying *you*. It defaults to `-py`; pass
+your own if anything else may talk to the same account - the vendor phone app
+already does:
+
+```python
+client = ZephyrClient.from_credentials(
+    username, password, session, client_id_suffix="-ha",
+)
+```
+
+The same keyword works on `CredentialsAuth`, and on `AbstractAuth` for a
+custom subclass. It must be a non-empty string, and short: AWS IoT caps the
+whole client ID at 128 characters, and the library appends `-<thingName>` per
+hood on top of identity plus suffix.
+
 ## Probe CLI
 
 The write path actuates a physical fan and light. The CLI writes one field
