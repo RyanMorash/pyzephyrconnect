@@ -106,12 +106,16 @@ happens. Each of these was paid for once already.
   denied — check `reason_code_list` explicitly.
 - **MQTT client ID = `<identity_id><suffix>-<thingName>`.** Two live connections
   sharing an ID make AWS IoT evict one for the other, forever. Keep the
-  `us-west-2:` region prefix; keep the whole thing under 128 chars. Consumers set
-  their own `client_id_suffix` (default `-py`) so they don't evict the phone app
-  or each other.
+  `us-west-2:` region prefix; keep the whole thing under 128 chars. `identity_id`
+  and `thingName` are fixed per account and hood, so the suffix is the only thing
+  separating simultaneous consumers: each needs its own distinct
+  `client_id_suffix`. The default `-py` is safe for exactly one Python client on
+  an account — a second one that also leaves it at the default builds an
+  identical client ID, and the two evict each other just as they would the phone
+  app.
 - **`X-Amz-Security-Token` is appended *after* signing** and is not part of the
   canonical query string.
-- **REST takes a bare ID token** in `Authorization` — no `Bearer ` prefix — and
+- **REST takes a bare ID token** in `Authorization` — no `Bearer` prefix — and
   `getowndevices` is POSTed with a zero-length body (`data=b""`), not `{}`.
 - **TLS:** the vendor REST host's intermediate omits the Subject Key Identifier,
   so the bundled TWCA certs are added as *supplementary* anchors on top of system
