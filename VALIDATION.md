@@ -76,7 +76,7 @@ deliberate friction, not a bug.
 and cannot be reconstructed. **Do not run step 9 until you are actually
 cleaning the grease filter.** Everything else can proceed without it.
 
-## The three answers that gated the integration — ANSWERED
+## The three answers this runbook set out to establish — ANSWERED
 
 Full detail in `PROTOCOL.md` §5. Summarised here so the runbook reads as a
 record of what happened.
@@ -87,8 +87,9 @@ running before (observed restoring fan 6 and light 1 together). `fan` and
 `light` write through directly while `power` reads `0`, and the device
 raises `power` itself.
 
-→ Power gets its own `switch` entity, and the fan and light entities must
-**not** write `power` alongside the level.
+→ `power` is an independent field, so `hood.async_set_power()` stands on
+its own and neither `hood.async_set_fan()` nor `hood.async_set_light()`
+writes `power` alongside the level.
 
 **2. `setdelaytimer` — seconds, not preset-snapped.**
 Not minutes. The vendor app's two presets are a UI choice rather than a
@@ -97,9 +98,10 @@ seconds. The device derives `delaytimer` and counts it down itself in
 60-second steps, reporting about once a minute, and at zero the hood shuts
 off — the countdown has been watched to zero end to end.
 
-→ HA `number` entity, converting minutes to seconds on write, and carrying
-its own maximum — the device's ceiling is unprobed (`PROTOCOL.md` §7), so
-the entity bound is a UI cap, not a known device limit.
+→ `hood.async_set_delay_timer()` takes seconds and writes them straight
+through; a caller working in minutes multiplies by 60. The device's own
+ceiling is unprobed (`PROTOCOL.md` §7), so any upper bound a consumer
+imposes is that consumer's choice, not a known device limit.
 
 **3. Filter counters — minutes, against a maximum in hours.**
 Confirmed, and cross-checked against the vendor app rather than inferred:

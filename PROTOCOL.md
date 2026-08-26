@@ -7,9 +7,8 @@ Verified working end to end against a real device (model `AK7400AS`).
 All device identifiers in this document (thing name, serial, MAC,
 coordinates, identity ID) are placeholders, not real values.
 
-Target use: a Home Assistant integration. Both the read and write paths are
-covered; the write path actuates hardware and is marked as such where it
-appears (§5, §7).
+Both the read and write paths are covered; the write path actuates
+hardware and is marked as such where it appears (§5, §7).
 
 ---
 
@@ -19,12 +18,12 @@ The device does not expose a local API. All communication is cloud
 round-trip through AWS IoT Core:
 
 ```
-HA / client ──SRP──> Cognito User Pool      (identity)
-            ──────> Cognito Identity Pool  (temporary AWS credentials)
-            ──────> iot:AttachPolicy       (grant MQTT topic access)
-            ──────> vendor REST API        (thing name lookup)
-            ──wss──> AWS IoT Core          (device shadow get / subscribe)
-                          └──> device
+client ──SRP──> Cognito User Pool      (identity)
+       ──────> Cognito Identity Pool  (temporary AWS credentials)
+       ──────> iot:AttachPolicy       (grant MQTT topic access)
+       ──────> vendor REST API        (thing name lookup)
+       ──wss──> AWS IoT Core          (device shadow get / subscribe)
+                     └──> device
 ```
 
 Device state lives entirely in the **AWS IoT classic device shadow**.
@@ -224,12 +223,11 @@ OpenSSL 3.x rejects but Apple's stack accepts.
 
 This is explicitly **not certificate pinning**: the full system trust
 store stays intact, nothing is restricted to a fixed leaf or a fixed CA
-set, and the integration keeps working if the vendor rotates to a
-mainstream CA (the extra anchors simply go unused). Pinning the leaf, by
-contrast, would break the integration outright on that rotation. All
-three bundled TWCA certs are valid through **2030**, well past the
-current leaf's 2026-10-15 expiry, so there is no pin-refresh cliff to
-plan around.
+set, and the library keeps working if the vendor rotates to a mainstream
+CA (the extra anchors simply go unused). Pinning the leaf, by contrast,
+would break it outright on that rotation. All three bundled TWCA certs are
+valid through **2030**, well past the current leaf's 2026-10-15 expiry, so
+there is no pin-refresh cliff to plan around.
 
 ## 5. MQTT / shadow
 
@@ -313,8 +311,9 @@ Writing `0` turns everything off. Writing `1` restores the levels that were
 running before (observed restoring fan 6 and light 1 together). It does
 **not** gate the other controls: `fan` and `light` can be written directly
 while `power` reads `0`, and the device raises `power` itself in response.
-So a client exposes power as its own control, and must *not* write `power`
-alongside a fan or light level.
+`power` is therefore an independent field rather than a prerequisite, and
+bundling it into a fan or light write is redundant — the device raises it
+on its own.
 
 **`setdelaytimer` — seconds, not preset-snapped.**
 Not minutes. The vendor app offers two presets, but that is a UI choice
@@ -373,9 +372,12 @@ Settled shape, one connection per hood:
 <identity_id>-ha-<thingName>          # e.g. us-west-2:uuid-ha-aaaa...eeee
 ```
 
-The `-ha` suffix is what lets this coexist with the vendor app; the
-per-thing suffix is what keeps two hoods on one account from evicting each
-other. Keep the region prefix on the identity ID (§3.2).
+What matters is that *some* suffix is present, so this client and the
+vendor app do not evict each other, and that it then varies per thing, so
+two hoods on one account do not evict each other either. The suffix string
+itself is arbitrary: `-ha` is simply the value this library ships, as
+`const.CLIENT_ID_SUFFIX`, and any stable non-empty string works. Keep the
+region prefix on the identity ID (§3.2).
 
 ### Transport gotchas
 
@@ -393,9 +395,9 @@ other. Keep the region prefix on the identity ID (§3.2).
   broker rejects with an opaque handshake error. See `presign.py`.
 - **Use `tls_set_context()`, not `tls_set()`.** paho's `tls_set()` builds
   the SSL context inline on the calling thread and, with `ca_certs=None`,
-  calls `load_default_certs()` — a blocking call on the event loop, which
-  Home Assistant flags. Build the context in a worker thread and hand it
-  over finished.
+  calls `load_default_certs()` — file I/O that blocks the event loop it is
+  called on. Build the context in a worker thread and hand it over
+  finished.
 - **The IoT endpoint needs the plain default trust store.** It chains to
   Amazon Root CA 1. Only the vendor REST host (§4) needs the TWCA anchors;
   do not reuse that context here.
