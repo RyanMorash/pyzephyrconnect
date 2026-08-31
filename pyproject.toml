@@ -35,7 +35,7 @@ dev = [
     "pytest-cov",
     # Exact-pinned to match the ruff-action pin in .github/workflows/ci.yml,
     # so local runs and CI can never disagree. Bump both together.
-    "ruff==0.14.14",
+    "ruff==0.16.5",
 ]
 
 [project.urls]
