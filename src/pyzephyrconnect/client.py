@@ -572,15 +572,11 @@ class ZephyrClient:
                     applied = hood.reported_fields_to_apply(version, reported)
                 else:
                     applied = reported
-                if is_update:
-                    current = hood.state
-                    new_state = (
-                        current.merge(applied)
-                        if current
-                        else HoodState.from_reported(applied)
-                    )
-                else:
-                    new_state = HoodState.from_reported(applied)
+                # Onto authoritative reported state, not the visible cache.
+                # The cache already has optimistic keys in it. Merging there
+                # stores them as device-reported, and retiring the command
+                # then cannot reveal a newer value another client wrote.
+                new_state = hood.state_for_document(applied, replace=not is_update)
                 # Parsing succeeded. Only a version that is still current
                 # may win, and only now. An older partial does not. A
                 # second check covers a cursor that moved while the
@@ -592,10 +588,15 @@ class ZephyrClient:
                         return
                 if isinstance(applied, dict):
                     hood.note_applied_versions(version, applied)
+                # A full GET versions keys it omits, too. Absence is the
+                # reported value. A delayed older partial must not fill
+                # those keys back in. Partials keep the per-key check.
+                if not is_update:
+                    hood.note_snapshot_version(version)
                 # Reconcile sees the original reported block. A key this
                 # version was too old to merge can still be the echo that
-                # retires its command, which is what stops that command
-                # overlaying every later document.
+                # retires its command. The visible cache is rebuilt from
+                # the authoritative state when it is stored below.
                 new_state = hood.reconcile_reported(
                     new_state,
                     reported,

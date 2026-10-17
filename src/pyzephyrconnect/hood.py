@@ -112,6 +112,12 @@ class Hood:
         # Runs before the first connect. Attaches the IoT policy; see _start.
         self._prepare = prepare
         self._shadow: ShadowClient | None = None
+        # Device-reported state, with no optimistic keys in it. The visible
+        # cache is this plus the pending commands that are still ahead of
+        # the last confirmation of their key. Merging an echo onto the
+        # visible cache stores the overlay as if the device had reported
+        # it, and retiring the command then has nothing newer to reveal.
+        self._reported: HoodState | None = None
         self._state: HoodState | None = None
         self._listeners: list[StateListener] = []
         self._connected = False
@@ -131,19 +137,24 @@ class Hood:
         # a versioned document arrives; a document with no version keeps
         # today's apply-anyway behaviour and does not move this cursor.
         self._shadow_version: int | None = None
-        # Commands whose echo has not arrived, oldest first. The latest
-        # value of a key is what the cache shows. One document retires at
-        # most one command, the oldest whose values it actually carries,
-        # and only when it is newer than that command's baseline. A partial
-        # echo of a later command must not wait behind an older command it
-        # does not mention, and it must not consume a redelivery of the
-        # version that already retired something ahead of it. Matching the
-        # value alone acks the wrong write when the same level is published
-        # twice. The queue is dropped when the session that published it is
-        # gone; a later GET must be able to show what the device or the
-        # phone did during the outage. Dangerous fields are never entered
-        # here.
+        # Commands whose echo has not arrived, oldest first. One document
+        # retires at most one command, the oldest whose values it actually
+        # carries, and only when it is newer than that command's baseline.
+        # A partial echo of a later command must not wait behind an older
+        # command it does not mention, and it must not consume a redelivery
+        # of the version that already retired something ahead of it. An
+        # older command stays queued so its own echo can still be matched,
+        # but it does not cover a newer confirmation of the same key.
+        # Matching the value alone acks the wrong write when the same level
+        # is published twice. The queue is dropped when the session that
+        # published it is gone; a later GET must be able to show what the
+        # device or the phone did during the outage. Dangerous fields are
+        # never entered here.
         self._pending_writes: list[_PendingWrite] = []
+        # Shadow version of the newest echo that retired a command for this
+        # key. A pending command published against an older baseline is
+        # kept for echo matching and left out of the visible cache.
+        self._confirmed_versions: dict[str, int] = {}
         # Shadow version at which each reported key was last merged.
         # update/accepted is partial, so a newer document does not contain
         # the keys an older one changed. The global cursor cannot decide
@@ -151,6 +162,11 @@ class Hood:
         # version 11's light stale, and version 11's light must not
         # overwrite a light already applied from version 14.
         self._field_versions: dict[str, int] = {}
+        # Newest full get/accepted version applied. A snapshot versions
+        # every key, including ones it omits: absence is the value. An
+        # older partial must not fill a key back in. Newer partials still
+        # use the per-key version above.
+        self._snapshot_version: int | None = None
         # One in-flight reread after update/rejected. A rejected optimistic
         # write would otherwise stick until something else refreshed state.
         self._reread_task: asyncio.Task[None] | None = None
@@ -567,17 +583,43 @@ class Hood:
     # -- state ---------------------------------------------------------
 
     def handle_state(self, state: HoodState) -> None:
-        """Records new state and notifies listeners.
+        """Records device-reported state and notifies listeners.
 
-        Called by ZephyrClient.
+        Called by ZephyrClient for a document, a poll, or discover. The
+        argument is authoritative reported state, not the optimistic
+        cache. Listeners see that state with still-leading commands
+        laid over it.
 
         Args:
-            state: The newly received hood state.
+            state: The newly received hood state, without optimistic keys.
         """
-        self._state = state
+        self._reported = state
+        self._publish_visible()
+
+    def _publish_visible(self) -> None:
+        """Rebuilds the visible cache and notifies listeners.
+
+        Reported state stays free of optimistic keys. Retiring a command
+        rebuilds from that reported state, so a newer value the overlay
+        was hiding becomes visible instead of leaving the old command's
+        value behind. An empty queue with no reported state yet clears
+        the cache without notifying: there is no HoodState to hand a
+        listener.
+        """
+        overlay = self._pending_overlay()
+        if self._reported is None:
+            if not overlay:
+                self._state = None
+                return
+            visible = HoodState.from_reported(dict(overlay))
+        elif overlay:
+            visible = self._reported.merge(overlay)
+        else:
+            visible = self._reported
+        self._state = visible
         for callback in list(self._listeners):
             try:
-                callback(state)
+                callback(visible)
             except Exception:  # noqa: BLE001
                 # One bad consumer must not stop the others from updating.
                 _LOGGER.exception("state listener raised")
@@ -756,14 +798,11 @@ class Hood:
                 dict(fields),
             )
         )
-        if self._state is None:
-            # No cache yet. from_reported on only these keys; the next full
-            # document replaces it. Merging is impossible without a base,
-            # and replacing a real cache with this partial payload is what
-            # zeroes the usage counters.
-            self.handle_state(HoodState.from_reported(dict(fields)))
-            return
-        self.handle_state(self._state.merge(dict(fields)))
+        # Laid over reported state, not merged into it. The next document
+        # has to be able to reveal a newer device value once this command
+        # retires. With no reported state yet, the visible cache is just
+        # these keys; the next full document replaces that base.
+        self._publish_visible()
 
     def is_shadow_version_current(self, version: object) -> bool:
         """Reports whether a document is new enough to apply, without recording it.
@@ -819,9 +858,13 @@ class Hood:
         use the same drop: the session that published them is gone, and a
         fresh GET has to be able to show a change made while it was down.
         A write that lands after this drop belongs to the new session and
-        stays pending over that GET.
+        stays pending over that GET. The visible cache is rebuilt from
+        reported state, so the dropped values do not linger until that GET.
         """
+        if not self._pending_writes:
+            return
         self._pending_writes.clear()
+        self._publish_visible()
 
     def reported_fields_to_apply(
         self, version: object, reported: dict[str, Any]
@@ -849,8 +892,46 @@ class Hood:
         return {
             key: value
             for key, value in reported.items()
-            if key not in self._field_versions or version >= self._field_versions[key]
+            if self._field_is_current(key, version)
         }
+
+    def _field_is_current(self, key: str, version: int) -> bool:
+        """Reports whether a partial may still change one key.
+
+        The bound is the newer of the last merge of this key and the last
+        full snapshot. A snapshot that omitted the key still counts: the
+        omission is the reported value at that version.
+
+        Args:
+            key: Reported key the partial wants to merge.
+            version: The partial document's version.
+
+        Returns:
+            True when ``version`` is at least that bound, or when neither
+            bound exists yet.
+        """
+        bound = self._field_versions.get(key)
+        floor = self._snapshot_version
+        if floor is not None and (bound is None or floor > bound):
+            bound = floor
+        return bound is None or version >= bound
+
+    def note_snapshot_version(self, version: object) -> None:
+        """Records a full snapshot as a lower bound for every key.
+
+        ``get/accepted`` is the whole reported document. A key it omits is
+        absent at this version, not "unchanged", so a delayed older partial
+        must not put that key back. Only moves the bound forward. A missing
+        or non-integer version records nothing. Per-key versions still
+        decide partials that are newer than this snapshot.
+
+        Args:
+            version: The GET's ``version``, or None when it had none.
+        """
+        if isinstance(version, bool) or not isinstance(version, int):
+            return
+        if self._snapshot_version is None or version > self._snapshot_version:
+            self._snapshot_version = version
 
     def note_applied_versions(self, version: object, reported: dict[str, Any]) -> None:
         """Records the version at which each applied key was last merged.
@@ -872,6 +953,29 @@ class Hood:
             if seen is None or version >= seen:
                 self._field_versions[key] = version
 
+    def state_for_document(self, reported: object, *, replace: bool) -> HoodState:
+        """Parses a shadow document onto authoritative reported state.
+
+        A full GET replaces. A partial update merges onto the last reported
+        document, never onto the visible cache. The visible cache already
+        contains optimistic keys; merging onto it would store those keys
+        as if the device had reported them, and retiring the command would
+        then keep the optimistic value instead of a newer reported one.
+        A non-dict reaches ``from_reported`` so the parse error happens
+        before the version cursor moves.
+
+        Args:
+            reported: The reported block to apply.
+            replace: True for a full snapshot.
+
+        Returns:
+            The authoritative state this document produces, with no
+            optimistic overlay.
+        """
+        if not replace and self._reported is not None and isinstance(reported, dict):
+            return self._reported.merge(reported)
+        return HoodState.from_reported(reported)  # type: ignore[arg-type]
+
     def reconcile_reported(
         self,
         state: HoodState,
@@ -880,7 +984,7 @@ class Hood:
         version: object,
         echoed: bool,
     ) -> HoodState:
-        """Keeps unconfirmed writes in place over a shadow document.
+        """Retires the command this document echoes, if it echoes one.
 
         A GET, including one at the current version, does not confirm a
         command. ``update/accepted`` retires the oldest command whose
@@ -896,8 +1000,14 @@ class Hood:
         latest write, and after ``1 → 2 → 1`` the first echo matches the
         last write.
 
+        The returned state is authoritative. ``handle_state`` lays the
+        commands that are still ahead of their key's last confirmation
+        over it. An older command kept for echo matching is not part of
+        that layer.
+
         Args:
-            state: The state parsed from the document.
+            state: The state parsed from the document, without optimistic
+                keys.
             reported: The reported object that document carried. Anything
                 other than a dict is treated as carrying no keys.
             version: The document's ``version``, or None when it had none.
@@ -905,14 +1015,12 @@ class Hood:
                 a command this client published.
 
         Returns:
-            ``state``, or a merge that puts the still-pending keys back.
+            ``state``, unchanged. Retirement is the side effect; the
+            visible cache is rebuilt when the caller stores ``state``.
         """
         if echoed:
             self._retire_echo(version, reported)
-        overlay = self._pending_overlay()
-        if not overlay:
-            return state
-        return state.merge(overlay)
+        return state
 
     def _retire_echo(self, version: object, reported: object) -> None:
         """Retires the one command this document echoes.
@@ -945,22 +1053,37 @@ class Hood:
             for later in self._pending_writes[index:]:
                 if later.baseline is None or later.baseline < version:
                     later.baseline = version
+            # This version confirmed these keys. An older command for the
+            # same key stays queued so a reordered echo can still match
+            # it, and is left out of the overlay.
+            for key in pending.fields:
+                seen = self._confirmed_versions.get(key)
+                if seen is None or version > seen:
+                    self._confirmed_versions[key] = version
             return
 
     def _pending_overlay(self) -> dict[str, int]:
-        """Returns the latest unconfirmed value of each pending key.
+        """Returns pending keys that are still ahead of a confirmation.
 
-        Later commands win. An older command is still in the queue so its
-        echo can be told apart from the later one, but it no longer
-        describes what the cache should show.
+        Later commands win among those that qualify. A command published
+        against a baseline older than the version that already confirmed
+        the key does not qualify: ``light=1`` then ``light=2``, with the
+        echo of ``2`` first, must not put ``1`` back over the reported
+        ``2``. The older command stays in the queue for its own echo.
 
         Returns:
-            Reported keys still waiting on a command, newest value first
-            in the sense that the last command to set a key supplies it.
+            Reported keys still waiting on a command that outranks the
+            last confirmation of that key.
         """
         overlay: dict[str, int] = {}
         for pending in self._pending_writes:
-            overlay.update(pending.fields)
+            for key, value in pending.fields.items():
+                confirmed = self._confirmed_versions.get(key)
+                if confirmed is not None and (
+                    pending.baseline is None or pending.baseline < confirmed
+                ):
+                    continue
+                overlay[key] = value
         return overlay
 
     def schedule_state_reread(self) -> None:
