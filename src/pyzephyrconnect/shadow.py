@@ -164,6 +164,13 @@ class ShadowClient:
         # serving writes. Consumed by open_until_connack.
         self._prepared_url: str | None = None
         self._prepared_ssl: ssl.SSLContext | None = None
+        # The in-flight network-thread join, if disconnect has cleared
+        # ``_client`` but ``loop_stop`` has not returned. A second caller
+        # must wait on this same future. Treating "no client" as "already
+        # finished" lets that caller return, drop the hood's socket, and
+        # open another session on this client ID while the join is still
+        # running.
+        self._closing: asyncio.Future[None] | None = None
         # Generation of the credentials this client's URL was signed under.
         # The provider writes it while presigning. Hood copies it onto the
         # live-socket record only once this object is installed, so a presign
@@ -535,13 +542,24 @@ class ShadowClient:
     async def disconnect(self) -> None:
         """Tears down the paho client and joins its network thread.
 
-        A no-op with no client. The reference and readiness events are
-        cleared before the first await, so a newer connection completing
-        during a slow teardown is not clobbered. The join runs in a worker
-        thread and is shielded: a cancellation arriving mid-teardown still
-        sees the thread stopped (best-effort) before it propagates.
+        A no-op once any in-flight join has finished. The reference and
+        readiness events are cleared before the first await, so a newer
+        connection completing during a slow teardown is not clobbered.
+        The join runs in a worker thread and is shielded: a cancellation
+        arriving mid-teardown still sees the thread stopped (best-effort)
+        before it propagates.
+
+        ``finish_subscriptions`` and a refused ``request_state`` call this
+        before the hood lock is held, and they clear ``_client`` before the
+        join. A write that lands in that window used to see no client,
+        return immediately, and drop ``Hood._shadow``. Recovery could then
+        open a second session on this client ID while ``loop_stop`` was
+        still running. Callers that arrive mid-join wait for the same one.
         """
+        closing = self._closing
         if self._client is None:
+            if closing is not None:
+                await self._await_closing(closing)
             return
         client, self._client = self._client, None
         # Clear before the await, not after: a slow teardown (loop_stop
@@ -562,18 +580,40 @@ class ShadowClient:
         # before the executor picks it up, leaking a paho client whose
         # network thread is already running - the exact leak this cleanup
         # exists to prevent, one level down.
-        teardown = asyncio.ensure_future(asyncio.to_thread(self._teardown, client))
+        #
+        # Published before the first await. A concurrent disconnect() must
+        # observe this future; otherwise it takes the no-client return
+        # above and does not wait.
+        closing = asyncio.ensure_future(asyncio.to_thread(self._teardown, client))
+        self._closing = closing
         try:
-            await asyncio.shield(teardown)
+            await self._await_closing(closing)
+        finally:
+            if self._closing is closing and closing.done():
+                self._closing = None
+
+    async def _await_closing(self, closing: asyncio.Future[None]) -> None:
+        """Waits for one teardown, including after this caller is cancelled.
+
+        ``asyncio.shield`` keeps the join running but raises
+        ``CancelledError`` in the caller immediately. Returning then would
+        release the hood lock while ``loop_stop`` is still joining.
+
+        Args:
+            closing: The in-flight ``loop_stop`` future.
+
+        Raises:
+            asyncio.CancelledError: This caller was cancelled. The join
+                has finished first.
+            Exception: Whatever the join raised.
+        """
+        try:
+            await asyncio.shield(closing)
         except asyncio.CancelledError:
-            # shield surfaces OUR cancellation immediately while the work
-            # item runs on; returning now would release the hood lock with
-            # paho's thread still alive, letting a new connect overlap the
-            # old client. Best-effort: see the teardown through, THEN
-            # honour the cancel. (A second cancel during this wait still
-            # wins - unavoidable, and strictly rarer.)
+            # A second cancel during this wait still wins. That is rarer
+            # than the overlap this wait exists to close.
             with contextlib.suppress(BaseException):
-                await teardown
+                await closing
             raise
 
     @staticmethod

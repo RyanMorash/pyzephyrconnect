@@ -701,6 +701,84 @@ async def test_a_hood_rebuilds_with_a_fresh_client_after_a_precheck_refusal(
     assert hood._shadow is made[1]
 
 
+async def test_an_in_flight_disconnect_blocks_a_writer_before_recovery(
+    fake_paho, monkeypatch
+):
+    """Tests that recovery waits out a disconnect the GET already started.
+
+    ``request_state`` clears the paho client and joins its thread before
+    the hood lock is taken. A write in that window must not treat the
+    second disconnect as finished: it would drop ``Hood._shadow`` and
+    ``async_ensure_running`` would open another session on this client ID
+    while ``loop_stop`` is still running. ``finish_subscriptions`` aborts
+    through the same ``disconnect``.
+    """
+    caps = HoodCapabilities.from_discover(
+        json.loads((FIXTURES / "discoverdevice.json").read_text())
+    )
+    made: list[ShadowClient] = []
+
+    def factory(_hood):
+        """Shadow factory that records every client it builds."""
+        made.append(_shadow())
+        return made[-1]
+
+    hood = Hood(caps, factory, AsyncMock(), AsyncMock())
+    await hood.async_start()
+    fake_paho.is_connected.return_value = False
+
+    order: list[str] = []
+    entered = asyncio.Event()
+    gate = asyncio.get_running_loop().create_future()
+    real_to_thread = shadow_module.asyncio.to_thread
+
+    async def to_thread(fn, *args, **kwargs):
+        """Hold the network-thread join. Every other worker runs now."""
+        if getattr(fn, "__name__", "") != "_teardown":
+            return await real_to_thread(fn, *args, **kwargs)
+        entered.set()
+        await gate
+        fn(*args, **kwargs)
+        order.append("teardown-done")
+        return None
+
+    def connect_async(*args, **kwargs):
+        """Record a new session opening relative to the blocked join."""
+        order.append("connect")
+        return fire(*args, **kwargs)
+
+    fire = fake_paho.connect_async.side_effect
+    fake_paho.connect_async.side_effect = connect_async
+    monkeypatch.setattr(shadow_module.asyncio, "to_thread", to_thread)
+
+    reading = asyncio.create_task(hood._read_state_outside_lock(made[0]))
+    await entered.wait()
+    write = asyncio.create_task(hood.async_set_light(1))
+    for _ in range(50):
+        await asyncio.sleep(0)
+        if hood._lock.locked() and not write.done():
+            break
+    else:  # pragma: no cover - the assertion message is the failure
+        raise AssertionError("write did not block on the in-flight disconnect")
+
+    ensure = asyncio.create_task(hood.async_ensure_running())
+    await asyncio.sleep(0)
+    assert "connect" not in order
+    assert not ensure.done()
+
+    fake_paho.is_connected.return_value = True
+    gate.set_result(None)
+    with pytest.raises(ZephyrNotConnectedError):
+        await reading
+    with pytest.raises(ZephyrNotConnectedError):
+        await write
+    await ensure
+
+    assert order.index("teardown-done") < order.index("connect")
+    assert hood._shadow is made[1]
+    assert made[0]._client is None
+
+
 async def test_a_refused_write_tears_the_connection_down_so_it_cannot_fire_later(
     fake_paho,
 ):

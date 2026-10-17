@@ -661,7 +661,7 @@ async def test_a_destructive_write_does_not_change_cached_state():
     assert hood.state is not None
     assert hood.state.set_recirculating == 0
     assert hood.state.use_grease_filter_time == 642
-    assert hood._optimistic == {}
+    assert hood._pending_writes == []
 
 
 async def test_a_failed_publish_does_not_pretend_the_write_landed():

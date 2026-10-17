@@ -568,7 +568,12 @@ class ZephyrClient:
                 # after a failed accept would rewind a newer snapshot.
                 if not hood.accept_shadow_version(payload.get("version")):
                     return
-                new_state = hood.reconcile_reported(new_state, reported)
+                new_state = hood.reconcile_reported(
+                    new_state,
+                    reported,
+                    version=payload.get("version"),
+                    echoed=topic.endswith("/update/accepted"),
+                )
                 # Listeners run inline. Hood.handle_state swallows their
                 # exceptions, so one bad consumer cannot stop the others.
                 hood.handle_state(new_state)

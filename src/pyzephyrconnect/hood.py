@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable
 
 from . import const
 from .exceptions import ZephyrNotConnectedError, ZephyrWriteError
@@ -21,6 +21,52 @@ from .shadow import ShadowClient
 _LOGGER = logging.getLogger(__name__)
 
 StateListener = Callable[[HoodState], None]
+
+
+class _PendingWrite:
+    """One command still waiting for its own echo.
+
+    Confirmation is this command, not a later one that happens to publish
+    the same level. ``baseline`` is the shadow version already applied when
+    the command was sent. A document at that version, including the GET
+    that was in flight before the command, is not its echo.
+    """
+
+    def __init__(self, baseline: int | None, fields: dict[str, int]) -> None:
+        """Stores the version baseline and the fields this command set.
+
+        Args:
+            baseline: Shadow version already applied, or None when no
+                versioned document has been applied yet.
+            fields: Reported keys this command published.
+        """
+        self.baseline = baseline
+        self.fields = fields
+
+
+def _version_confirms(version: object, baseline: int | None) -> bool:
+    """Reports whether a document is newer than a command's baseline.
+
+    A missing version is not an echo: the rejection reread and an in-flight
+    GET often arrive without moving the cursor, or at the same version the
+    command was published against. A version equal to the baseline is that
+    in-flight document, not the command's acknowledgement. Greater-than is
+    not by itself the acknowledgement. The caller still has to match the
+    oldest command's values, or a repeated level acks the wrong write.
+
+    Args:
+        version: The document's ``version`` field.
+        baseline: The version applied when the command was published, or
+            None when no versioned document had been applied yet.
+
+    Returns:
+        True when ``version`` is a newer shadow version than ``baseline``.
+    """
+    if isinstance(version, bool) or not isinstance(version, int):
+        return False
+    if baseline is None:
+        return True
+    return version > baseline
 
 
 def _prepares_offline(shadow: object) -> bool:
@@ -83,12 +129,16 @@ class Hood:
         # a versioned document arrives; a document with no version keeps
         # today's apply-anyway behaviour and does not move this cursor.
         self._shadow_version: int | None = None
-        # Fields published since the last document that echoed them, or
-        # since update/rejected dropped them. Incoming reported state must
-        # not replace these: a GET in flight before the write, and an
-        # earlier write's echo, still carry the old value. Dangerous
-        # fields are never entered here.
-        self._optimistic: dict[str, int] = {}
+        # Commands whose echo has not arrived, oldest first. The latest
+        # value of a key is what the cache shows. An incoming document may
+        # retire only the oldest command, and only when it is that
+        # command's echo: a newer version than ``baseline`` carrying that
+        # command's values. Matching the value alone acks the wrong write
+        # when the same level is published twice. The queue is dropped when
+        # the session that published it is gone; a later GET must be able
+        # to show what the device or the phone did during the outage.
+        # Dangerous fields are never entered here.
+        self._pending_writes: list[_PendingWrite] = []
         # One in-flight reread after update/rejected. A rejected optimistic
         # write would otherwise stick until something else refreshed state.
         self._reread_task: asyncio.Task[None] | None = None
@@ -250,6 +300,10 @@ class Hood:
         if self._shadow is shadow:
             self._shadow = None
             self._connected = False
+            # The session that published these commands is gone, so their
+            # echoes will not arrive. Keeping them would paint the old
+            # values over the GET that follows the replacement session.
+            self.discard_unconfirmed_writes()
         with contextlib.suppress(Exception):
             await shadow.disconnect()
 
@@ -464,6 +518,11 @@ class Hood:
             # Mirrors ShadowClient.disconnect's clear-before-await.
             shadow, self._shadow = self._shadow, None
             self._connected = False
+            # Stop and the supervisor rebuild both come through here. The
+            # commands published on this socket lose their echo when the
+            # socket does. Writes on the replacement session are recorded
+            # after this returns, and those stay pending.
+            self.discard_unconfirmed_writes()
             await shadow.disconnect()
 
     async def async_poll(self) -> HoodState:
@@ -635,6 +694,7 @@ class Hood:
             # misleads the derived client.connected.
             self._shadow = None
             self._connected = False
+            self.discard_unconfirmed_writes()
             raise
         # Only after the publish was accepted into paho's queue. The
         # NO_CONN path above tears the client down so a qos>0 message
@@ -659,13 +719,21 @@ class Hood:
         """
         if set(fields) & const.DANGEROUS_FIELDS:
             return
-        # Remembered until a document echoes the same value, or a rejection
-        # drops the set. Without this, a GET at the current version (the
-        # one that was in flight before the write) parses as new enough
-        # and puts the old value back. An earlier echo can do the same to
-        # a later command. ``<=`` on the version cursor would also drop the
-        # rejection reread, which comes back at the same version.
-        self._optimistic.update(fields)
+        # Kept until THIS command's echo, a rejection, or the loss of the
+        # session. A GET at the current version was in flight before the
+        # write and must not replace it. An earlier command's echo must
+        # not either, including when it carries the same level a later
+        # command published. ``<=`` on the version cursor would also drop
+        # the rejection reread, which comes back at the same version.
+        baseline = self._shadow_version
+        self._pending_writes.append(
+            _PendingWrite(
+                baseline
+                if isinstance(baseline, int) and not isinstance(baseline, bool)
+                else None,
+                dict(fields),
+            )
+        )
         if self._state is None:
             # No cache yet. from_reported on only these keys; the next full
             # document replaces it. Merging is impossible without a base,
@@ -718,48 +786,93 @@ class Hood:
         return True
 
     def discard_unconfirmed_writes(self) -> None:
-        """Drops optimistic fields a rejection may have been about.
+        """Drops commands whose echo will not be the next document.
 
-        The follow-up GET is what restores those keys. Leaving them
-        pending would paint the refused values back over that document,
-        and the GET often reuses the current version so the cursor will
-        not reject it. A write that lands after this drop is a newer
-        command and stays pending over the GET.
+        A rejection means the device did not apply the write, and the
+        follow-up GET reuses the current version so the cursor will not
+        reject it. Leaving the commands pending would paint the refused
+        values back over that document. Stop, rebuild, and a dead socket
+        use the same drop: the session that published them is gone, and a
+        fresh GET has to be able to show a change made while it was down.
+        A write that lands after this drop belongs to the new session and
+        stays pending over that GET.
         """
-        self._optimistic.clear()
+        self._pending_writes.clear()
 
-    def reconcile_reported(self, state: HoodState, reported: object) -> HoodState:
+    def reconcile_reported(
+        self,
+        state: HoodState,
+        reported: object,
+        *,
+        version: object,
+        echoed: bool,
+    ) -> HoodState:
         """Keeps unconfirmed writes in place over a shadow document.
 
-        A document echoes a write when it carries the same value for that
-        key. Until then the key stays as published. A GET that was in
-        flight before the write, or an earlier write's echo, still has
-        the old value and must not replace it.
+        A GET, including one at the current version, does not confirm a
+        command. ``update/accepted`` retires the oldest pending command
+        only, and only when the document is newer than that command's
+        baseline and carries that command's values. The newest command
+        stays until its own echo. Value equality alone will not do: after
+        ``1`` then ``0``, an in-flight document that still says ``0``
+        matches the latest write, and after ``1 → 2 → 1`` the first echo
+        matches the last write.
 
         Args:
             state: The state parsed from the document.
             reported: The reported object that document carried. Anything
                 other than a dict is treated as carrying no keys.
+            version: The document's ``version``, or None when it had none.
+            echoed: True for ``update/accepted``. A GET is not an echo of
+                a command this client published.
 
         Returns:
             ``state``, or a merge that puts the still-pending keys back.
         """
-        if not self._optimistic:
-            return state
-        reported_map: Mapping[str, object] = (
-            reported if isinstance(reported, dict) else {}
-        )
-        still: dict[str, int] = {}
-        overlay: dict[str, int] = {}
-        for key, value in self._optimistic.items():
-            if key in reported_map and reported_map[key] == value:
-                continue
-            still[key] = value
-            overlay[key] = value
-        self._optimistic = still
+        if echoed:
+            self._retire_oldest_echo(version, reported)
+        overlay = self._pending_overlay()
         if not overlay:
             return state
         return state.merge(overlay)
+
+    def _retire_oldest_echo(self, version: object, reported: object) -> None:
+        """Retires the oldest command when this document is its echo.
+
+        One document, one command. A newer command that published the same
+        level stays pending, so this echo cannot ack it.
+
+        Args:
+            version: The document's ``version``, or None.
+            reported: The reported object. Not a dict means nothing matches.
+        """
+        if not self._pending_writes or not isinstance(reported, dict):
+            return
+        oldest = self._pending_writes[0]
+        if not _version_confirms(version, oldest.baseline):
+            return
+        if any(
+            key not in reported or reported[key] != value
+            for key, value in oldest.fields.items()
+        ):
+            return
+        self._pending_writes.pop(0)
+
+    def _pending_overlay(self) -> dict[str, int]:
+        """Returns the latest unconfirmed value of each pending key.
+
+        Later commands win. An older command is still in the queue so its
+        echo can be told apart from the later one, but it no longer
+        describes what the cache should show.
+
+        Returns:
+            Reported keys still waiting on a command, newest value first
+            in the sense that the last command to set a key supplies it.
+        """
+        overlay: dict[str, int] = {}
+        for pending in self._pending_writes:
+            overlay.update(pending.fields)
+        return overlay
 
     def schedule_state_reread(self) -> None:
         """Schedules a full shadow GET after a rejected update.
@@ -818,6 +931,7 @@ class Hood:
                 if self._shadow is shadow:
                     self._shadow = None
                     self._connected = False
+                    self.discard_unconfirmed_writes()
                 raise
 
     def _consume_reread(self, task: asyncio.Task[None]) -> None:
