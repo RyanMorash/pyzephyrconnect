@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 from . import const
 from .exceptions import ZephyrNotConnectedError, ZephyrWriteError
@@ -21,6 +22,67 @@ from .shadow import ShadowClient
 _LOGGER = logging.getLogger(__name__)
 
 StateListener = Callable[[HoodState], None]
+
+
+class _PendingWrite:
+    """One command still waiting for its own echo.
+
+    Confirmation is this command, not a later one that happens to publish
+    the same level. ``baseline`` is the shadow version already applied when
+    the command was sent. A document at that version, including the GET
+    that was in flight before the command, is not its echo.
+    """
+
+    def __init__(self, baseline: int | None, fields: dict[str, int]) -> None:
+        """Stores the version baseline and the fields this command set.
+
+        Args:
+            baseline: Shadow version already applied, or None when no
+                versioned document has been applied yet.
+            fields: Reported keys this command published.
+        """
+        self.baseline = baseline
+        self.fields = fields
+
+
+def _version_confirms(version: object, baseline: int | None) -> bool:
+    """Reports whether a document is newer than a command's baseline.
+
+    A missing version is not an echo: the rejection reread and an in-flight
+    GET often arrive without moving the cursor, or at the same version the
+    command was published against. A version equal to the baseline is that
+    in-flight document, or a QoS 1 redelivery of an echo that already
+    retired an earlier command. Greater-than is not by itself the
+    acknowledgement. The caller still has to match one command's values,
+    or a repeated level acks the wrong write.
+
+    Args:
+        version: The document's ``version`` field.
+        baseline: The version applied when the command was published, or
+            None when no versioned document had been applied yet.
+
+    Returns:
+        True when ``version`` is a newer shadow version than ``baseline``.
+    """
+    if isinstance(version, bool) or not isinstance(version, int):
+        return False
+    if baseline is None:
+        return True
+    return version > baseline
+
+
+def _prepares_offline(shadow: object) -> bool:
+    """Whether reconnect can presign before tearing this socket down.
+
+    Read off the class, and only when the value is exactly True. A
+    MagicMock's class does not define the flag; asking the instance would
+    invent one and take the split path with methods the double does not
+    implement.
+
+    Args:
+        shadow: The live session about to be replaced.
+    """
+    return getattr(type(shadow), "prepares_transport_before_disconnect", False) is True
 
 
 class Hood:
@@ -50,6 +112,12 @@ class Hood:
         # Runs before the first connect. Attaches the IoT policy; see _start.
         self._prepare = prepare
         self._shadow: ShadowClient | None = None
+        # Device-reported state, with no optimistic keys in it. The visible
+        # cache is this plus the pending commands that are still ahead of
+        # the last confirmation of their key. Merging an echo onto the
+        # visible cache stores the overlay as if the device had reported
+        # it, and retiring the command then has nothing newer to reveal.
+        self._reported: HoodState | None = None
         self._state: HoodState | None = None
         self._listeners: list[StateListener] = []
         self._connected = False
@@ -63,6 +131,45 @@ class Hood:
         # wires in (so a reconnect updates it without anyone remembering
         # to). None until the first presign.
         self._presigned_generation: int | None = None
+        # Newest shadow `version` applied from get/accepted or
+        # update/accepted. An in-flight GET from before a write carries an
+        # older version and must not replace the newer snapshot. None until
+        # a versioned document arrives; a document with no version keeps
+        # today's apply-anyway behaviour and does not move this cursor.
+        self._shadow_version: int | None = None
+        # Commands whose echo has not arrived, oldest first. One document
+        # retires at most one command, the oldest whose values it actually
+        # carries, and only when it is newer than that command's baseline.
+        # A partial echo of a later command must not wait behind an older
+        # command it does not mention, and it must not consume a redelivery
+        # of the version that already retired something ahead of it. An
+        # older command stays queued so its own echo can still be matched,
+        # but it does not cover a newer confirmation of the same key.
+        # Matching the value alone acks the wrong write when the same level
+        # is published twice. The queue is dropped when the session that
+        # published it is gone; a later GET must be able to show what the
+        # device or the phone did during the outage. Dangerous fields are
+        # never entered here.
+        self._pending_writes: list[_PendingWrite] = []
+        # Shadow version of the newest echo that retired a command for this
+        # key. A pending command published against an older baseline is
+        # kept for echo matching and left out of the visible cache.
+        self._confirmed_versions: dict[str, int] = {}
+        # Shadow version at which each reported key was last merged.
+        # update/accepted is partial, so a newer document does not contain
+        # the keys an older one changed. The global cursor cannot decide
+        # that for a single key: version 12 reporting fan does not make
+        # version 11's light stale, and version 11's light must not
+        # overwrite a light already applied from version 14.
+        self._field_versions: dict[str, int] = {}
+        # Newest full get/accepted version applied. A snapshot versions
+        # every key, including ones it omits: absence is the value. An
+        # older partial must not fill a key back in. Newer partials still
+        # use the per-key version above.
+        self._snapshot_version: int | None = None
+        # One in-flight reread after update/rejected. A rejected optimistic
+        # write would otherwise stick until something else refreshed state.
+        self._reread_task: asyncio.Task[None] | None = None
         # Serialises start/stop/reconnect against writes.
         self._lock = asyncio.Lock()
 
@@ -95,12 +202,22 @@ class Hood:
     def handle_connection_change(self, connected: bool) -> None:
         """Records the new connection state for this hood.
 
-        Called by ShadowClient from the event loop.
+        Called by ShadowClient from the event loop. paho's own
+        auto-reconnect does not come through ``_stop``. The disconnect
+        callback is the only point that knows the session which published
+        the pending commands is gone. Leaving them pending paints the
+        missed write over the resync GET, so a change made during the
+        outage never shows. A write that lands after this callback belongs
+        to the session that came back and stays pending. ``_stop`` already
+        drops the queue before it awaits disconnect; this clear is the
+        same drop for the path that never calls ``_stop``.
 
         Args:
             connected: Whether this hood's shadow connection is now up.
         """
         self._connected = connected
+        if not connected:
+            self.discard_unconfirmed_writes()
 
     async def async_start(self) -> None:
         """Opens this hood's shadow connection and requests current state."""
@@ -144,8 +261,14 @@ class Hood:
         The presigned URL is derived from credentials that expire, so a
         refresh without a reconnect leaves a socket AWS IoT will drop.
 
-        Holds the lock across both halves so a write arriving mid-rebuild
-        waits rather than failing with a spurious ZephyrNotConnectedError.
+        A write that arrives during the blackout waits and then publishes
+        once, rather than failing with a spurious ZephyrNotConnectedError.
+        The lock covers only the gap where there is no session that can
+        publish: presign and the TLS context run first, while the old
+        socket is still up, and SUBACKs plus the state GET run after the
+        new session is past CONNACK. Two live sessions sharing a client ID
+        evict each other, so the old socket is fully stopped before the
+        new one is opened.
         """
         async with self._lock:
             if not self._should_run:
@@ -153,21 +276,74 @@ class Hood:
                 # calls this for every hood on the account; it must not
                 # bring up MQTT for hoods the consumer chose not to start.
                 return
+            old = self._shadow
+        if old is not None and _prepares_offline(old):
+            await self._reconnect_prepared(old)
+            return
+        # Test doubles implement connect() as the whole handshake. That
+        # call is the stand-in for "not yet past CONNACK", so it stays
+        # inside the lock. The state GET does not.
+        async with self._lock:
+            if not self._should_run:
+                return
             await self._stop()
-            await self._start()
+            shadow = await self._open()
+        if shadow is not None:
+            await self._read_state_outside_lock(shadow)
 
     def note_presigned_generation(self, generation: int) -> None:
-        """Records which credential generation signed this socket's URL.
+        """Records which credential generation signed the live socket's URL.
 
-        Called by the provider ZephyrClient hands to ShadowClient, which
-        invokes it on every connect attempt - so a reconnect re-records the
-        current generation and no caller has to remember to.
+        Called when that socket is installed, from the generation the
+        credentials provider stashed on the shadow while presigning. Noting
+        it any earlier lets a presign that never connects, or that loses a
+        race with another rebuild, describe the socket that is still up.
+        ``needs_represign`` would then treat an expiring URL as current.
 
         Args:
-            generation: The credentials provider's current generation
-                counter.
+            generation: The generation the installed socket was signed under.
         """
         self._presigned_generation = generation
+
+    def _install_shadow(self, shadow: ShadowClient) -> None:
+        """Records ``shadow`` as the live socket and commits its generation.
+
+        Lock-free: callers hold ``self._lock``. The generation is copied
+        only when the provider left an int on the shadow. A test double
+        that never presigned leaves the hood's record alone.
+
+        Args:
+            shadow: The session that may now publish.
+        """
+        self._shadow = shadow
+        generation = getattr(shadow, "presigned_generation", None)
+        if isinstance(generation, bool) or not isinstance(generation, int):
+            return
+        self.note_presigned_generation(generation)
+
+    async def _drop_failed_socket(self, shadow: ShadowClient) -> None:
+        """Disconnects ``shadow`` before any other open can reuse its client ID.
+
+        Lock-free: callers hold ``self._lock``. The live reference is
+        cleared only when it still points here, so a newer session is left
+        alone. The disconnect itself runs before the caller releases the
+        lock either way. ``async_start`` and ``async_ensure_running`` treat
+        ``_shadow is None`` as permission to connect, and a connect that
+        overlaps this client's ``loop_stop`` is two sessions on one client
+        ID.
+
+        Args:
+            shadow: The session whose handshake or state GET failed.
+        """
+        if self._shadow is shadow:
+            self._shadow = None
+            self._connected = False
+            # The session that published these commands is gone, so their
+            # echoes will not arrive. Keeping them would paint the old
+            # values over the GET that follows the replacement session.
+            self.discard_unconfirmed_writes()
+        with contextlib.suppress(Exception):
+            await shadow.disconnect()
 
     def needs_represign(self, current: int) -> bool:
         """Reports whether the live socket is signed under stale credentials.
@@ -217,20 +393,26 @@ class Hood:
         async with self._lock:
             await self._stop()
 
-    # Lock-free bodies. Callers above hold self._lock; asyncio.Lock is not
-    # reentrant, so async_reconnect cannot call the public methods.
+    # _open, _start and _stop are lock-free: their callers hold self._lock.
+    # asyncio.Lock is not reentrant, so those bodies must not call the
+    # public methods. _read_state_outside_lock and _reconnect_prepared take
+    # the lock themselves around the sections that mutate the socket.
 
-    async def _start(self) -> None:
-        """Attaches the IoT policy, connects the shadow, and requests state.
+    async def _open(self) -> ShadowClient | None:
+        """Attaches the policy, connects, and records the socket.
 
         Lock-free: callers hold self._lock. A no-op when a socket already
-        exists; if the initial state request fails, the hood is put back in
-        the no-socket shape the supervisor knows how to recover from.
+        exists, so a second start cannot orphan a live paho thread. Does
+        not request state; the caller decides whether that GET is inside
+        the lock (first start) or after it (a rebuild).
+
+        Returns:
+            The shadow just connected, or None when one was already up.
         """
         if self._shadow is not None:
             # Already connected. Rebuilding here would orphan the previous
             # paho client with its network thread still running.
-            return
+            return None
         # MUST precede connect(). An already-open MQTT connection does not
         # pick up newly attached permissions, and the failure is silent:
         # connect, subscribe and publish all succeed and every message is
@@ -239,7 +421,19 @@ class Hood:
         await self._prepare()
         shadow = self._shadow_factory(self)
         await shadow.connect()
-        self._shadow = shadow
+        self._install_shadow(shadow)
+        return shadow
+
+    async def _start(self) -> None:
+        """Connects the shadow and requests state, under the caller's lock.
+
+        Lock-free: callers hold self._lock. If the initial state request
+        fails, the hood is put back in the no-socket shape the supervisor
+        knows how to recover from.
+        """
+        shadow = await self._open()
+        if shadow is None:
+            return
         try:
             await shadow.request_state()
         except BaseException:
@@ -266,6 +460,83 @@ class Hood:
                 await shadow.disconnect()
             raise
 
+    async def _read_state_outside_lock(self, shadow: ShadowClient) -> None:
+        """Requests the initial document without holding the hood lock.
+
+        A command published while this GET is in flight must not wait for
+        it. On failure the socket is dropped, and that disconnect finishes
+        before the lock is released. ``async_start`` and
+        ``async_ensure_running`` open a session as soon as ``_shadow`` is
+        None; doing that while this client's network thread is still inside
+        ``loop_stop`` puts two sessions on one client ID. AWS IoT evicts
+        one, and the old disconnect callback then marks the survivor down.
+
+        Args:
+            shadow: The session the GET belongs to. Ignored if a newer
+                session has already replaced it.
+
+        Raises:
+            Exception: Whatever ``request_state`` raised, after teardown.
+        """
+        try:
+            await shadow.request_state()
+        except BaseException:
+            async with self._lock:
+                await self._drop_failed_socket(shadow)
+            raise
+
+    async def _reconnect_prepared(self, old: ShadowClient) -> None:
+        """Rebuilds a real shadow, presigning before the old socket stops.
+
+        ``old`` must be a ShadowClient (it advertises
+        ``prepares_transport_before_disconnect``). The replacement is a new
+        object: opening it before ``old`` has disconnected would put two
+        sessions on one client ID, and AWS IoT would evict one of them.
+
+        Args:
+            old: The live session being replaced. If it is no longer the
+                hood's socket by the time the lock is taken, the rebuild
+                is abandoned.
+        """
+        # Policy before any new socket. Latched, so this is a no-op after
+        # the first successful attach for this identity.
+        await self._prepare()
+        replacement = self._shadow_factory(self)
+        # Presign stamps its generation on ``replacement``, not on this
+        # hood. Two rebuilds can be in prepare_transport at once; committing
+        # either generation before that socket is the live one lets the
+        # loser describe the winner, and needs_represign() then skips the
+        # rebuild that would replace a URL signed under expiring credentials.
+        await replacement.prepare_transport()
+        async with self._lock:
+            if not self._should_run or self._shadow is not old:
+                return
+            await self._stop()
+            try:
+                await replacement.open_until_connack()
+            except BaseException:
+                # Not installed, so _drop_failed_socket will not clear
+                # _connected. A CONNACK callback may already have set it.
+                # This attempt holds the lock, so nothing else is live.
+                self._connected = False
+                await self._drop_failed_socket(replacement)
+                raise
+            # Past CONNACK. publish_state is legal; release the lock before
+            # the subscription wait and the state GET. The generation is
+            # committed with the install, not when the URL was signed.
+            self._install_shadow(replacement)
+        try:
+            await replacement.finish_subscriptions()
+            await replacement.request_state()
+        except BaseException:
+            # Disconnect before releasing the lock. Clearing _shadow and
+            # yielding first lets async_ensure_running open a second session
+            # on this client ID while loop_stop is still joining the old
+            # network thread.
+            async with self._lock:
+                await self._drop_failed_socket(replacement)
+            raise
+
     async def _stop(self) -> None:
         """Tears down the shadow connection, if any.
 
@@ -285,6 +556,11 @@ class Hood:
             # Mirrors ShadowClient.disconnect's clear-before-await.
             shadow, self._shadow = self._shadow, None
             self._connected = False
+            # Stop and the supervisor rebuild both come through here. The
+            # commands published on this socket lose their echo when the
+            # socket does. Writes on the replacement session are recorded
+            # after this returns, and those stay pending.
+            self.discard_unconfirmed_writes()
             await shadow.disconnect()
 
     async def async_poll(self) -> HoodState:
@@ -307,17 +583,43 @@ class Hood:
     # -- state ---------------------------------------------------------
 
     def handle_state(self, state: HoodState) -> None:
-        """Records new state and notifies listeners.
+        """Records device-reported state and notifies listeners.
 
-        Called by ZephyrClient.
+        Called by ZephyrClient for a document, a poll, or discover. The
+        argument is authoritative reported state, not the optimistic
+        cache. Listeners see that state with still-leading commands
+        laid over it.
 
         Args:
-            state: The newly received hood state.
+            state: The newly received hood state, without optimistic keys.
         """
-        self._state = state
+        self._reported = state
+        self._publish_visible()
+
+    def _publish_visible(self) -> None:
+        """Rebuilds the visible cache and notifies listeners.
+
+        Reported state stays free of optimistic keys. Retiring a command
+        rebuilds from that reported state, so a newer value the overlay
+        was hiding becomes visible instead of leaving the old command's
+        value behind. An empty queue with no reported state yet clears
+        the cache without notifying: there is no HoodState to hand a
+        listener.
+        """
+        overlay = self._pending_overlay()
+        if self._reported is None:
+            if not overlay:
+                self._state = None
+                return
+            visible = HoodState.from_reported(dict(overlay))
+        elif overlay:
+            visible = self._reported.merge(overlay)
+        else:
+            visible = self._reported
+        self._state = visible
         for callback in list(self._listeners):
             try:
-                callback(state)
+                callback(visible)
             except Exception:  # noqa: BLE001
                 # One bad consumer must not stop the others from updating.
                 _LOGGER.exception("state listener raised")
@@ -456,7 +758,409 @@ class Hood:
             # misleads the derived client.connected.
             self._shadow = None
             self._connected = False
+            self.discard_unconfirmed_writes()
             raise
+        # Only after the publish was accepted into paho's queue. The
+        # NO_CONN path above tears the client down so a qos>0 message
+        # cannot actuate later; applying state there would report a
+        # command that was refused. Listeners run inline, and this lock
+        # is held, so a listener must not call back into the hood.
+        self._note_optimistic_write(fields)
+
+    def _note_optimistic_write(self, fields: dict[str, int]) -> None:
+        """Merges a successful write into the cache before the echo arrives.
+
+        The vendor app shows the tap immediately. Waiting for
+        ``update/accepted`` makes every consumer one cloud round trip
+        behind that. Device-derived keys (``power`` rising after a fan
+        write, ``delaytimer`` counted down from ``setdelaytimer``) are
+        left for the echo to merge. Destructive fields are skipped: showing
+        a zeroed grease counter, or a recirculating change, before the
+        device confirms it would lie about a change that cannot be undone.
+
+        Args:
+            fields: The fields just published to ``state.reported``.
+        """
+        if set(fields) & const.DANGEROUS_FIELDS:
+            return
+        # Kept until THIS command's echo, a rejection, or the loss of the
+        # session. A GET at the current version was in flight before the
+        # write and must not replace it. An earlier command's echo must
+        # not either, including when it carries the same level a later
+        # command published. ``<=`` on the version cursor would also drop
+        # the rejection reread, which comes back at the same version.
+        baseline = self._shadow_version
+        self._pending_writes.append(
+            _PendingWrite(
+                baseline
+                if isinstance(baseline, int) and not isinstance(baseline, bool)
+                else None,
+                dict(fields),
+            )
+        )
+        # Laid over reported state, not merged into it. The next document
+        # has to be able to reveal a newer device value once this command
+        # retires. With no reported state yet, the visible cache is just
+        # these keys; the next full document replaces that base.
+        self._publish_visible()
+
+    def is_shadow_version_current(self, version: object) -> bool:
+        """Reports whether a document is new enough to apply, without recording it.
+
+        A missing or non-integer version is current: those documents keep
+        the apply-anyway behaviour and do not move the cursor. An integer
+        older than the newest one already applied is not. Callers parse
+        the reported block before ``accept_shadow_version``, so a document
+        that fails to parse does not make a later valid one look stale.
+
+        Args:
+            version: The ``version`` field of a shadow document, or None
+                when the document did not carry one.
+
+        Returns:
+            True when the caller should try to apply the document.
+        """
+        if isinstance(version, bool) or not isinstance(version, int):
+            return True
+        return self._shadow_version is None or version >= self._shadow_version
+
+    def accept_shadow_version(self, version: object) -> bool:
+        """Records a document version after its reported block parsed.
+
+        Call only once the new state exists, and only for a document the
+        caller has already judged current. A missing or non-integer
+        version does not move the cursor. An older version is not
+        recorded. A partial ``update/accepted`` older than the cursor is
+        still applied field by field elsewhere; this method must not
+        rewind the cursor to it. The check is repeated so a cursor that
+        moved during parsing cannot be rewound either.
+
+        Args:
+            version: The ``version`` field of a shadow document, or None
+                when the document did not carry one.
+
+        Returns:
+            True when the caller should apply the document.
+        """
+        if not self.is_shadow_version_current(version):
+            return False
+        if not isinstance(version, bool) and isinstance(version, int):
+            self._shadow_version = version
+        return True
+
+    def discard_unconfirmed_writes(self) -> None:
+        """Drops commands whose echo will not be the next document.
+
+        A rejection means the device did not apply the write, and the
+        follow-up GET reuses the current version so the cursor will not
+        reject it. Leaving the commands pending would paint the refused
+        values back over that document. Stop, rebuild, and a dead socket
+        use the same drop: the session that published them is gone, and a
+        fresh GET has to be able to show a change made while it was down.
+        A write that lands after this drop belongs to the new session and
+        stays pending over that GET. The visible cache is rebuilt from
+        reported state, so the dropped values do not linger until that GET.
+        """
+        if not self._pending_writes:
+            return
+        self._pending_writes.clear()
+        self._publish_visible()
+
+    def reported_fields_to_apply(
+        self, version: object, reported: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Returns the reported keys this partial document may still change.
+
+        ``update/accepted`` carries only the keys that changed. Dropping a
+        whole older document because a newer partial arrived first loses
+        the keys the newer one did not mention. A key already merged from
+        a newer document must not be overwritten by the late one. A
+        version that is not an integer does not participate: every key is
+        applied, matching a document that never moves the cursor.
+
+        Args:
+            version: The document's ``version``, or None when it had none.
+            reported: The reported object. Callers pass a dict; a list
+                fails in parsing before this is consulted.
+
+        Returns:
+            The subset of ``reported`` safe to merge. Keys are omitted,
+            not set to None: absent is not a value.
+        """
+        if isinstance(version, bool) or not isinstance(version, int):
+            return dict(reported)
+        return {
+            key: value
+            for key, value in reported.items()
+            if self._field_is_current(key, version)
+        }
+
+    def _field_is_current(self, key: str, version: int) -> bool:
+        """Reports whether a partial may still change one key.
+
+        The bound is the newer of the last merge of this key and the last
+        full snapshot. A snapshot that omitted the key still counts: the
+        omission is the reported value at that version.
+
+        Args:
+            key: Reported key the partial wants to merge.
+            version: The partial document's version.
+
+        Returns:
+            True when ``version`` is at least that bound, or when neither
+            bound exists yet.
+        """
+        bound = self._field_versions.get(key)
+        floor = self._snapshot_version
+        if floor is not None and (bound is None or floor > bound):
+            bound = floor
+        return bound is None or version >= bound
+
+    def note_snapshot_version(self, version: object) -> None:
+        """Records a full snapshot as a lower bound for every key.
+
+        ``get/accepted`` is the whole reported document. A key it omits is
+        absent at this version, not "unchanged", so a delayed older partial
+        must not put that key back. Only moves the bound forward. A missing
+        or non-integer version records nothing. Per-key versions still
+        decide partials that are newer than this snapshot.
+
+        Args:
+            version: The GET's ``version``, or None when it had none.
+        """
+        if isinstance(version, bool) or not isinstance(version, int):
+            return
+        if self._snapshot_version is None or version > self._snapshot_version:
+            self._snapshot_version = version
+
+    def note_applied_versions(self, version: object, reported: dict[str, Any]) -> None:
+        """Records the version at which each applied key was last merged.
+
+        Only moves a key forward. An older partial allowed to fill a key
+        the newer document left out must not make a key that already
+        moved look stale. A missing or non-integer version records
+        nothing, so it cannot block a later numbered document.
+
+        Args:
+            version: The document version. Ignored unless it is an int.
+            reported: The keys that were actually merged, not the keys the
+                document carried and this version was too old to apply.
+        """
+        if isinstance(version, bool) or not isinstance(version, int):
+            return
+        for key in reported:
+            seen = self._field_versions.get(key)
+            if seen is None or version >= seen:
+                self._field_versions[key] = version
+
+    def state_for_document(self, reported: object, *, replace: bool) -> HoodState:
+        """Parses a shadow document onto authoritative reported state.
+
+        A full GET replaces. A partial update merges onto the last reported
+        document, never onto the visible cache. The visible cache already
+        contains optimistic keys; merging onto it would store those keys
+        as if the device had reported them, and retiring the command would
+        then keep the optimistic value instead of a newer reported one.
+        A non-dict reaches ``from_reported`` so the parse error happens
+        before the version cursor moves.
+
+        Args:
+            reported: The reported block to apply.
+            replace: True for a full snapshot.
+
+        Returns:
+            The authoritative state this document produces, with no
+            optimistic overlay.
+        """
+        if not replace and self._reported is not None and isinstance(reported, dict):
+            return self._reported.merge(reported)
+        return HoodState.from_reported(reported)  # type: ignore[arg-type]
+
+    def reconcile_reported(
+        self,
+        state: HoodState,
+        reported: object,
+        *,
+        version: object,
+        echoed: bool,
+    ) -> HoodState:
+        """Retires the command this document echoes, if it echoes one.
+
+        A GET, including one at the current version, does not confirm a
+        command. ``update/accepted`` retires the oldest command whose
+        values the document actually carries, and only when the document
+        is newer than that command's baseline. One document, one command:
+        a fan echo that arrives before the light echo can retire the fan
+        command without consuming the light one, and it must not be
+        required to be the oldest entry. Commands published after the one
+        retired have their baseline raised to this version, so a QoS 1
+        redelivery of the same echo cannot retire the next write of the
+        same value. Value equality alone will not do: after ``1`` then
+        ``0``, an in-flight document that still says ``0`` matches the
+        latest write, and after ``1 → 2 → 1`` the first echo matches the
+        last write.
+
+        The returned state is authoritative. ``handle_state`` lays the
+        commands that are still ahead of their key's last confirmation
+        over it. An older command kept for echo matching is not part of
+        that layer.
+
+        Args:
+            state: The state parsed from the document, without optimistic
+                keys.
+            reported: The reported object that document carried. Anything
+                other than a dict is treated as carrying no keys.
+            version: The document's ``version``, or None when it had none.
+            echoed: True for ``update/accepted``. A GET is not an echo of
+                a command this client published.
+
+        Returns:
+            ``state``, unchanged. Retirement is the side effect; the
+            visible cache is rebuilt when the caller stores ``state``.
+        """
+        if echoed:
+            self._retire_echo(version, reported)
+        return state
+
+    def _retire_echo(self, version: object, reported: object) -> None:
+        """Retires the one command this document echoes.
+
+        Oldest match wins, so a document that carries the oldest command
+        still acks that one and not a later command with the same level.
+        A partial that only carries a later command acks that later one.
+        Commands ahead of it keep their baselines: the light echo can
+        still be older than the fan echo that already arrived. Commands
+        behind it move up to this version. A replay of this document is
+        then equal to their baseline, and equal does not confirm.
+
+        Args:
+            version: The document's ``version``, or None.
+            reported: The reported object. Not a dict means nothing matches.
+        """
+        if not self._pending_writes or not isinstance(reported, dict):
+            return
+        if isinstance(version, bool) or not isinstance(version, int):
+            return
+        for index, pending in enumerate(self._pending_writes):
+            if not _version_confirms(version, pending.baseline):
+                continue
+            if any(
+                key not in reported or reported[key] != value
+                for key, value in pending.fields.items()
+            ):
+                continue
+            del self._pending_writes[index]
+            for later in self._pending_writes[index:]:
+                if later.baseline is None or later.baseline < version:
+                    later.baseline = version
+            # This version confirmed these keys. An older command for the
+            # same key stays queued so a reordered echo can still match
+            # it, and is left out of the overlay.
+            for key in pending.fields:
+                seen = self._confirmed_versions.get(key)
+                if seen is None or version > seen:
+                    self._confirmed_versions[key] = version
+            return
+
+    def _pending_overlay(self) -> dict[str, int]:
+        """Returns pending keys that are still ahead of a confirmation.
+
+        Later commands win among those that qualify. A command published
+        against a baseline older than the version that already confirmed
+        the key does not qualify: ``light=1`` then ``light=2``, with the
+        echo of ``2`` first, must not put ``1`` back over the reported
+        ``2``. The older command stays in the queue for its own echo.
+
+        Returns:
+            Reported keys still waiting on a command that outranks the
+            last confirmation of that key.
+        """
+        overlay: dict[str, int] = {}
+        for pending in self._pending_writes:
+            for key, value in pending.fields.items():
+                confirmed = self._confirmed_versions.get(key)
+                if confirmed is not None and (
+                    pending.baseline is None or pending.baseline < confirmed
+                ):
+                    continue
+                overlay[key] = value
+        return overlay
+
+    def schedule_state_reread(self) -> None:
+        """Schedules a full shadow GET after a rejected update.
+
+        Optimistic keys would otherwise stick: a rejection means the device
+        did not apply the write, and nothing else will correct the cache
+        until the next document. A ``get/rejected`` must not land here. That
+        topic firing another GET retries forever when no shadow exists.
+
+        One reread at a time. Runs on the event loop; failures are logged
+        as the exception type only, because the message can name a topic.
+        """
+        in_flight = self._reread_task
+        if in_flight is not None and not in_flight.done():
+            return
+        shadow = self._shadow
+        if shadow is None:
+            return
+        task = asyncio.get_running_loop().create_task(
+            self._reread_after_rejection(shadow)
+        )
+        self._reread_task = task
+        task.add_done_callback(self._consume_reread)
+
+    async def _reread_after_rejection(self, shadow: ShadowClient) -> None:
+        """Asks for the full shadow so a rejected optimistic write can clear.
+
+        Held under the hood lock for the whole publish. ``request_state``
+        on a dead socket tears the paho client down and raises
+        ``ZephyrNotConnectedError``. Leaving ``_shadow`` set after that is
+        the shape nothing recovers from: ``async_ensure_running`` will not
+        reopen while a client object remains, and ``needs_represign`` sees
+        a generation that still matches, so push stays dark until the next
+        credential rotation. A session that replaced this one before the
+        lock was taken is left alone.
+
+        Args:
+            shadow: The session to read. The one that was current when the
+                rejection was scheduled.
+
+        Raises:
+            ZephyrNotConnectedError: The GET was refused and, when
+                ``shadow`` was still the live session, the hood was
+                returned to the no-socket shape the supervisor rebuilds.
+        """
+        async with self._lock:
+            if self._shadow is not shadow:
+                return
+            try:
+                await shadow.request_state()
+            except ZephyrNotConnectedError:
+                # request_state already disconnected. Clear only the matching
+                # reference, still inside this lock, so a supervisor tick
+                # cannot observe a hollow client and also cannot open the
+                # next session until that disconnect has finished.
+                if self._shadow is shadow:
+                    self._shadow = None
+                    self._connected = False
+                    self.discard_unconfirmed_writes()
+                raise
+
+    def _consume_reread(self, task: asyncio.Task[None]) -> None:
+        """Logs a reread failure without the exception text.
+
+        Args:
+            task: The reread task that just finished.
+        """
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            # Type only. The message can embed a topic, and a topic embeds
+            # the thing name.
+            _LOGGER.debug(
+                "state reread after a rejected write failed: %s", type(exc).__name__
+            )
 
     async def async_set_power(self, on: bool) -> None:
         """Switches hood power on or off.
