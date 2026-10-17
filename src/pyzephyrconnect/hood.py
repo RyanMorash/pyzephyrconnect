@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 
 from . import const
 from .exceptions import ZephyrNotConnectedError, ZephyrWriteError
@@ -83,6 +83,12 @@ class Hood:
         # a versioned document arrives; a document with no version keeps
         # today's apply-anyway behaviour and does not move this cursor.
         self._shadow_version: int | None = None
+        # Fields published since the last document that echoed them, or
+        # since update/rejected dropped them. Incoming reported state must
+        # not replace these: a GET in flight before the write, and an
+        # earlier write's echo, still carry the old value. Dangerous
+        # fields are never entered here.
+        self._optimistic: dict[str, int] = {}
         # One in-flight reread after update/rejected. A rejected optimistic
         # write would otherwise stick until something else refreshed state.
         self._reread_task: asyncio.Task[None] | None = None
@@ -198,17 +204,54 @@ class Hood:
             await self._read_state_outside_lock(shadow)
 
     def note_presigned_generation(self, generation: int) -> None:
-        """Records which credential generation signed this socket's URL.
+        """Records which credential generation signed the live socket's URL.
 
-        Called by the provider ZephyrClient hands to ShadowClient, which
-        invokes it on every connect attempt - so a reconnect re-records the
-        current generation and no caller has to remember to.
+        Called when that socket is installed, from the generation the
+        credentials provider stashed on the shadow while presigning. Noting
+        it any earlier lets a presign that never connects, or that loses a
+        race with another rebuild, describe the socket that is still up.
+        ``needs_represign`` would then treat an expiring URL as current.
 
         Args:
-            generation: The credentials provider's current generation
-                counter.
+            generation: The generation the installed socket was signed under.
         """
         self._presigned_generation = generation
+
+    def _install_shadow(self, shadow: ShadowClient) -> None:
+        """Records ``shadow`` as the live socket and commits its generation.
+
+        Lock-free: callers hold ``self._lock``. The generation is copied
+        only when the provider left an int on the shadow. A test double
+        that never presigned leaves the hood's record alone.
+
+        Args:
+            shadow: The session that may now publish.
+        """
+        self._shadow = shadow
+        generation = getattr(shadow, "presigned_generation", None)
+        if isinstance(generation, bool) or not isinstance(generation, int):
+            return
+        self.note_presigned_generation(generation)
+
+    async def _drop_failed_socket(self, shadow: ShadowClient) -> None:
+        """Disconnects ``shadow`` before any other open can reuse its client ID.
+
+        Lock-free: callers hold ``self._lock``. The live reference is
+        cleared only when it still points here, so a newer session is left
+        alone. The disconnect itself runs before the caller releases the
+        lock either way. ``async_start`` and ``async_ensure_running`` treat
+        ``_shadow is None`` as permission to connect, and a connect that
+        overlaps this client's ``loop_stop`` is two sessions on one client
+        ID.
+
+        Args:
+            shadow: The session whose handshake or state GET failed.
+        """
+        if self._shadow is shadow:
+            self._shadow = None
+            self._connected = False
+        with contextlib.suppress(Exception):
+            await shadow.disconnect()
 
     def needs_represign(self, current: int) -> bool:
         """Reports whether the live socket is signed under stale credentials.
@@ -286,7 +329,7 @@ class Hood:
         await self._prepare()
         shadow = self._shadow_factory(self)
         await shadow.connect()
-        self._shadow = shadow
+        self._install_shadow(shadow)
         return shadow
 
     async def _start(self) -> None:
@@ -329,9 +372,12 @@ class Hood:
         """Requests the initial document without holding the hood lock.
 
         A command published while this GET is in flight must not wait for
-        it. On failure the socket is dropped under the lock so a writer
-        cannot observe a half-cleared hood, and the disconnect itself stays
-        outside the lock so that writer is not stuck behind the thread join.
+        it. On failure the socket is dropped, and that disconnect finishes
+        before the lock is released. ``async_start`` and
+        ``async_ensure_running`` open a session as soon as ``_shadow`` is
+        None; doing that while this client's network thread is still inside
+        ``loop_stop`` puts two sessions on one client ID. AWS IoT evicts
+        one, and the old disconnect callback then marks the survivor down.
 
         Args:
             shadow: The session the GET belongs to. Ignored if a newer
@@ -344,11 +390,7 @@ class Hood:
             await shadow.request_state()
         except BaseException:
             async with self._lock:
-                if self._shadow is shadow:
-                    self._shadow = None
-                    self._connected = False
-            with contextlib.suppress(Exception):
-                await shadow.disconnect()
+                await self._drop_failed_socket(shadow)
             raise
 
     async def _reconnect_prepared(self, old: ShadowClient) -> None:
@@ -368,43 +410,39 @@ class Hood:
         # the first successful attach for this identity.
         await self._prepare()
         replacement = self._shadow_factory(self)
-        # The credentials provider records the generation onto this hood as
-        # a side effect of presigning. If we never install the socket that
-        # URL belongs to, that record would describe the OLD socket and the
-        # supervisor would stop rebuilding it.
-        previous_generation = self._presigned_generation
-        try:
-            await replacement.prepare_transport()
-        except BaseException:
-            self._presigned_generation = previous_generation
-            raise
+        # Presign stamps its generation on ``replacement``, not on this
+        # hood. Two rebuilds can be in prepare_transport at once; committing
+        # either generation before that socket is the live one lets the
+        # loser describe the winner, and needs_represign() then skips the
+        # rebuild that would replace a URL signed under expiring credentials.
+        await replacement.prepare_transport()
         async with self._lock:
             if not self._should_run or self._shadow is not old:
-                if self._shadow is old:
-                    self._presigned_generation = previous_generation
                 return
             await self._stop()
             try:
                 await replacement.open_until_connack()
             except BaseException:
-                self._shadow = None
+                # Not installed, so _drop_failed_socket will not clear
+                # _connected. A CONNACK callback may already have set it.
+                # This attempt holds the lock, so nothing else is live.
                 self._connected = False
-                with contextlib.suppress(Exception):
-                    await replacement.disconnect()
+                await self._drop_failed_socket(replacement)
                 raise
             # Past CONNACK. publish_state is legal; release the lock before
-            # the subscription wait and the state GET.
-            self._shadow = replacement
+            # the subscription wait and the state GET. The generation is
+            # committed with the install, not when the URL was signed.
+            self._install_shadow(replacement)
         try:
             await replacement.finish_subscriptions()
             await replacement.request_state()
         except BaseException:
+            # Disconnect before releasing the lock. Clearing _shadow and
+            # yielding first lets async_ensure_running open a second session
+            # on this client ID while loop_stop is still joining the old
+            # network thread.
             async with self._lock:
-                if self._shadow is replacement:
-                    self._shadow = None
-                    self._connected = False
-            with contextlib.suppress(Exception):
-                await replacement.disconnect()
+                await self._drop_failed_socket(replacement)
             raise
 
     async def _stop(self) -> None:
@@ -621,6 +659,13 @@ class Hood:
         """
         if set(fields) & const.DANGEROUS_FIELDS:
             return
+        # Remembered until a document echoes the same value, or a rejection
+        # drops the set. Without this, a GET at the current version (the
+        # one that was in flight before the write) parses as new enough
+        # and puts the old value back. An earlier echo can do the same to
+        # a later command. ``<=`` on the version cursor would also drop the
+        # rejection reread, which comes back at the same version.
+        self._optimistic.update(fields)
         if self._state is None:
             # No cache yet. from_reported on only these keys; the next full
             # document replaces it. Merging is impossible without a base,
@@ -630,13 +675,34 @@ class Hood:
             return
         self.handle_state(self._state.merge(dict(fields)))
 
-    def accept_shadow_version(self, version: object) -> bool:
-        """Decides whether a shadow document is new enough to apply.
+    def is_shadow_version_current(self, version: object) -> bool:
+        """Reports whether a document is new enough to apply, without recording it.
 
-        A missing or non-integer version keeps the previous behaviour:
-        apply the document, and do not move the cursor. A version older
-        than the newest one already applied is dropped, so a GET that was
-        in flight before a write cannot replace the newer snapshot.
+        A missing or non-integer version is current: those documents keep
+        the apply-anyway behaviour and do not move the cursor. An integer
+        older than the newest one already applied is not. Callers parse
+        the reported block before ``accept_shadow_version``, so a document
+        that fails to parse does not make a later valid one look stale.
+
+        Args:
+            version: The ``version`` field of a shadow document, or None
+                when the document did not carry one.
+
+        Returns:
+            True when the caller should try to apply the document.
+        """
+        if isinstance(version, bool) or not isinstance(version, int):
+            return True
+        return self._shadow_version is None or version >= self._shadow_version
+
+    def accept_shadow_version(self, version: object) -> bool:
+        """Records a document version after its reported block parsed.
+
+        Call only once the new state exists. A missing or non-integer
+        version does not move the cursor. An older version is not
+        recorded; the caller should already have returned, and this
+        repeats the check so a cursor that moved during parsing cannot
+        be rewound.
 
         Args:
             version: The ``version`` field of a shadow document, or None
@@ -645,12 +711,55 @@ class Hood:
         Returns:
             True when the caller should apply the document.
         """
-        if isinstance(version, bool) or not isinstance(version, int):
-            return True
-        if self._shadow_version is not None and version < self._shadow_version:
+        if not self.is_shadow_version_current(version):
             return False
-        self._shadow_version = version
+        if not isinstance(version, bool) and isinstance(version, int):
+            self._shadow_version = version
         return True
+
+    def discard_unconfirmed_writes(self) -> None:
+        """Drops optimistic fields a rejection may have been about.
+
+        The follow-up GET is what restores those keys. Leaving them
+        pending would paint the refused values back over that document,
+        and the GET often reuses the current version so the cursor will
+        not reject it. A write that lands after this drop is a newer
+        command and stays pending over the GET.
+        """
+        self._optimistic.clear()
+
+    def reconcile_reported(self, state: HoodState, reported: object) -> HoodState:
+        """Keeps unconfirmed writes in place over a shadow document.
+
+        A document echoes a write when it carries the same value for that
+        key. Until then the key stays as published. A GET that was in
+        flight before the write, or an earlier write's echo, still has
+        the old value and must not replace it.
+
+        Args:
+            state: The state parsed from the document.
+            reported: The reported object that document carried. Anything
+                other than a dict is treated as carrying no keys.
+
+        Returns:
+            ``state``, or a merge that puts the still-pending keys back.
+        """
+        if not self._optimistic:
+            return state
+        reported_map: Mapping[str, object] = (
+            reported if isinstance(reported, dict) else {}
+        )
+        still: dict[str, int] = {}
+        overlay: dict[str, int] = {}
+        for key, value in self._optimistic.items():
+            if key in reported_map and reported_map[key] == value:
+                continue
+            still[key] = value
+            overlay[key] = value
+        self._optimistic = still
+        if not overlay:
+            return state
+        return state.merge(overlay)
 
     def schedule_state_reread(self) -> None:
         """Schedules a full shadow GET after a rejected update.
@@ -678,11 +787,38 @@ class Hood:
     async def _reread_after_rejection(self, shadow: ShadowClient) -> None:
         """Asks for the full shadow so a rejected optimistic write can clear.
 
+        Held under the hood lock for the whole publish. ``request_state``
+        on a dead socket tears the paho client down and raises
+        ``ZephyrNotConnectedError``. Leaving ``_shadow`` set after that is
+        the shape nothing recovers from: ``async_ensure_running`` will not
+        reopen while a client object remains, and ``needs_represign`` sees
+        a generation that still matches, so push stays dark until the next
+        credential rotation. A session that replaced this one before the
+        lock was taken is left alone.
+
         Args:
             shadow: The session to read. The one that was current when the
                 rejection was scheduled.
+
+        Raises:
+            ZephyrNotConnectedError: The GET was refused and, when
+                ``shadow`` was still the live session, the hood was
+                returned to the no-socket shape the supervisor rebuilds.
         """
-        await shadow.request_state()
+        async with self._lock:
+            if self._shadow is not shadow:
+                return
+            try:
+                await shadow.request_state()
+            except ZephyrNotConnectedError:
+                # request_state already disconnected. Clear only the matching
+                # reference, still inside this lock, so a supervisor tick
+                # cannot observe a hollow client and also cannot open the
+                # next session until that disconnect has finished.
+                if self._shadow is shadow:
+                    self._shadow = None
+                    self._connected = False
+                raise
 
     def _consume_reread(self, task: asyncio.Task[None]) -> None:
         """Logs a reread failure without the exception text.

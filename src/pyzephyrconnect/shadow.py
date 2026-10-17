@@ -164,6 +164,12 @@ class ShadowClient:
         # serving writes. Consumed by open_until_connack.
         self._prepared_url: str | None = None
         self._prepared_ssl: ssl.SSLContext | None = None
+        # Generation of the credentials this client's URL was signed under.
+        # The provider writes it while presigning. Hood copies it onto the
+        # live-socket record only once this object is installed, so a presign
+        # that loses a race or never connects cannot describe the socket that
+        # is still up.
+        self.presigned_generation: int | None = None
 
     # Hood.async_reconnect reads this off the CLASS. A MagicMock invents
     # every instance attribute it is asked for, so an instance flag would

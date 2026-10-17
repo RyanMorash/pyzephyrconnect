@@ -369,9 +369,16 @@ class ZephyrClient:
         Returns:
             A fresh, unstarted ShadowClient for this hood.
         """
+        # The provider has to stamp the client it signed, and that client
+        # does not exist until ShadowClient() returns. A one-element cell
+        # is the binding. Noting the generation on the hood from here would
+        # let a presign that never becomes the live socket, or that loses a
+        # race with another rebuild, make needs_represign() treat the
+        # previous socket as current.
+        signed: list[ShadowClient] = []
 
         async def provider() -> Credentials:
-            """Fetches presign credentials; notes generation on the hood."""
+            """Fetches presign credentials and stashes their generation."""
             # The PAIR, in one call. Fetching the credentials and then
             # reading credentials_generation as a separate statement puts an
             # await between them: a refresh landing in that window records
@@ -379,10 +386,9 @@ class ZephyrClient:
             # looks current to the supervisor and dies at the OLD
             # credentials' expiry with nothing scheduled to re-presign it.
             creds, generation = await self._auth.async_get_presign_credentials()
-            # Record which credential generation this socket's URL is signed
-            # under - the supervisor reconnects on mismatch, because expiry
-            # alone lies when a REST call refreshed the cache first.
-            hood.note_presigned_generation(generation)
+            # On the client, not the hood. Hood copies this across when it
+            # installs the socket and not before.
+            signed[0].presigned_generation = generation
             return creds
 
         shadow = ShadowClient(
@@ -407,14 +413,15 @@ class ZephyrClient:
             hood.handle_connection_change,
             # The per-hood wrapper, not async_get_credentials itself:
             # ShadowClient calls this on every connect, which is exactly
-            # when the presigned URL is (re)built, so the generation it
-            # records self-updates on reconnects.
+            # when the presigned URL is (re)built. The generation is
+            # stashed on the client; Hood commits it at install.
             provider,
             # Without this the ShadowClient falls back to DEFAULT_ENDPOINTS,
             # so an endpoint override would reach REST but silently leave
             # MQTT pointed at production.
             endpoints=self._endpoints,
         )
+        signed.append(shadow)
         self._ensure_supervisor()
         return shadow
 
@@ -528,28 +535,45 @@ class ZephyrClient:
                 # update/rejected only. get/rejected means the document is
                 # missing; scheduling another GET from there retries forever.
                 # The reread is what clears an optimistic write the device
-                # did not apply.
+                # did not apply. Drop the pending keys FIRST: that GET often
+                # carries the same version (a rejected write does not bump
+                # it), and pending keys would be painted back over the
+                # document that is supposed to restore the refused fields.
                 if topic.endswith("/update/rejected"):
+                    hood.discard_unconfirmed_writes()
                     hood.schedule_state_reread()
                 return
 
-            state_block = payload.get("state") or {}
-            if topic.endswith("/get/accepted"):
+            if topic.endswith("/get/accepted") or topic.endswith("/update/accepted"):
+                # Older than the cursor: drop before parsing. The check does
+                # not move the cursor. A document that fails to parse must
+                # not either, or the next valid older one looks stale and
+                # the cache stays on the last good snapshot forever.
                 if not self._version_is_current(hood, topic, payload):
                     return
+                state_block = payload.get("state") or {}
                 reported = state_block.get("reported") or {}
-                new_state = HoodState.from_reported(reported)
-            elif topic.endswith("/update/accepted"):
-                if not self._version_is_current(hood, topic, payload):
+                if topic.endswith("/get/accepted"):
+                    new_state = HoodState.from_reported(reported)
+                else:
+                    current = hood.state
+                    new_state = (
+                        current.merge(reported)
+                        if current
+                        else HoodState.from_reported(reported)
+                    )
+                # Parsing succeeded. Only now is this version allowed to
+                # win. A second check covers a cursor that moved while the
+                # reported block was built; it does not, today, but applying
+                # after a failed accept would rewind a newer snapshot.
+                if not hood.accept_shadow_version(payload.get("version")):
                     return
-                reported = state_block.get("reported") or {}
-                current = hood.state
-                new_state = (
-                    current.merge(reported)
-                    if current
-                    else HoodState.from_reported(reported)
-                )
-            elif topic.endswith("/update/delta"):
+                new_state = hood.reconcile_reported(new_state, reported)
+                # Listeners run inline. Hood.handle_state swallows their
+                # exceptions, so one bad consumer cannot stop the others.
+                hood.handle_state(new_state)
+                return
+            if topic.endswith("/update/delta"):
                 # A shadow delta is desired-vs-reported difference - a wish,
                 # not confirmed device state. This vendor never writes
                 # state.desired (see ShadowClient.publish_state), so any
@@ -565,12 +589,6 @@ class ZephyrClient:
                     topic.rsplit("/", 1)[-1],
                 )
                 return
-            else:
-                return
-
-            # Hood.handle_state notifies listeners and swallows their
-            # exceptions, so one bad consumer cannot stop the others.
-            hood.handle_state(new_state)
         except Exception:  # noqa: BLE001
             # One malformed message must not escape onto the event loop.
             # Log leaf-only - never the thing name, full topic, or payload.
@@ -595,9 +613,10 @@ class ZephyrClient:
             payload: The shadow document, which may omit ``version``.
 
         Returns:
-            True when the document should be applied.
+            True when the document is new enough to parse. Parsing still
+            has to succeed before the cursor moves.
         """
-        if hood.accept_shadow_version(payload.get("version")):
+        if hood.is_shadow_version_current(payload.get("version")):
             return True
         _LOGGER.debug(
             "ignoring stale shadow document on %s",

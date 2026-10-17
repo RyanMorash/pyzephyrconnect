@@ -874,7 +874,10 @@ async def test_the_shadow_gets_the_credentials_provider_not_a_credential(wired):
     It is a per-hood wrapper rather than async_get_credentials itself: the
     connect that presigns the URL is exactly the moment that must record
     which credential generation the signature belongs to, so the supervisor
-    can rebuild on a mismatch instead of trusting expiry.
+    can rebuild on a mismatch instead of trusting expiry. The record lives
+    on the shadow until that shadow is installed. Noting it on the hood
+    from the provider would let an abandoned presign describe the socket
+    that is still live.
     """
     client = _client()
     hoods = await client.async_setup()
@@ -886,7 +889,8 @@ async def test_the_shadow_gets_the_credentials_provider_not_a_credential(wired):
     creds = await provider()
     assert isinstance(creds, Credentials)
     wired["auth"].async_get_credentials.assert_awaited()
-    assert hoods[0]._presigned_generation == wired["auth"].credentials_generation
+    assert hoods[0]._presigned_generation is None
+    assert wired["shadow"].presigned_generation == wired["auth"].credentials_generation
 
 
 async def test_the_recorded_generation_belongs_to_the_credentials_used(wired):
@@ -1190,6 +1194,176 @@ async def test_a_stale_get_does_not_replace_a_newer_snapshot(wired):
         {"state": {"reported": {"light": 0}}, "version": 9},
     )
     assert hoods[0].state.light == 4
+
+
+async def test_a_same_version_get_does_not_clobber_an_optimistic_write(wired):
+    """Tests that a GET at the current version keeps an unconfirmed write.
+
+    The write does not advance the shadow version. The document that was
+    in flight before it comes back at that same version, and a strict
+    older-than check lets it through. Pending fields stay until a document
+    echoes them. Once it does, a later document may change the key.
+    """
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/get/accepted",
+        {
+            "state": {"reported": {"light": 0, "usegreasefiltertime": 642}},
+            "version": 10,
+        },
+    )
+
+    await hoods[0].async_set_light(1)
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/get/accepted",
+        {
+            "state": {"reported": {"light": 0, "usegreasefiltertime": 642}},
+            "version": 10,
+        },
+    )
+
+    assert hoods[0].state.light == 1
+    assert hoods[0].state.use_grease_filter_time == 642
+
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/update/accepted",
+        {"state": {"reported": {"light": 1}}, "version": 11},
+    )
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/get/accepted",
+        {
+            "state": {"reported": {"light": 3, "usegreasefiltertime": 642}},
+            "version": 12,
+        },
+    )
+    assert hoods[0].state.light == 3
+
+
+async def test_an_earlier_echo_does_not_overwrite_a_later_optimistic_write(wired):
+    """Tests that an earlier command's echo does not revert a later command.
+
+    update/accepted can still carry the previous value of a key published
+    after that command. That key stays as published. The echoed key is
+    acknowledged and may change in a later document.
+    """
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/get/accepted",
+        {
+            "state": {"reported": {"light": 0, "fan": 0, "usegreasefiltertime": 642}},
+            "version": 10,
+        },
+    )
+
+    await hoods[0].async_set_light(1)
+    await hoods[0].async_set_fan(2)
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/update/accepted",
+        {"state": {"reported": {"light": 1, "fan": 0}}, "version": 11},
+    )
+
+    assert hoods[0].state.light == 1
+    assert hoods[0].state.fan == 2
+    assert hoods[0].state.use_grease_filter_time == 642
+
+
+async def test_a_rejection_lets_the_reread_restore_refused_fields(wired):
+    """Tests that a rejection drops pending keys and a later write survives.
+
+    The follow-up GET reuses the current version, because a rejected write
+    does not bump it. Pending keys from the refused command would be
+    painted back over that document. A command published after the
+    rejection is a different write and stays in place.
+    """
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/get/accepted",
+        {
+            "state": {"reported": {"light": 0, "fan": 0, "usegreasefiltertime": 642}},
+            "version": 10,
+        },
+    )
+
+    await hoods[0].async_set_light(1)
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/update/rejected",
+        {"code": 400},
+    )
+    await asyncio.sleep(0)
+    await hoods[0].async_set_fan(2)
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/get/accepted",
+        {
+            "state": {"reported": {"light": 0, "fan": 0, "usegreasefiltertime": 642}},
+            "version": 10,
+        },
+    )
+
+    assert hoods[0].state.light == 0
+    assert hoods[0].state.fan == 2
+    assert hoods[0].state.use_grease_filter_time == 642
+
+
+async def test_a_document_that_fails_to_parse_does_not_advance_the_version(wired):
+    """Tests that an invalid reported block does not stick the version cursor.
+
+    get/accepted and update/accepted both have to parse before recording
+    the version. A list where reported should be an object raises, the
+    handler swallows it, and a later valid document with a lower version
+    must still apply.
+    """
+    client = _client()
+    hoods = await client.async_setup()
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/update/accepted",
+        {
+            "state": {"reported": {"light": 1, "usegreasefiltertime": 642}},
+            "version": 10,
+        },
+    )
+
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/get/accepted",
+        {"state": {"reported": [1]}, "version": 12},
+    )
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/update/accepted",
+        {"state": {"reported": [1]}, "version": 13},
+    )
+
+    assert hoods[0].state.light == 1
+    assert hoods[0].state.use_grease_filter_time == 642
+    assert hoods[0]._shadow_version == 10
+
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/get/accepted",
+        {
+            "state": {"reported": {"light": 4, "usegreasefiltertime": 700}},
+            "version": 11,
+        },
+    )
+    assert hoods[0].state.light == 4
+    assert hoods[0].state.use_grease_filter_time == 700
+    assert hoods[0]._shadow_version == 11
 
 
 async def test_a_rejected_update_rereads_state_without_logging_the_thing(wired, caplog):
