@@ -545,34 +545,62 @@ class ZephyrClient:
                 return
 
             if topic.endswith("/get/accepted") or topic.endswith("/update/accepted"):
-                # Older than the cursor: drop before parsing. The check does
-                # not move the cursor. A document that fails to parse must
-                # not either, or the next valid older one looks stale and
-                # the cache stays on the last good snapshot forever.
-                if not self._version_is_current(hood, topic, payload):
+                # A full GET older than the cursor is a snapshot from before
+                # a later document. Applying it would replace every key.
+                # The check does not move the cursor. A document that fails
+                # to parse must not either, or the next valid older one
+                # looks stale and the cache stays on the last good snapshot
+                # forever.
+                #
+                # update/accepted is not that snapshot. It carries only the
+                # keys that changed, so version 12 reporting fan does not
+                # contain version 11's light. Dropping the older partial
+                # strands the light command: the fan echo cannot retire it,
+                # and every later GET stays covered by the pending light.
+                # Keep the partial. Hood applies a key only when this
+                # document is at least as new as the last merge of that
+                # key, and does not rewind the cursor.
+                is_update = topic.endswith("/update/accepted")
+                version = payload.get("version")
+                if not is_update and not self._version_is_current(hood, topic, payload):
                     return
                 state_block = payload.get("state") or {}
                 reported = state_block.get("reported") or {}
-                if topic.endswith("/get/accepted"):
-                    new_state = HoodState.from_reported(reported)
+                # A list still has to reach from_reported and raise before
+                # the cursor moves. Filtering is only meaningful for a dict.
+                if is_update and isinstance(reported, dict):
+                    applied = hood.reported_fields_to_apply(version, reported)
                 else:
+                    applied = reported
+                if is_update:
                     current = hood.state
                     new_state = (
-                        current.merge(reported)
+                        current.merge(applied)
                         if current
-                        else HoodState.from_reported(reported)
+                        else HoodState.from_reported(applied)
                     )
-                # Parsing succeeded. Only now is this version allowed to
-                # win. A second check covers a cursor that moved while the
-                # reported block was built; it does not, today, but applying
-                # after a failed accept would rewind a newer snapshot.
-                if not hood.accept_shadow_version(payload.get("version")):
-                    return
+                else:
+                    new_state = HoodState.from_reported(applied)
+                # Parsing succeeded. Only a version that is still current
+                # may win, and only now. An older partial does not. A
+                # second check covers a cursor that moved while the
+                # reported block was built; it does not, today, but
+                # applying after a failed accept would rewind a newer
+                # snapshot.
+                if hood.is_shadow_version_current(version):
+                    if not hood.accept_shadow_version(version):
+                        return
+                if isinstance(applied, dict):
+                    hood.note_applied_versions(version, applied)
+                # Reconcile sees the original reported block. A key this
+                # version was too old to merge can still be the echo that
+                # retires its command, which is what stops that command
+                # overlaying every later document.
                 new_state = hood.reconcile_reported(
                     new_state,
                     reported,
-                    version=payload.get("version"),
-                    echoed=topic.endswith("/update/accepted"),
+                    version=version,
+                    echoed=is_update,
                 )
                 # Listeners run inline. Hood.handle_state swallows their
                 # exceptions, so one bad consumer cannot stop the others.
@@ -607,10 +635,11 @@ class ZephyrClient:
     ) -> bool:
         """Reports whether this document is newer than the one already applied.
 
-        An older ``version`` is a GET (or an update) that was in flight
-        before a later write. Applying it would replace the optimistic
-        snapshot, or a newer echo, with stale reported state. The log names
-        the topic leaf only.
+        An older ``version`` on a full GET was in flight before a later
+        write. Applying it would replace the optimistic snapshot, or a
+        newer echo, with stale reported state. Partial updates are not
+        decided here: a newer partial does not supersede keys it does not
+        carry. The log names the topic leaf only.
 
         Args:
             hood: The hood whose version cursor to consult.

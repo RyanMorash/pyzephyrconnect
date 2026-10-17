@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 from . import const
 from .exceptions import ZephyrNotConnectedError, ZephyrWriteError
@@ -50,9 +51,10 @@ def _version_confirms(version: object, baseline: int | None) -> bool:
     A missing version is not an echo: the rejection reread and an in-flight
     GET often arrive without moving the cursor, or at the same version the
     command was published against. A version equal to the baseline is that
-    in-flight document, not the command's acknowledgement. Greater-than is
-    not by itself the acknowledgement. The caller still has to match the
-    oldest command's values, or a repeated level acks the wrong write.
+    in-flight document, or a QoS 1 redelivery of an echo that already
+    retired an earlier command. Greater-than is not by itself the
+    acknowledgement. The caller still has to match one command's values,
+    or a repeated level acks the wrong write.
 
     Args:
         version: The document's ``version`` field.
@@ -130,15 +132,25 @@ class Hood:
         # today's apply-anyway behaviour and does not move this cursor.
         self._shadow_version: int | None = None
         # Commands whose echo has not arrived, oldest first. The latest
-        # value of a key is what the cache shows. An incoming document may
-        # retire only the oldest command, and only when it is that
-        # command's echo: a newer version than ``baseline`` carrying that
-        # command's values. Matching the value alone acks the wrong write
-        # when the same level is published twice. The queue is dropped when
-        # the session that published it is gone; a later GET must be able
-        # to show what the device or the phone did during the outage.
-        # Dangerous fields are never entered here.
+        # value of a key is what the cache shows. One document retires at
+        # most one command, the oldest whose values it actually carries,
+        # and only when it is newer than that command's baseline. A partial
+        # echo of a later command must not wait behind an older command it
+        # does not mention, and it must not consume a redelivery of the
+        # version that already retired something ahead of it. Matching the
+        # value alone acks the wrong write when the same level is published
+        # twice. The queue is dropped when the session that published it is
+        # gone; a later GET must be able to show what the device or the
+        # phone did during the outage. Dangerous fields are never entered
+        # here.
         self._pending_writes: list[_PendingWrite] = []
+        # Shadow version at which each reported key was last merged.
+        # update/accepted is partial, so a newer document does not contain
+        # the keys an older one changed. The global cursor cannot decide
+        # that for a single key: version 12 reporting fan does not make
+        # version 11's light stale, and version 11's light must not
+        # overwrite a light already applied from version 14.
+        self._field_versions: dict[str, int] = {}
         # One in-flight reread after update/rejected. A rejected optimistic
         # write would otherwise stick until something else refreshed state.
         self._reread_task: asyncio.Task[None] | None = None
@@ -174,12 +186,22 @@ class Hood:
     def handle_connection_change(self, connected: bool) -> None:
         """Records the new connection state for this hood.
 
-        Called by ShadowClient from the event loop.
+        Called by ShadowClient from the event loop. paho's own
+        auto-reconnect does not come through ``_stop``. The disconnect
+        callback is the only point that knows the session which published
+        the pending commands is gone. Leaving them pending paints the
+        missed write over the resync GET, so a change made during the
+        outage never shows. A write that lands after this callback belongs
+        to the session that came back and stays pending. ``_stop`` already
+        drops the queue before it awaits disconnect; this clear is the
+        same drop for the path that never calls ``_stop``.
 
         Args:
             connected: Whether this hood's shadow connection is now up.
         """
         self._connected = connected
+        if not connected:
+            self.discard_unconfirmed_writes()
 
     async def async_start(self) -> None:
         """Opens this hood's shadow connection and requests current state."""
@@ -766,11 +788,13 @@ class Hood:
     def accept_shadow_version(self, version: object) -> bool:
         """Records a document version after its reported block parsed.
 
-        Call only once the new state exists. A missing or non-integer
+        Call only once the new state exists, and only for a document the
+        caller has already judged current. A missing or non-integer
         version does not move the cursor. An older version is not
-        recorded; the caller should already have returned, and this
-        repeats the check so a cursor that moved during parsing cannot
-        be rewound.
+        recorded. A partial ``update/accepted`` older than the cursor is
+        still applied field by field elsewhere; this method must not
+        rewind the cursor to it. The check is repeated so a cursor that
+        moved during parsing cannot be rewound either.
 
         Args:
             version: The ``version`` field of a shadow document, or None
@@ -799,6 +823,55 @@ class Hood:
         """
         self._pending_writes.clear()
 
+    def reported_fields_to_apply(
+        self, version: object, reported: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Returns the reported keys this partial document may still change.
+
+        ``update/accepted`` carries only the keys that changed. Dropping a
+        whole older document because a newer partial arrived first loses
+        the keys the newer one did not mention. A key already merged from
+        a newer document must not be overwritten by the late one. A
+        version that is not an integer does not participate: every key is
+        applied, matching a document that never moves the cursor.
+
+        Args:
+            version: The document's ``version``, or None when it had none.
+            reported: The reported object. Callers pass a dict; a list
+                fails in parsing before this is consulted.
+
+        Returns:
+            The subset of ``reported`` safe to merge. Keys are omitted,
+            not set to None: absent is not a value.
+        """
+        if isinstance(version, bool) or not isinstance(version, int):
+            return dict(reported)
+        return {
+            key: value
+            for key, value in reported.items()
+            if key not in self._field_versions or version >= self._field_versions[key]
+        }
+
+    def note_applied_versions(self, version: object, reported: dict[str, Any]) -> None:
+        """Records the version at which each applied key was last merged.
+
+        Only moves a key forward. An older partial allowed to fill a key
+        the newer document left out must not make a key that already
+        moved look stale. A missing or non-integer version records
+        nothing, so it cannot block a later numbered document.
+
+        Args:
+            version: The document version. Ignored unless it is an int.
+            reported: The keys that were actually merged, not the keys the
+                document carried and this version was too old to apply.
+        """
+        if isinstance(version, bool) or not isinstance(version, int):
+            return
+        for key in reported:
+            seen = self._field_versions.get(key)
+            if seen is None or version >= seen:
+                self._field_versions[key] = version
+
     def reconcile_reported(
         self,
         state: HoodState,
@@ -810,13 +883,18 @@ class Hood:
         """Keeps unconfirmed writes in place over a shadow document.
 
         A GET, including one at the current version, does not confirm a
-        command. ``update/accepted`` retires the oldest pending command
-        only, and only when the document is newer than that command's
-        baseline and carries that command's values. The newest command
-        stays until its own echo. Value equality alone will not do: after
-        ``1`` then ``0``, an in-flight document that still says ``0``
-        matches the latest write, and after ``1 → 2 → 1`` the first echo
-        matches the last write.
+        command. ``update/accepted`` retires the oldest command whose
+        values the document actually carries, and only when the document
+        is newer than that command's baseline. One document, one command:
+        a fan echo that arrives before the light echo can retire the fan
+        command without consuming the light one, and it must not be
+        required to be the oldest entry. Commands published after the one
+        retired have their baseline raised to this version, so a QoS 1
+        redelivery of the same echo cannot retire the next write of the
+        same value. Value equality alone will not do: after ``1`` then
+        ``0``, an in-flight document that still says ``0`` matches the
+        latest write, and after ``1 → 2 → 1`` the first echo matches the
+        last write.
 
         Args:
             state: The state parsed from the document.
@@ -830,17 +908,22 @@ class Hood:
             ``state``, or a merge that puts the still-pending keys back.
         """
         if echoed:
-            self._retire_oldest_echo(version, reported)
+            self._retire_echo(version, reported)
         overlay = self._pending_overlay()
         if not overlay:
             return state
         return state.merge(overlay)
 
-    def _retire_oldest_echo(self, version: object, reported: object) -> None:
-        """Retires the oldest command when this document is its echo.
+    def _retire_echo(self, version: object, reported: object) -> None:
+        """Retires the one command this document echoes.
 
-        One document, one command. A newer command that published the same
-        level stays pending, so this echo cannot ack it.
+        Oldest match wins, so a document that carries the oldest command
+        still acks that one and not a later command with the same level.
+        A partial that only carries a later command acks that later one.
+        Commands ahead of it keep their baselines: the light echo can
+        still be older than the fan echo that already arrived. Commands
+        behind it move up to this version. A replay of this document is
+        then equal to their baseline, and equal does not confirm.
 
         Args:
             version: The document's ``version``, or None.
@@ -848,15 +931,21 @@ class Hood:
         """
         if not self._pending_writes or not isinstance(reported, dict):
             return
-        oldest = self._pending_writes[0]
-        if not _version_confirms(version, oldest.baseline):
+        if isinstance(version, bool) or not isinstance(version, int):
             return
-        if any(
-            key not in reported or reported[key] != value
-            for key, value in oldest.fields.items()
-        ):
+        for index, pending in enumerate(self._pending_writes):
+            if not _version_confirms(version, pending.baseline):
+                continue
+            if any(
+                key not in reported or reported[key] != value
+                for key, value in pending.fields.items()
+            ):
+                continue
+            del self._pending_writes[index]
+            for later in self._pending_writes[index:]:
+                if later.baseline is None or later.baseline < version:
+                    later.baseline = version
             return
-        self._pending_writes.pop(0)
 
     def _pending_overlay(self) -> dict[str, int]:
         """Returns the latest unconfirmed value of each pending key.

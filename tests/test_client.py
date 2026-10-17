@@ -1431,6 +1431,191 @@ async def test_a_missed_echo_does_not_hide_state_after_reconnect(wired):
     assert hoods[0]._pending_writes == []
 
 
+async def test_a_reordered_partial_echo_keeps_the_older_field(wired):
+    """Tests that an older partial update is not dropped behind a newer one.
+
+    update/accepted carries only the keys that changed. Version 12
+    reporting fan does not contain the light change at version 11.
+    Dropping version 11 strands the light command, and every later GET
+    stays covered by that pending value. The older partial still applies
+    its own key and retires its command. It does not move the version
+    cursor backward, and it does not overwrite a key a newer document
+    already applied.
+    """
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/get/accepted",
+        {
+            "state": {"reported": {"light": 0, "fan": 0, "usegreasefiltertime": 642}},
+            "version": 10,
+        },
+    )
+
+    await hoods[0].async_set_light(1)
+    await hoods[0].async_set_fan(2)
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/update/accepted",
+        {"state": {"reported": {"fan": 2}}, "version": 12},
+    )
+
+    assert hoods[0].state.light == 1
+    assert hoods[0].state.fan == 2
+    assert len(hoods[0]._pending_writes) == 1
+    assert hoods[0]._shadow_version == 12
+
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/update/accepted",
+        {"state": {"reported": {"light": 1}}, "version": 11},
+    )
+    assert hoods[0].state.light == 1
+    assert hoods[0].state.fan == 2
+    assert hoods[0]._pending_writes == []
+    assert hoods[0]._shadow_version == 12
+
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/get/accepted",
+        {
+            "state": {"reported": {"light": 5, "fan": 3, "usegreasefiltertime": 700}},
+            "version": 13,
+        },
+    )
+    assert hoods[0].state.light == 5
+    assert hoods[0].state.fan == 3
+    assert hoods[0].state.use_grease_filter_time == 700
+
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/update/accepted",
+        {"state": {"reported": {"light": 9}}, "version": 14},
+    )
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/update/accepted",
+        {"state": {"reported": {"light": 1}}, "version": 13},
+    )
+    assert hoods[0].state.light == 9
+    assert hoods[0].state.fan == 3
+    assert hoods[0]._shadow_version == 14
+
+
+async def test_a_redelivered_echo_does_not_retire_the_next_same_value(wired):
+    """Tests that a QoS 1 replay of one echo does not ack a second write.
+
+    Two light=1 commands share a baseline. The version-11 echo retires the
+    first and advances the second command's baseline to that version. A
+    redelivery of version 11 still matches the value, and must not retire
+    the second. A GET at version 11 that still has the old light cannot
+    replace it either. The second command waits for its own later echo.
+    """
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/get/accepted",
+        {
+            "state": {"reported": {"light": 0, "usegreasefiltertime": 642}},
+            "version": 10,
+        },
+    )
+
+    await hoods[0].async_set_light(1)
+    await hoods[0].async_set_light(1)
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/update/accepted",
+        {"state": {"reported": {"light": 1}}, "version": 11},
+    )
+    assert hoods[0].state.light == 1
+    assert len(hoods[0]._pending_writes) == 1
+
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/update/accepted",
+        {"state": {"reported": {"light": 1}}, "version": 11},
+    )
+    assert hoods[0].state.light == 1
+    assert len(hoods[0]._pending_writes) == 1
+
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/get/accepted",
+        {
+            "state": {"reported": {"light": 0, "usegreasefiltertime": 642}},
+            "version": 11,
+        },
+    )
+    assert hoods[0].state.light == 1
+    assert hoods[0].state.use_grease_filter_time == 642
+
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/update/accepted",
+        {"state": {"reported": {"light": 1}}, "version": 12},
+    )
+    assert hoods[0].state.light == 1
+    assert hoods[0]._pending_writes == []
+
+
+async def test_a_missed_echo_on_automatic_reconnect_does_not_hide_the_get(wired):
+    """Tests that paho's own reconnect drops the dead session's commands.
+
+    Automatic reconnect does not call ``_stop``. The disconnect callback
+    is the only signal that the session which published the command is
+    gone. Leaving the command pending paints it over the resync GET, so a
+    change made while the socket was down never shows. A write after the
+    callback belongs to the session that came back and stays pending over
+    a resync that was already in flight.
+    """
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/get/accepted",
+        {
+            "state": {"reported": {"light": 0, "usegreasefiltertime": 642}},
+            "version": 10,
+        },
+    )
+    await hoods[0].async_set_light(1)
+    assert hoods[0]._pending_writes
+
+    hoods[0].handle_connection_change(False)
+
+    assert hoods[0]._pending_writes == []
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/get/accepted",
+        {
+            "state": {"reported": {"light": 4, "usegreasefiltertime": 700}},
+            "version": 20,
+        },
+    )
+    assert hoods[0].state.light == 4
+    assert hoods[0].state.use_grease_filter_time == 700
+
+    hoods[0].handle_connection_change(True)
+    await hoods[0].async_set_light(2)
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/get/accepted",
+        {
+            "state": {"reported": {"light": 4, "usegreasefiltertime": 710}},
+            "version": 20,
+        },
+    )
+    assert hoods[0].state.light == 2
+    assert hoods[0].state.use_grease_filter_time == 710
+    assert hoods[0]._pending_writes
+
+
 async def test_a_rejection_lets_the_reread_restore_refused_fields(wired):
     """Tests that a rejection drops pending keys and a later write survives.
 
