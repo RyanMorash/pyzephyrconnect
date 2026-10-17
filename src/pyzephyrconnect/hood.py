@@ -23,6 +23,20 @@ _LOGGER = logging.getLogger(__name__)
 StateListener = Callable[[HoodState], None]
 
 
+def _prepares_offline(shadow: object) -> bool:
+    """Whether reconnect can presign before tearing this socket down.
+
+    Read off the class, and only when the value is exactly True. A
+    MagicMock's class does not define the flag; asking the instance would
+    invent one and take the split path with methods the double does not
+    implement.
+
+    Args:
+        shadow: The live session about to be replaced.
+    """
+    return getattr(type(shadow), "prepares_transport_before_disconnect", False) is True
+
+
 class Hood:
     """A single hood on the account."""
 
@@ -63,6 +77,15 @@ class Hood:
         # wires in (so a reconnect updates it without anyone remembering
         # to). None until the first presign.
         self._presigned_generation: int | None = None
+        # Newest shadow `version` applied from get/accepted or
+        # update/accepted. An in-flight GET from before a write carries an
+        # older version and must not replace the newer snapshot. None until
+        # a versioned document arrives; a document with no version keeps
+        # today's apply-anyway behaviour and does not move this cursor.
+        self._shadow_version: int | None = None
+        # One in-flight reread after update/rejected. A rejected optimistic
+        # write would otherwise stick until something else refreshed state.
+        self._reread_task: asyncio.Task[None] | None = None
         # Serialises start/stop/reconnect against writes.
         self._lock = asyncio.Lock()
 
@@ -144,8 +167,14 @@ class Hood:
         The presigned URL is derived from credentials that expire, so a
         refresh without a reconnect leaves a socket AWS IoT will drop.
 
-        Holds the lock across both halves so a write arriving mid-rebuild
-        waits rather than failing with a spurious ZephyrNotConnectedError.
+        A write that arrives during the blackout waits and then publishes
+        once, rather than failing with a spurious ZephyrNotConnectedError.
+        The lock covers only the gap where there is no session that can
+        publish: presign and the TLS context run first, while the old
+        socket is still up, and SUBACKs plus the state GET run after the
+        new session is past CONNACK. Two live sessions sharing a client ID
+        evict each other, so the old socket is fully stopped before the
+        new one is opened.
         """
         async with self._lock:
             if not self._should_run:
@@ -153,8 +182,20 @@ class Hood:
                 # calls this for every hood on the account; it must not
                 # bring up MQTT for hoods the consumer chose not to start.
                 return
+            old = self._shadow
+        if old is not None and _prepares_offline(old):
+            await self._reconnect_prepared(old)
+            return
+        # Test doubles implement connect() as the whole handshake. That
+        # call is the stand-in for "not yet past CONNACK", so it stays
+        # inside the lock. The state GET does not.
+        async with self._lock:
+            if not self._should_run:
+                return
             await self._stop()
-            await self._start()
+            shadow = await self._open()
+        if shadow is not None:
+            await self._read_state_outside_lock(shadow)
 
     def note_presigned_generation(self, generation: int) -> None:
         """Records which credential generation signed this socket's URL.
@@ -217,20 +258,26 @@ class Hood:
         async with self._lock:
             await self._stop()
 
-    # Lock-free bodies. Callers above hold self._lock; asyncio.Lock is not
-    # reentrant, so async_reconnect cannot call the public methods.
+    # _open, _start and _stop are lock-free: their callers hold self._lock.
+    # asyncio.Lock is not reentrant, so those bodies must not call the
+    # public methods. _read_state_outside_lock and _reconnect_prepared take
+    # the lock themselves around the sections that mutate the socket.
 
-    async def _start(self) -> None:
-        """Attaches the IoT policy, connects the shadow, and requests state.
+    async def _open(self) -> ShadowClient | None:
+        """Attaches the policy, connects, and records the socket.
 
         Lock-free: callers hold self._lock. A no-op when a socket already
-        exists; if the initial state request fails, the hood is put back in
-        the no-socket shape the supervisor knows how to recover from.
+        exists, so a second start cannot orphan a live paho thread. Does
+        not request state; the caller decides whether that GET is inside
+        the lock (first start) or after it (a rebuild).
+
+        Returns:
+            The shadow just connected, or None when one was already up.
         """
         if self._shadow is not None:
             # Already connected. Rebuilding here would orphan the previous
             # paho client with its network thread still running.
-            return
+            return None
         # MUST precede connect(). An already-open MQTT connection does not
         # pick up newly attached permissions, and the failure is silent:
         # connect, subscribe and publish all succeed and every message is
@@ -240,6 +287,18 @@ class Hood:
         shadow = self._shadow_factory(self)
         await shadow.connect()
         self._shadow = shadow
+        return shadow
+
+    async def _start(self) -> None:
+        """Connects the shadow and requests state, under the caller's lock.
+
+        Lock-free: callers hold self._lock. If the initial state request
+        fails, the hood is put back in the no-socket shape the supervisor
+        knows how to recover from.
+        """
+        shadow = await self._open()
+        if shadow is None:
+            return
         try:
             await shadow.request_state()
         except BaseException:
@@ -264,6 +323,88 @@ class Hood:
             # of it. The paho thread still has to go either way.
             with contextlib.suppress(Exception):
                 await shadow.disconnect()
+            raise
+
+    async def _read_state_outside_lock(self, shadow: ShadowClient) -> None:
+        """Requests the initial document without holding the hood lock.
+
+        A command published while this GET is in flight must not wait for
+        it. On failure the socket is dropped under the lock so a writer
+        cannot observe a half-cleared hood, and the disconnect itself stays
+        outside the lock so that writer is not stuck behind the thread join.
+
+        Args:
+            shadow: The session the GET belongs to. Ignored if a newer
+                session has already replaced it.
+
+        Raises:
+            Exception: Whatever ``request_state`` raised, after teardown.
+        """
+        try:
+            await shadow.request_state()
+        except BaseException:
+            async with self._lock:
+                if self._shadow is shadow:
+                    self._shadow = None
+                    self._connected = False
+            with contextlib.suppress(Exception):
+                await shadow.disconnect()
+            raise
+
+    async def _reconnect_prepared(self, old: ShadowClient) -> None:
+        """Rebuilds a real shadow, presigning before the old socket stops.
+
+        ``old`` must be a ShadowClient (it advertises
+        ``prepares_transport_before_disconnect``). The replacement is a new
+        object: opening it before ``old`` has disconnected would put two
+        sessions on one client ID, and AWS IoT would evict one of them.
+
+        Args:
+            old: The live session being replaced. If it is no longer the
+                hood's socket by the time the lock is taken, the rebuild
+                is abandoned.
+        """
+        # Policy before any new socket. Latched, so this is a no-op after
+        # the first successful attach for this identity.
+        await self._prepare()
+        replacement = self._shadow_factory(self)
+        # The credentials provider records the generation onto this hood as
+        # a side effect of presigning. If we never install the socket that
+        # URL belongs to, that record would describe the OLD socket and the
+        # supervisor would stop rebuilding it.
+        previous_generation = self._presigned_generation
+        try:
+            await replacement.prepare_transport()
+        except BaseException:
+            self._presigned_generation = previous_generation
+            raise
+        async with self._lock:
+            if not self._should_run or self._shadow is not old:
+                if self._shadow is old:
+                    self._presigned_generation = previous_generation
+                return
+            await self._stop()
+            try:
+                await replacement.open_until_connack()
+            except BaseException:
+                self._shadow = None
+                self._connected = False
+                with contextlib.suppress(Exception):
+                    await replacement.disconnect()
+                raise
+            # Past CONNACK. publish_state is legal; release the lock before
+            # the subscription wait and the state GET.
+            self._shadow = replacement
+        try:
+            await replacement.finish_subscriptions()
+            await replacement.request_state()
+        except BaseException:
+            async with self._lock:
+                if self._shadow is replacement:
+                    self._shadow = None
+                    self._connected = False
+            with contextlib.suppress(Exception):
+                await replacement.disconnect()
             raise
 
     async def _stop(self) -> None:
@@ -457,6 +598,107 @@ class Hood:
             self._shadow = None
             self._connected = False
             raise
+        # Only after the publish was accepted into paho's queue. The
+        # NO_CONN path above tears the client down so a qos>0 message
+        # cannot actuate later; applying state there would report a
+        # command that was refused. Listeners run inline, and this lock
+        # is held, so a listener must not call back into the hood.
+        self._note_optimistic_write(fields)
+
+    def _note_optimistic_write(self, fields: dict[str, int]) -> None:
+        """Merges a successful write into the cache before the echo arrives.
+
+        The vendor app shows the tap immediately. Waiting for
+        ``update/accepted`` makes every consumer one cloud round trip
+        behind that. Device-derived keys (``power`` rising after a fan
+        write, ``delaytimer`` counted down from ``setdelaytimer``) are
+        left for the echo to merge. Destructive fields are skipped: showing
+        a zeroed grease counter, or a recirculating change, before the
+        device confirms it would lie about a change that cannot be undone.
+
+        Args:
+            fields: The fields just published to ``state.reported``.
+        """
+        if set(fields) & const.DANGEROUS_FIELDS:
+            return
+        if self._state is None:
+            # No cache yet. from_reported on only these keys; the next full
+            # document replaces it. Merging is impossible without a base,
+            # and replacing a real cache with this partial payload is what
+            # zeroes the usage counters.
+            self.handle_state(HoodState.from_reported(dict(fields)))
+            return
+        self.handle_state(self._state.merge(dict(fields)))
+
+    def accept_shadow_version(self, version: object) -> bool:
+        """Decides whether a shadow document is new enough to apply.
+
+        A missing or non-integer version keeps the previous behaviour:
+        apply the document, and do not move the cursor. A version older
+        than the newest one already applied is dropped, so a GET that was
+        in flight before a write cannot replace the newer snapshot.
+
+        Args:
+            version: The ``version`` field of a shadow document, or None
+                when the document did not carry one.
+
+        Returns:
+            True when the caller should apply the document.
+        """
+        if isinstance(version, bool) or not isinstance(version, int):
+            return True
+        if self._shadow_version is not None and version < self._shadow_version:
+            return False
+        self._shadow_version = version
+        return True
+
+    def schedule_state_reread(self) -> None:
+        """Schedules a full shadow GET after a rejected update.
+
+        Optimistic keys would otherwise stick: a rejection means the device
+        did not apply the write, and nothing else will correct the cache
+        until the next document. A ``get/rejected`` must not land here. That
+        topic firing another GET retries forever when no shadow exists.
+
+        One reread at a time. Runs on the event loop; failures are logged
+        as the exception type only, because the message can name a topic.
+        """
+        in_flight = self._reread_task
+        if in_flight is not None and not in_flight.done():
+            return
+        shadow = self._shadow
+        if shadow is None:
+            return
+        task = asyncio.get_running_loop().create_task(
+            self._reread_after_rejection(shadow)
+        )
+        self._reread_task = task
+        task.add_done_callback(self._consume_reread)
+
+    async def _reread_after_rejection(self, shadow: ShadowClient) -> None:
+        """Asks for the full shadow so a rejected optimistic write can clear.
+
+        Args:
+            shadow: The session to read. The one that was current when the
+                rejection was scheduled.
+        """
+        await shadow.request_state()
+
+    def _consume_reread(self, task: asyncio.Task[None]) -> None:
+        """Logs a reread failure without the exception text.
+
+        Args:
+            task: The reread task that just finished.
+        """
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            # Type only. The message can embed a topic, and a topic embeds
+            # the thing name.
+            _LOGGER.debug(
+                "state reread after a rejected write failed: %s", type(exc).__name__
+            )
 
     async def async_set_power(self, on: bool) -> None:
         """Switches hood power on or off.

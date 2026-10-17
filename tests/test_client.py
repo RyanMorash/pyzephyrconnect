@@ -26,6 +26,7 @@ from pyzephyrconnect.const import DEFAULT_ENDPOINTS, Endpoints
 from pyzephyrconnect.exceptions import (
     ZephyrAuthError,
     ZephyrError,
+    ZephyrNotConnectedError,
     ZephyrPolicyError,
     ZephyrTransportError,
 )
@@ -1076,6 +1077,173 @@ async def test_update_delta_is_ignored(wired):
     )
 
     assert hoods[0].state.fan == 1
+
+
+async def test_a_write_is_optimistic_and_the_echo_merges_over_it(wired):
+    """Tests that a write shows up locally and the echo only adds device keys.
+
+    power is not part of the publish. The device raises it itself, and that
+    arrives on update/accepted. The grease counter must survive both steps.
+    """
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/get/accepted",
+        {"state": {"reported": {"light": 0, "usegreasefiltertime": 642}}},
+    )
+    seen = []
+    hoods[0].add_listener(seen.append)
+
+    await hoods[0].async_set_light(1)
+
+    wired["shadow"].publish_state.assert_awaited_with({"light": 1})
+    assert hoods[0].state.light == 1
+    assert hoods[0].state.power is None
+    assert hoods[0].state.use_grease_filter_time == 642
+    assert len(seen) == 1
+    assert seen[0].light == 1
+
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/update/accepted",
+        {"state": {"reported": {"fan": 1, "power": 1}}, "version": 11},
+    )
+
+    assert hoods[0].state.light == 1
+    assert hoods[0].state.fan == 1
+    assert hoods[0].state.power == 1
+    assert hoods[0].state.use_grease_filter_time == 642
+
+
+async def test_a_delta_does_not_move_an_optimistic_snapshot(wired):
+    """Tests that a delta is still dropped after an optimistic write.
+
+    Optimistic state is not a reason to start trusting desired-vs-reported.
+    """
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/get/accepted",
+        {"state": {"reported": {"light": 0, "fan": 0}}},
+    )
+    await hoods[0].async_set_light(1)
+
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/update/delta",
+        {"state": {"light": 3, "power": 1}, "version": 99},
+    )
+
+    assert hoods[0].state.light == 1
+    assert hoods[0].state.power is None
+
+
+async def test_a_stale_get_does_not_replace_a_newer_snapshot(wired):
+    """Tests that an older shadow version is ignored and a newer one replaces.
+
+    A missing version still applies, and does not move the cursor, so a
+    later older document stays ignored.
+    """
+    client = _client()
+    hoods = await client.async_setup()
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/update/accepted",
+        {
+            "state": {"reported": {"light": 1, "usegreasefiltertime": 642}},
+            "version": 10,
+        },
+    )
+
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/get/accepted",
+        {"state": {"reported": {"light": 0}}, "version": 9},
+    )
+    assert hoods[0].state.light == 1
+    assert hoods[0].state.use_grease_filter_time == 642
+
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/get/accepted",
+        {
+            "state": {"reported": {"light": 3, "usegreasefiltertime": 642}},
+            "version": 11,
+        },
+    )
+    assert hoods[0].state.light == 3
+
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/get/accepted",
+        {"state": {"reported": {"light": 4, "usegreasefiltertime": 642}}},
+    )
+    assert hoods[0].state.light == 4
+
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/get/accepted",
+        {"state": {"reported": {"light": 0}}, "version": 9},
+    )
+    assert hoods[0].state.light == 4
+
+
+async def test_a_rejected_update_rereads_state_without_logging_the_thing(wired, caplog):
+    """Tests that update/rejected schedules a GET and get/rejected does not.
+
+    The log is the topic leaf only. The thing name identifies a home.
+    """
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+    wired["shadow"].request_state.reset_mock()
+
+    with caplog.at_level(logging.DEBUG, logger="pyzephyrconnect.client"):
+        client._handle_message(
+            hoods[0],
+            f"$aws/things/{THING}/shadow/update/rejected",
+            {"message": "rejected", "thingName": THING},
+        )
+        await asyncio.sleep(0)
+
+    wired["shadow"].request_state.assert_awaited_once()
+    assert THING not in caplog.text
+
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/get/rejected",
+        {"code": 404},
+    )
+    await asyncio.sleep(0)
+    wired["shadow"].request_state.assert_awaited_once()
+
+
+async def test_a_refused_write_does_not_update_state(wired):
+    """Tests that ZephyrNotConnectedError leaves the cache alone."""
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/get/accepted",
+        {"state": {"reported": {"light": 0, "usegreasefiltertime": 642}}},
+    )
+    before = hoods[0].state
+    seen = []
+    hoods[0].add_listener(seen.append)
+    wired["shadow"].publish_state = AsyncMock(
+        side_effect=ZephyrNotConnectedError("hood is not connected")
+    )
+
+    with pytest.raises(ZephyrNotConnectedError):
+        await hoods[0].async_set_light(1)
+
+    assert hoods[0].state is before
+    assert seen == []
 
 
 async def test_a_delta_notifies_nobody_and_logs_no_identifier(wired, caplog):

@@ -159,6 +159,16 @@ class ShadowClient:
         self._subscribed = asyncio.Event()
         self._subscribe_error: ZephyrPolicyError | None = None
         self._pending_subscribes = 0
+        # Presign + TLS context built ahead of the socket, so a credential
+        # rebuild can do that work while the previous session is still
+        # serving writes. Consumed by open_until_connack.
+        self._prepared_url: str | None = None
+        self._prepared_ssl: ssl.SSLContext | None = None
+
+    # Hood.async_reconnect reads this off the CLASS. A MagicMock invents
+    # every instance attribute it is asked for, so an instance flag would
+    # look true on test doubles and send them down the split handshake.
+    prepares_transport_before_disconnect: bool = True
 
     # -- paho callbacks (background thread) ---------------------------
 
@@ -332,35 +342,25 @@ class ShadowClient:
 
     # -- async surface -------------------------------------------------
 
-    async def connect(self, timeout: float = 15.0) -> None:
-        """Opens the WebSocket and subscribes to the shadow topics.
+    async def prepare_transport(self) -> None:
+        """Presigns the WebSocket URL and builds the TLS context. No socket.
 
-        Credentials are fetched from the provider on every attempt rather
-        than captured once: the presigned URL embeds a SigV4 signature that
-        expires with them, so a reconnect must re-presign or it will retry a
-        URL AWS IoT has already stopped accepting.
+        Both are pure local work: SigV4 over the current credentials, and
+        ``ssl.create_default_context`` (which loads the system trust store).
+        Doing them before the previous session is torn down keeps that
+        session able to carry a command. The URL still has to be rebuilt on
+        every attempt. It embeds a signature that expires with the
+        credentials, and reusing one retries a URL AWS IoT has stopped
+        accepting.
 
-        Args:
-            timeout: Seconds to wait for the CONNACK, and again for the
-                shadow subscriptions, before giving up.
-
-        Raises:
-            ZephyrTransportError: The connection or the shadow
-                subscriptions did not complete within the timeout.
-            ZephyrPolicyError: AWS IoT denied a shadow subscription -
-                almost always a missing IoT policy on the Cognito
-                identity.
+        The context is a plain default one. The IoT ATS endpoint chains to
+        Amazon Root CA 1, which system trust stores already carry. Only the
+        vendor REST host needs the TWCA anchors; do not reuse that context
+        here.
         """
         self._loop = asyncio.get_running_loop()
-        if self._client is not None:
-            # connect() is the ~50-minute reconnect path; connecting over a
-            # live client would leak its network thread and reuse stale
-            # readiness events.
-            await self.disconnect()
-        self._connected.clear()
-        self._subscribed.clear()
         credentials = await self._credentials_provider()
-        url = build_presigned_url(
+        self._prepared_url = build_presigned_url(
             credentials.access_key,
             credentials.secret_key,
             credentials.session_token,
@@ -368,6 +368,52 @@ class ShadowClient:
             region=self._endpoints.region,
             now=datetime.now(UTC),
         )
+        # Off the loop. paho's tls_set() would call load_default_certs() on
+        # the calling thread, which Home Assistant instruments as a blocking
+        # call. This runs on every connect, including every supervisor
+        # rebuild. Hand paho a finished context instead.
+        self._prepared_ssl = await asyncio.to_thread(ssl.create_default_context)
+
+    async def open_until_connack(self, timeout: float = 15.0) -> None:
+        """Opens the socket and returns once publish is legal.
+
+        Legal means post-CONNACK: ``is_connected()`` is what ``_publish``
+        checks, and that flips before subscriptions are granted. Waiting
+        out six QoS-1 SUBACKs here would keep a command blocked for those
+        extra round trips. ``finish_subscriptions`` does that wait.
+
+        Uses the URL and context from ``prepare_transport`` when they are
+        already built, so a caller can presign before tearing the previous
+        session down. Two live sessions that share a client ID evict each
+        other, so this must not run until that previous ``disconnect`` has
+        finished. This method does not overlap them.
+
+        Args:
+            timeout: Seconds to wait for the CONNACK before giving up.
+
+        Raises:
+            ZephyrTransportError: The CONNACK did not arrive in time.
+        """
+        self._loop = asyncio.get_running_loop()
+        if self._client is not None:
+            # Same object reconnecting. A second paho client would leak the
+            # first network thread and reuse stale readiness events.
+            await self.disconnect()
+        if self._prepared_url is None or self._prepared_ssl is None:
+            await self.prepare_transport()
+        url = self._prepared_url
+        ssl_context = self._prepared_ssl
+        self._prepared_url = None
+        self._prepared_ssl = None
+        if url is None or ssl_context is None:
+            # prepare_transport sets both or raises. Reaching here without
+            # them means a later edit split the pair; refuse rather than
+            # hand paho a default context built on the event loop.
+            raise ZephyrTransportError("MQTT connection was not prepared")
+        # Cleared only once the URL and context are in locals, so a failed
+        # prepare cannot have wiped a newer connection's events.
+        self._connected.clear()
+        self._subscribed.clear()
         parts = urlsplit(url)
 
         client = mqtt.Client(
@@ -377,18 +423,7 @@ class ShadowClient:
             protocol=mqtt.MQTTv311,
         )
         client.ws_set_options(path=f"{parts.path}?{parts.query}")
-        # The IoT ATS endpoint chains to Amazon Root CA 1, which system trust
-        # stores already carry. Only the vendor REST host needs the extra CAs,
-        # so this is a plain default context - NOT the TWCA one.
-        #
-        # Built in a worker thread and handed to paho finished. paho's
-        # tls_set() constructs the context inline on the calling thread: it
-        # does ssl.SSLContext(...) and then, because ca_certs is None,
-        # context.load_default_certs() - which Home Assistant instruments as
-        # a blocking call. connect() is async and runs on the event loop, and
-        # this path executes on every connect including every supervisor
-        # reconnect.
-        client.tls_set_context(await asyncio.to_thread(ssl.create_default_context))
+        client.tls_set_context(ssl_context)
         # paho retries indefinitely at a fixed short interval by default. Cap
         # the backoff so an expired credential does not become a hot loop.
         client.reconnect_delay_set(min_delay=1, max_delay=120)
@@ -403,12 +438,37 @@ class ShadowClient:
         self._client = client
 
         try:
-            try:
-                await asyncio.wait_for(self._connected.wait(), timeout)
-            except TimeoutError as err:
-                raise ZephyrTransportError(
-                    f"MQTT connection to {self._endpoints.iot_endpoint} timed out"
-                ) from err
+            await asyncio.wait_for(self._connected.wait(), timeout)
+        except TimeoutError as err:
+            await self._abort_handshake()
+            raise ZephyrTransportError(
+                f"MQTT connection to {self._endpoints.iot_endpoint} timed out"
+            ) from err
+        except BaseException:
+            # CancelledError included: the paho thread is already running
+            # and nothing outside holds it yet.
+            await self._abort_handshake()
+            raise
+
+    async def finish_subscriptions(self, timeout: float = 15.0) -> None:
+        """Waits until every shadow subscription is granted.
+
+        A denied subscribe still fires ``on_subscribe``. Granted QoS 128 is
+        a refusal, almost always a missing IoT policy, and IoT then closes
+        the connection. That has to surface here as ``ZephyrPolicyError``,
+        not as a silent half-open session.
+
+        Not required before a command can be published. Callers that have
+        already observed CONNACK may publish first and await this after.
+
+        Args:
+            timeout: Seconds to wait for the SUBACKs before giving up.
+
+        Raises:
+            ZephyrTransportError: Subscriptions did not complete in time.
+            ZephyrPolicyError: AWS IoT denied a shadow subscription.
+        """
+        try:
             try:
                 await asyncio.wait_for(self._subscribed.wait(), timeout)
             except TimeoutError as err:
@@ -419,21 +479,52 @@ class ShadowClient:
                 error, self._subscribe_error = self._subscribe_error, None
                 raise error
         except BaseException:
-            # Covers the ZephyrTransportError raises above, ZephyrPolicyError,
-            # AND CancelledError: whatever interrupts the handshake, the paho
-            # client and its network thread must be torn down before the
-            # exception leaves - nothing outside holds a reference yet.
-            try:
-                await self.disconnect()
-            except Exception:  # noqa: BLE001
-                # The teardown failure must not REPLACE the handshake
-                # failure - the caller's terminal-vs-retry decision keys on
-                # the original exception's type. An OSError out of
-                # loop_stop() standing in for a ZephyrPolicyError would tell
-                # the supervisor to retry forever against a policy the
-                # identity will never have.
-                _LOGGER.exception("teardown after a failed handshake")
+            # ZephyrTransportError, ZephyrPolicyError, and CancelledError.
+            # The caller's terminal-vs-retry decision keys on the original
+            # type, so a teardown failure must not replace it.
+            await self._abort_handshake()
             raise
+
+    async def _abort_handshake(self) -> None:
+        """Tears the half-open client down without masking the handshake error.
+
+        An ``OSError`` out of ``loop_stop`` standing in for a
+        ``ZephyrPolicyError`` would tell the supervisor to retry forever
+        against a policy the identity will never have.
+        """
+        try:
+            await self.disconnect()
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("teardown after a failed handshake")
+
+    async def connect(self, timeout: float = 15.0) -> None:
+        """Opens the WebSocket and subscribes to the shadow topics.
+
+        The full handshake: presign, CONNACK, then SUBACKs. The supervisor
+        rebuild does not use this. It presigns before disconnecting and
+        returns to callers at CONNACK so a command is not stuck behind the
+        subscription wait. First start and direct callers still wait here,
+        so a ``connect()`` that returns has a session that can both publish
+        and receive.
+
+        Args:
+            timeout: Seconds to wait for the CONNACK, and again for the
+                shadow subscriptions, before giving up.
+
+        Raises:
+            ZephyrTransportError: The connection or the shadow
+                subscriptions did not complete within the timeout.
+            ZephyrPolicyError: AWS IoT denied a shadow subscription.
+                Almost always a missing IoT policy on the Cognito
+                identity.
+        """
+        self._loop = asyncio.get_running_loop()
+        if self._client is not None:
+            # Connecting over a live client would leak its network thread.
+            await self.disconnect()
+        await self.prepare_transport()
+        await self.open_until_connack(timeout)
+        await self.finish_subscriptions(timeout)
 
     async def disconnect(self) -> None:
         """Tears down the paho client and joins its network thread.

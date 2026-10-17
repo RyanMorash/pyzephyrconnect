@@ -521,16 +521,27 @@ class ZephyrClient:
             if topic.endswith("/rejected"):
                 # Do not log the payload: a rejection can echo back the
                 # desired/reported fields it rejected, including identifiers.
+                # Leaf only - the full topic embeds the thing name.
                 _LOGGER.warning(
                     "shadow operation rejected on %s", topic.rsplit("/", 1)[-1]
                 )
+                # update/rejected only. get/rejected means the document is
+                # missing; scheduling another GET from there retries forever.
+                # The reread is what clears an optimistic write the device
+                # did not apply.
+                if topic.endswith("/update/rejected"):
+                    hood.schedule_state_reread()
                 return
 
             state_block = payload.get("state") or {}
             if topic.endswith("/get/accepted"):
+                if not self._version_is_current(hood, topic, payload):
+                    return
                 reported = state_block.get("reported") or {}
                 new_state = HoodState.from_reported(reported)
             elif topic.endswith("/update/accepted"):
+                if not self._version_is_current(hood, topic, payload):
+                    return
                 reported = state_block.get("reported") or {}
                 current = hood.state
                 new_state = (
@@ -567,6 +578,32 @@ class ZephyrClient:
                 "unhandled error processing shadow message on %s",
                 topic.rsplit("/", 1)[-1],
             )
+
+    def _version_is_current(
+        self, hood: Hood, topic: str, payload: dict[str, Any]
+    ) -> bool:
+        """Reports whether this document is newer than the one already applied.
+
+        An older ``version`` is a GET (or an update) that was in flight
+        before a later write. Applying it would replace the optimistic
+        snapshot, or a newer echo, with stale reported state. The log names
+        the topic leaf only.
+
+        Args:
+            hood: The hood whose version cursor to consult.
+            topic: The full MQTT topic; only its leaf is logged.
+            payload: The shadow document, which may omit ``version``.
+
+        Returns:
+            True when the document should be applied.
+        """
+        if hood.accept_shadow_version(payload.get("version")):
+            return True
+        _LOGGER.debug(
+            "ignoring stale shadow document on %s",
+            topic.rsplit("/", 1)[-1],
+        )
+        return False
 
     # -- the refresh supervisor ----------------------------------------
 
