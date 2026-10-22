@@ -629,9 +629,11 @@ class ShadowClient:
         The follow-up wait is shielded too. A second cancellation delivered
         into an unshielded ``await`` cancels the ``to_thread`` task, marks
         that future done, and leaves the worker inside ``loop_stop``.
-        ``uncancel`` drops a request already counted on this task so the
-        next shield is not aborted before it waits. This caller still
-        finishes by raising ``CancelledError``, after the join.
+        Catching the error and waiting on a new shield does not clear
+        cancellation requests already counted on this task. The caller
+        that raised them, including a timeout or task group, still has to
+        see that count. This caller finishes by raising
+        ``CancelledError`` after the join.
 
         Args:
             closing: The in-flight ``loop_stop`` future.
@@ -641,7 +643,6 @@ class ShadowClient:
                 has finished first.
             Exception: Whatever the join raised.
         """
-        task = asyncio.current_task()
         cancelled = False
         while True:
             try:
@@ -649,12 +650,6 @@ class ShadowClient:
                 break
             except asyncio.CancelledError:
                 cancelled = True
-                # The CancelledError just delivered does not clear a second
-                # request already counted. Left in place, the next shield
-                # raises immediately and never waits out the join.
-                if task is not None:
-                    while task.uncancel():
-                        pass
                 if closing.cancelled():
                     break
                 continue
