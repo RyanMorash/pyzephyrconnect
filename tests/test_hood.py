@@ -213,35 +213,67 @@ async def test_reconnect_does_not_start_a_hood_that_was_never_started():
 
 
 async def test_a_write_during_a_reconnect_waits_rather_than_failing():
-    """Tests that a write during a reconnect waits on the lock.
+    """Tests that a write during a reconnect waits only until publish is legal.
 
     The supervisor rebuilds the socket about every 50 minutes. A write
-    landing in that window is not a disconnected hood, and must not surface
-    to the user as a failed command.
+    landing before the new session is up is not a disconnected hood, and
+    must not surface as a failed command. It also must not wait for the
+    state GET that follows CONNACK: that GET is not on the command path.
+    The old socket is stopped before the new one connects.
     """
     import asyncio
 
     hood, shadow = _hood()
     await hood.async_start()
+    shadow.publish_state.reset_mock()
 
-    release = asyncio.Event()
+    order: list[str] = []
+    connack = asyncio.Event()
+    get_release = asyncio.Event()
 
     async def slow_connect():
-        """Connect double that blocks until the test releases it."""
-        await release.wait()
+        """Connect double that blocks until the test releases CONNACK."""
+        order.append("connect")
+        await connack.wait()
 
-    shadow.connect = AsyncMock(side_effect=slow_connect)
+    async def slow_get():
+        """State GET that blocks until the test releases it."""
+        order.append("get")
+        await get_release.wait()
+
+    async def disc():
+        """Record disconnect relative to the replacement connect."""
+        order.append("disconnect")
+
+    shadow.connect.side_effect = slow_connect
+    shadow.request_state.side_effect = slow_get
+    shadow.disconnect.side_effect = disc
+
     reconnect = asyncio.create_task(hood.async_reconnect())
     await asyncio.sleep(0)
 
-    write = asyncio.create_task(hood.async_set_light(1))
+    early = asyncio.create_task(hood.async_set_light(1))
     await asyncio.sleep(0)
-    assert not write.done()  # waiting on the lock, not raising
+    assert not early.done()  # still before CONNACK; waiting, not raising
 
-    release.set()
-    await reconnect
-    await write
+    connack.set()
+    for _ in range(10):
+        await asyncio.sleep(0)
+        if early.done() and "get" in order:
+            break
+    assert early.done()
+    assert not reconnect.done()  # parked on the state GET
     shadow.publish_state.assert_awaited_with({"light": 1})
+
+    during_get = asyncio.create_task(hood.async_set_light(2))
+    await asyncio.sleep(0)
+    assert during_get.done()  # the GET is outside the lock
+    shadow.publish_state.assert_awaited_with({"light": 2})
+
+    get_release.set()
+    await reconnect
+    assert order == ["disconnect", "connect", "get"]
+    assert shadow.connect.await_count == 2  # start, then this rebuild
 
 
 async def test_listeners_are_notified_and_removable():
@@ -578,9 +610,428 @@ async def test_a_write_refused_by_a_dead_socket_leaves_a_recoverable_hood():
     assert hood._shadow is None
     assert hood.connected is False
     assert hood._should_run is True  # the consumer still wants it up
+    # The refusal must not look like the light changed.
+    assert hood.state is None
 
     await hood.async_ensure_running()  # the next supervisor tick
 
     assert len(made) == 2
     await hood.async_set_light(1)
     made[1].publish_state.assert_awaited_with({"light": 1})
+
+
+async def test_a_successful_write_updates_state_before_any_shadow_message():
+    """Tests that a successful write is visible before the echo arrives.
+
+    The publish payload stays the written field only. Counters already in
+    the cache survive: merging the partial payload over raw is what keeps
+    them, and replacing the cache with that payload would zero them.
+    """
+    hood, shadow = _hood()
+    await hood.async_start()
+    hood.handle_state(HoodState.from_reported({"light": 0, "usegreasefiltertime": 642}))
+    seen = []
+    hood.add_listener(seen.append)
+
+    await hood.async_set_light(1)
+
+    shadow.publish_state.assert_awaited_with({"light": 1})
+    assert hood.state is not None
+    assert hood.state.light == 1
+    assert hood.state.use_grease_filter_time == 642
+    assert len(seen) == 1
+    assert seen[0].light == 1
+
+
+async def test_a_destructive_write_does_not_change_cached_state():
+    """Tests that a destructive write waits for the device to confirm it.
+
+    resetgreasefilter zeroes a counter that cannot be reconstructed, and
+    setrecirculating changes filter accounting. Showing either locally
+    before update/accepted would lie about a change the device may ignore.
+    """
+    hood, _shadow = _hood()
+    await hood.async_start()
+    hood.handle_state(
+        HoodState.from_reported({"setrecirculating": 0, "usegreasefiltertime": 642})
+    )
+
+    await hood.async_set_recirculating(True)
+
+    assert hood.state is not None
+    assert hood.state.set_recirculating == 0
+    assert hood.state.use_grease_filter_time == 642
+    assert hood._pending_writes == []
+
+
+async def test_a_failed_publish_does_not_pretend_the_write_landed():
+    """Tests that a refused publish leaves state and listeners untouched."""
+    hood, shadow = _hood()
+    await hood.async_start()
+    hood.handle_state(HoodState.from_reported({"light": 0, "usegreasefiltertime": 642}))
+    before = hood.state
+    seen = []
+    hood.add_listener(seen.append)
+    shadow.publish_state = AsyncMock(side_effect=ZephyrNotConnectedError("down"))
+
+    with pytest.raises(ZephyrNotConnectedError):
+        await hood.async_set_light(1)
+
+    assert hood.state is before
+    assert seen == []
+    assert hood._shadow is None
+
+
+async def test_an_abandoned_presign_does_not_mark_the_old_socket_current():
+    """Tests that a presign abandoned before disconnect keeps the old generation.
+
+    The credentials provider records the generation as it presigns. If that
+    record stuck while the old socket was still the live one, the supervisor
+    would see no mismatch and stop rebuilding a session signed under the
+    previous credentials.
+    """
+
+    class _SplittingShadow:
+        """Double that presigns offline, the way ShadowClient does."""
+
+        prepares_transport_before_disconnect = True
+
+        def __init__(self) -> None:
+            """Installs the async methods Hood calls on a real shadow."""
+            self.connect = AsyncMock()
+            self.disconnect = AsyncMock()
+            self.request_state = AsyncMock()
+            self.finish_subscriptions = AsyncMock()
+            self.open_until_connack = AsyncMock()
+            self.prepare_transport = AsyncMock()
+
+    made: list[_SplittingShadow] = []
+
+    def factory(hood: Hood) -> _SplittingShadow:
+        """Build a splitting double that aborts the rebuild during presign."""
+        shadow = _SplittingShadow()
+
+        async def prepare() -> None:
+            """Stamp a generation on this socket, then drop consumer intent."""
+            # On the shadow, not the hood. Committing it here would describe
+            # the socket that is still live if this rebuild is abandoned.
+            shadow.presigned_generation = 7
+            hood._should_run = False
+
+        shadow.prepare_transport = AsyncMock(side_effect=prepare)
+        made.append(shadow)
+        return shadow
+
+    hood = Hood(_caps(), factory, AsyncMock(), AsyncMock())
+    await hood.async_start()
+    hood._presigned_generation = 1
+    first = made[0]
+
+    await hood.async_reconnect()
+
+    assert hood._presigned_generation == 1
+    assert hood._shadow is first
+    first.disconnect.assert_not_awaited()
+    first.open_until_connack.assert_not_awaited()
+
+
+def _splitting_factory(made: list, prepare):
+    """Build a shadow factory whose clients presign before disconnecting.
+
+    Args:
+        made: Collects every shadow the factory builds, in order.
+        prepare: Async side effect installed on each shadow's
+            ``prepare_transport``. Receives the shadow and its index.
+    """
+
+    class _SplittingShadow:
+        """Double that presigns offline, the way ShadowClient does."""
+
+        prepares_transport_before_disconnect = True
+
+        def __init__(self) -> None:
+            """Installs the async methods Hood calls on a real shadow."""
+            self.presigned_generation: int | None = None
+            self.connect = AsyncMock()
+            self.disconnect = AsyncMock()
+            self.request_state = AsyncMock()
+            self.finish_subscriptions = AsyncMock()
+            self.open_until_connack = AsyncMock()
+            self.prepare_transport = AsyncMock()
+
+    def factory(_hood: Hood) -> _SplittingShadow:
+        """Build one splitting double and register ``prepare`` on it."""
+        shadow = _SplittingShadow()
+        index = len(made)
+
+        async def run_prepare() -> None:
+            """Run the test's presign side effect for this shadow."""
+            await prepare(shadow, index)
+
+        shadow.prepare_transport = AsyncMock(side_effect=run_prepare)
+        made.append(shadow)
+        return shadow
+
+    return factory
+
+
+async def test_overlapping_reconnects_keep_the_installed_generation():
+    """Tests that a losing presign does not describe the socket that won.
+
+    Both rebuilds presign before either takes the lock. The generation
+    belongs to the socket that is installed. Recording the loser's
+    generation would make needs_represign() treat an expiring URL as
+    current.
+    """
+    made: list = []
+    release_a = asyncio.Event()
+    release_b = asyncio.Event()
+    entered_a = asyncio.Event()
+    entered_b = asyncio.Event()
+
+    async def prepare(shadow, index: int) -> None:
+        """Stamp this rebuild's generation and wait until released."""
+        if index == 1:
+            shadow.presigned_generation = 2
+            entered_a.set()
+            await release_a.wait()
+        elif index == 2:
+            shadow.presigned_generation = 3
+            entered_b.set()
+            await release_b.wait()
+
+    hood = Hood(_caps(), _splitting_factory(made, prepare), AsyncMock(), AsyncMock())
+    await hood.async_start()
+    hood._presigned_generation = 1
+
+    task_a = asyncio.create_task(hood.async_reconnect())
+    await entered_a.wait()
+    task_b = asyncio.create_task(hood.async_reconnect())
+    await entered_b.wait()
+    assert hood._presigned_generation == 1
+
+    release_a.set()
+    await task_a
+    assert hood._shadow is made[1]
+    assert hood._presigned_generation == 2
+
+    release_b.set()
+    await task_b
+    assert hood._shadow is made[1]
+    assert hood._presigned_generation == 2
+    assert hood.needs_represign(3) is True
+    assert hood.needs_represign(2) is False
+
+
+async def test_a_failed_overlapping_presign_does_not_restore_an_older_generation():
+    """Tests that a presign failure does not roll the installed generation back.
+
+    The loser starts before the winner is installed, so the generation it
+    would restore is the previous socket's. Writing that back after the
+    winner is installed makes needs_represign() rebuild a URL that is
+    already current, or skip one that is not.
+    """
+    made: list = []
+    release_a = asyncio.Event()
+    release_b = asyncio.Event()
+    entered_a = asyncio.Event()
+    entered_b = asyncio.Event()
+
+    async def prepare(shadow, index: int) -> None:
+        """Let the winner install, then fail the loser."""
+        if index == 1:
+            shadow.presigned_generation = 2
+            entered_a.set()
+            await release_a.wait()
+        elif index == 2:
+            entered_b.set()
+            await release_b.wait()
+            raise RuntimeError("presign failed")
+
+    hood = Hood(_caps(), _splitting_factory(made, prepare), AsyncMock(), AsyncMock())
+    await hood.async_start()
+    hood._presigned_generation = 1
+
+    task_a = asyncio.create_task(hood.async_reconnect())
+    await entered_a.wait()
+    task_b = asyncio.create_task(hood.async_reconnect())
+    await entered_b.wait()
+
+    release_a.set()
+    await task_a
+    assert hood._presigned_generation == 2
+
+    release_b.set()
+    with pytest.raises(RuntimeError, match="presign failed"):
+        await task_b
+
+    assert hood._shadow is made[1]
+    assert hood._presigned_generation == 2
+    assert hood.needs_represign(2) is False
+
+
+async def test_a_failed_get_disconnects_before_another_session_opens():
+    """Tests that a failed state GET finishes disconnect before a new connect.
+
+    Clearing ``_shadow`` and releasing the lock first lets
+    ``async_ensure_running`` open a session while the failed client's
+    network thread is still stopping. Both use the same client ID.
+    """
+    made: list = []
+    order: list[str] = []
+    blocked = asyncio.Event()
+    release = asyncio.Event()
+
+    def factory(_hood: Hood):
+        """Build a shadow that blocks disconnect on the failed rebuild."""
+        index = len(made)
+        shadow = MagicMock()
+
+        async def connect() -> None:
+            """Record this session opening."""
+            order.append(f"connect-{index}")
+
+        async def disconnect() -> None:
+            """Block the failed session's teardown until the test releases it."""
+            order.append(f"disconnect-start-{index}")
+            if index == 1:
+                blocked.set()
+                await release.wait()
+            order.append(f"disconnect-end-{index}")
+
+        shadow.connect = AsyncMock(side_effect=connect)
+        shadow.disconnect = AsyncMock(side_effect=disconnect)
+        shadow.request_state = AsyncMock(
+            side_effect=ZephyrTransportError("boom") if index == 1 else None
+        )
+        made.append(shadow)
+        return shadow
+
+    hood = Hood(_caps(), factory, AsyncMock(), AsyncMock())
+    await hood.async_start()
+    order.clear()
+
+    reconnect = asyncio.create_task(hood.async_reconnect())
+    await blocked.wait()
+    ensure = asyncio.create_task(hood.async_ensure_running())
+    await asyncio.sleep(0)
+    assert "connect-2" not in order
+
+    release.set()
+    with pytest.raises(ZephyrTransportError):
+        await reconnect
+    await ensure
+
+    assert order.index("disconnect-end-1") < order.index("connect-2")
+
+
+async def test_a_failed_prepared_get_disconnects_before_another_session_opens():
+    """Tests that the presign-first rebuild disconnects before a new connect.
+
+    The state GET after CONNACK is outside the lock on success. On failure
+    the disconnect still has to finish before ``async_ensure_running`` is
+    allowed to open the replacement session.
+    """
+    made: list = []
+    order: list[str] = []
+    blocked = asyncio.Event()
+    release = asyncio.Event()
+
+    async def prepare(shadow, index: int) -> None:
+        """No generation race in this test; presign returns immediately."""
+        shadow.presigned_generation = 1
+
+    factory = _splitting_factory(made, prepare)
+
+    def tracking_factory(_hood: Hood):
+        """Wrap the splitting factory and record connect versus disconnect."""
+        shadow = factory(_hood)
+        index = len(made) - 1
+
+        async def connect() -> None:
+            """Record a session opened through the non-split path."""
+            order.append(f"connect-{index}")
+
+        async def disconnect() -> None:
+            """Block teardown of the session whose state GET failed."""
+            order.append(f"disconnect-start-{index}")
+            if index == 1:
+                blocked.set()
+                await release.wait()
+            order.append(f"disconnect-end-{index}")
+
+        shadow.connect = AsyncMock(side_effect=connect)
+        shadow.disconnect = AsyncMock(side_effect=disconnect)
+        if index == 1:
+            shadow.request_state = AsyncMock(side_effect=ZephyrTransportError("boom"))
+        return shadow
+
+    hood = Hood(_caps(), tracking_factory, AsyncMock(), AsyncMock())
+    await hood.async_start()
+    order.clear()
+
+    reconnect = asyncio.create_task(hood.async_reconnect())
+    await blocked.wait()
+    ensure = asyncio.create_task(hood.async_ensure_running())
+    await asyncio.sleep(0)
+    assert "connect-2" not in order
+
+    release.set()
+    with pytest.raises(ZephyrTransportError):
+        await reconnect
+    await ensure
+
+    assert order.index("disconnect-end-1") < order.index("connect-2")
+
+
+async def test_a_rejected_reread_on_a_dead_socket_clears_it():
+    """Tests that a refused rejection-GET leaves a hood the supervisor can reopen.
+
+    ``request_state`` tears its paho client down and raises. Leaving
+    ``_shadow`` set afterwards means ``async_ensure_running`` will not
+    rebuild and ``needs_represign`` still sees a matching generation.
+    """
+    hood, shadow = _hood()
+    await hood.async_start()
+    hood.handle_connection_change(True)
+    shadow.connect.reset_mock()
+    shadow.request_state = AsyncMock(
+        side_effect=ZephyrNotConnectedError("hood is not connected")
+    )
+
+    hood.schedule_state_reread()
+    task = hood._reread_task
+    assert task is not None
+    with pytest.raises(ZephyrNotConnectedError):
+        await task
+
+    assert hood._shadow is None
+    assert hood.connected is False
+    assert hood._should_run is True
+
+    # The same double is what the factory hands back. The refusal belonged
+    # to the dead session; the rebuilt one has to be able to read state.
+    shadow.request_state = AsyncMock()
+    await hood.async_ensure_running()
+    shadow.connect.assert_awaited()
+
+
+async def test_a_rejected_reread_leaves_a_newer_socket_in_place():
+    """Tests that a reread for a replaced socket does not drop the new one.
+
+    The rejection captured the previous session. By the time the reread
+    runs, a rebuild may already have installed another. Clearing whichever
+    ``_shadow`` happens to be set would drop that live session.
+    """
+    hood, shadow = _hood()
+    await hood.async_start()
+    newer = MagicMock()
+    hood._shadow = newer
+    shadow.request_state = AsyncMock(
+        side_effect=ZephyrNotConnectedError("hood is not connected")
+    )
+
+    await hood._reread_after_rejection(shadow)
+
+    shadow.request_state.assert_not_awaited()
+    assert hood._shadow is newer

@@ -369,9 +369,16 @@ class ZephyrClient:
         Returns:
             A fresh, unstarted ShadowClient for this hood.
         """
+        # The provider has to stamp the client it signed, and that client
+        # does not exist until ShadowClient() returns. A one-element cell
+        # is the binding. Noting the generation on the hood from here would
+        # let a presign that never becomes the live socket, or that loses a
+        # race with another rebuild, make needs_represign() treat the
+        # previous socket as current.
+        signed: list[ShadowClient] = []
 
         async def provider() -> Credentials:
-            """Fetches presign credentials; notes generation on the hood."""
+            """Fetches presign credentials and stashes their generation."""
             # The PAIR, in one call. Fetching the credentials and then
             # reading credentials_generation as a separate statement puts an
             # await between them: a refresh landing in that window records
@@ -379,10 +386,9 @@ class ZephyrClient:
             # looks current to the supervisor and dies at the OLD
             # credentials' expiry with nothing scheduled to re-presign it.
             creds, generation = await self._auth.async_get_presign_credentials()
-            # Record which credential generation this socket's URL is signed
-            # under - the supervisor reconnects on mismatch, because expiry
-            # alone lies when a REST call refreshed the cache first.
-            hood.note_presigned_generation(generation)
+            # On the client, not the hood. Hood copies this across when it
+            # installs the socket and not before.
+            signed[0].presigned_generation = generation
             return creds
 
         shadow = ShadowClient(
@@ -407,14 +413,15 @@ class ZephyrClient:
             hood.handle_connection_change,
             # The per-hood wrapper, not async_get_credentials itself:
             # ShadowClient calls this on every connect, which is exactly
-            # when the presigned URL is (re)built, so the generation it
-            # records self-updates on reconnects.
+            # when the presigned URL is (re)built. The generation is
+            # stashed on the client; Hood commits it at install.
             provider,
             # Without this the ShadowClient falls back to DEFAULT_ENDPOINTS,
             # so an endpoint override would reach REST but silently leave
             # MQTT pointed at production.
             endpoints=self._endpoints,
         )
+        signed.append(shadow)
         self._ensure_supervisor()
         return shadow
 
@@ -521,24 +528,107 @@ class ZephyrClient:
             if topic.endswith("/rejected"):
                 # Do not log the payload: a rejection can echo back the
                 # desired/reported fields it rejected, including identifiers.
+                # Leaf only - the full topic embeds the thing name.
                 _LOGGER.warning(
                     "shadow operation rejected on %s", topic.rsplit("/", 1)[-1]
                 )
+                # update/rejected only. get/rejected means the document is
+                # missing; scheduling another GET from there retries forever.
+                # The reread is what clears an optimistic write the device
+                # did not apply. Drop the pending keys FIRST: that GET often
+                # carries the same version (a rejected write does not bump
+                # it), and pending keys would be painted back over the
+                # document that is supposed to restore the refused fields.
+                if topic.endswith("/update/rejected"):
+                    hood.discard_unconfirmed_writes()
+                    hood.schedule_state_reread()
                 return
 
-            state_block = payload.get("state") or {}
-            if topic.endswith("/get/accepted"):
-                reported = state_block.get("reported") or {}
-                new_state = HoodState.from_reported(reported)
-            elif topic.endswith("/update/accepted"):
-                reported = state_block.get("reported") or {}
-                current = hood.state
-                new_state = (
-                    current.merge(reported)
-                    if current
-                    else HoodState.from_reported(reported)
+            if topic.endswith("/get/accepted") or topic.endswith("/update/accepted"):
+                # A full GET older than the cursor is a snapshot from before
+                # a later document. Applying it would replace every key.
+                # The check does not move the cursor. A document that fails
+                # to parse must not either, or the next valid older one
+                # looks stale and the cache stays on the last good snapshot
+                # forever.
+                #
+                # update/accepted is not that snapshot. It carries only the
+                # keys that changed, so version 12 reporting fan does not
+                # contain version 11's light. Dropping the older partial
+                # strands the light command: the fan echo cannot retire it,
+                # and every later GET stays covered by the pending light.
+                # Keep the partial. Hood applies a key only when this
+                # document is at least as new as the last merge of that
+                # key, and does not rewind the cursor.
+                is_update = topic.endswith("/update/accepted")
+                version = payload.get("version")
+                if not is_update and not self._version_is_current(hood, topic, payload):
+                    return
+                # ``payload.get`` cannot tell a missing key from JSON null,
+                # and ``is None`` then treats both as ``{}``. That commits
+                # an empty snapshot, ``as_counter`` turns the omitted usage
+                # counters into 0, and both version cursors stick, so a
+                # later valid older GET is ignored. A present non-dict,
+                # including null, is the same failure as ``[]``. A missing
+                # ``state`` is too: there is no reported document to apply.
+                # Reject before parsing and before either cursor moves.
+                # The handler below logs the topic leaf and swallows the
+                # error.
+                if "state" not in payload or not isinstance(payload["state"], dict):
+                    raise TypeError("shadow state block was not an object")
+                state_block = payload["state"]
+                # A null reported block is not an empty object either. An
+                # omitted reported key still is: this document named a
+                # state object and did not replace the reported section.
+                # ``[]``, ``""``, and ``0`` raise here so they never reach
+                # from_reported after a cursor has moved.
+                if "reported" not in state_block:
+                    reported = {}
+                elif not isinstance(state_block["reported"], dict):
+                    raise TypeError("shadow reported block was not an object")
+                else:
+                    reported = state_block["reported"]
+                # Filtering is only meaningful for a dict.
+                if is_update and isinstance(reported, dict):
+                    applied = hood.reported_fields_to_apply(version, reported)
+                else:
+                    applied = reported
+                # Onto authoritative reported state, not the visible cache.
+                # The cache already has optimistic keys in it. Merging there
+                # stores them as device-reported, and retiring the command
+                # then cannot reveal a newer value another client wrote.
+                new_state = hood.state_for_document(applied, replace=not is_update)
+                # Parsing succeeded. Only a version that is still current
+                # may win, and only now. An older partial does not. A
+                # second check covers a cursor that moved while the
+                # reported block was built; it does not, today, but
+                # applying after a failed accept would rewind a newer
+                # snapshot.
+                if hood.is_shadow_version_current(version):
+                    if not hood.accept_shadow_version(version):
+                        return
+                if isinstance(applied, dict):
+                    hood.note_applied_versions(version, applied)
+                # A full GET versions keys it omits, too. Absence is the
+                # reported value. A delayed older partial must not fill
+                # those keys back in. Partials keep the per-key check.
+                if not is_update:
+                    hood.note_snapshot_version(version)
+                # Reconcile sees the original reported block. A key this
+                # version was too old to merge can still be the echo that
+                # retires its command. The visible cache is rebuilt from
+                # the authoritative state when it is stored below.
+                new_state = hood.reconcile_reported(
+                    new_state,
+                    reported,
+                    version=version,
+                    echoed=is_update,
                 )
-            elif topic.endswith("/update/delta"):
+                # Listeners run inline. Hood.handle_state swallows their
+                # exceptions, so one bad consumer cannot stop the others.
+                hood.handle_state(new_state)
+                return
+            if topic.endswith("/update/delta"):
                 # A shadow delta is desired-vs-reported difference - a wish,
                 # not confirmed device state. This vendor never writes
                 # state.desired (see ShadowClient.publish_state), so any
@@ -554,12 +644,6 @@ class ZephyrClient:
                     topic.rsplit("/", 1)[-1],
                 )
                 return
-            else:
-                return
-
-            # Hood.handle_state notifies listeners and swallows their
-            # exceptions, so one bad consumer cannot stop the others.
-            hood.handle_state(new_state)
         except Exception:  # noqa: BLE001
             # One malformed message must not escape onto the event loop.
             # Log leaf-only - never the thing name, full topic, or payload.
@@ -567,6 +651,34 @@ class ZephyrClient:
                 "unhandled error processing shadow message on %s",
                 topic.rsplit("/", 1)[-1],
             )
+
+    def _version_is_current(
+        self, hood: Hood, topic: str, payload: dict[str, Any]
+    ) -> bool:
+        """Reports whether this document is newer than the one already applied.
+
+        An older ``version`` on a full GET was in flight before a later
+        write. Applying it would replace the optimistic snapshot, or a
+        newer echo, with stale reported state. Partial updates are not
+        decided here: a newer partial does not supersede keys it does not
+        carry. The log names the topic leaf only.
+
+        Args:
+            hood: The hood whose version cursor to consult.
+            topic: The full MQTT topic; only its leaf is logged.
+            payload: The shadow document, which may omit ``version``.
+
+        Returns:
+            True when the document is new enough to parse. Parsing still
+            has to succeed before the cursor moves.
+        """
+        if hood.is_shadow_version_current(payload.get("version")):
+            return True
+        _LOGGER.debug(
+            "ignoring stale shadow document on %s",
+            topic.rsplit("/", 1)[-1],
+        )
+        return False
 
     # -- the refresh supervisor ----------------------------------------
 
