@@ -575,11 +575,13 @@ class ShadowClient:
         # supervisor rebuild, per hood.
         #
         # Shielded: disconnect() runs inside connect()'s `except
-        # BaseException` cleanup. A SECOND cancellation arriving while this
+        # BaseException` cleanup. A cancellation arriving while this
         # teardown work item is still queued on the executor would cancel it
         # before the executor picks it up, leaking a paho client whose
         # network thread is already running - the exact leak this cleanup
-        # exists to prevent, one level down.
+        # exists to prevent, one level down. A second cancellation of this
+        # caller has to be shielded again. An unshielded wait cancels the
+        # join future while loop_stop is still running.
         #
         # Published before the first await. A concurrent disconnect() must
         # observe this future; otherwise it takes the no-client return
@@ -589,7 +591,11 @@ class ShadowClient:
         try:
             await self._await_closing(closing)
         finally:
-            if self._closing is closing and closing.done():
+            # A cancelled join is not finished. The worker can still be
+            # inside loop_stop, and the next disconnect() has to keep
+            # awaiting that same future. Clearing it here is what lets a
+            # recovery open a second session on this client ID.
+            if self._closing is closing and closing.done() and not closing.cancelled():
                 self._closing = None
 
     async def _await_closing(self, closing: asyncio.Future[None]) -> None:
@@ -599,6 +605,13 @@ class ShadowClient:
         ``CancelledError`` in the caller immediately. Returning then would
         release the hood lock while ``loop_stop`` is still joining.
 
+        The follow-up wait is shielded too. A second cancellation delivered
+        into an unshielded ``await`` cancels the ``to_thread`` task, marks
+        that future done, and leaves the worker inside ``loop_stop``.
+        ``uncancel`` drops a request already counted on this task so the
+        next shield is not aborted before it waits. This caller still
+        finishes by raising ``CancelledError``, after the join.
+
         Args:
             closing: The in-flight ``loop_stop`` future.
 
@@ -607,14 +620,31 @@ class ShadowClient:
                 has finished first.
             Exception: Whatever the join raised.
         """
-        try:
-            await asyncio.shield(closing)
-        except asyncio.CancelledError:
-            # A second cancel during this wait still wins. That is rarer
-            # than the overlap this wait exists to close.
-            with contextlib.suppress(BaseException):
-                await closing
-            raise
+        task = asyncio.current_task()
+        cancelled = False
+        while True:
+            try:
+                await asyncio.shield(closing)
+                break
+            except asyncio.CancelledError:
+                cancelled = True
+                # The CancelledError just delivered does not clear a second
+                # request already counted. Left in place, the next shield
+                # raises immediately and never waits out the join.
+                if task is not None:
+                    while task.uncancel():
+                        pass
+                if closing.cancelled():
+                    break
+                continue
+            except Exception:
+                # A teardown error after this caller was cancelled must not
+                # replace the cancellation. The join has already finished.
+                if not cancelled:
+                    raise
+                break
+        if cancelled:
+            raise asyncio.CancelledError
 
     @staticmethod
     def _teardown(client: mqtt.Client) -> None:

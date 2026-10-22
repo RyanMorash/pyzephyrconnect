@@ -1691,6 +1691,51 @@ async def test_a_redelivered_echo_does_not_retire_the_next_same_value(wired):
     assert hoods[0]._pending_writes == []
 
 
+async def test_one_echo_retires_every_queued_command_it_carries(wired):
+    """Tests that one document can retire two queued commands.
+
+    light=1 and fan=2 share a baseline. One update/accepted carries both
+    values, plus power. Retiring only the oldest command raises the fan
+    command's baseline to that version, so this document cannot confirm
+    fan, and a later fan=0 stays hidden under the pending 2.
+    """
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/get/accepted",
+        {
+            "state": {"reported": {"light": 0, "fan": 0, "usegreasefiltertime": 642}},
+            "version": 10,
+        },
+    )
+
+    await hoods[0].async_set_light(1)
+    await hoods[0].async_set_fan(2)
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/update/accepted",
+        {
+            "state": {"reported": {"light": 1, "fan": 2, "power": 1}},
+            "version": 11,
+        },
+    )
+    assert hoods[0].state.light == 1
+    assert hoods[0].state.fan == 2
+    assert hoods[0].state.power == 1
+    assert hoods[0]._pending_writes == []
+
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/update/accepted",
+        {"state": {"reported": {"fan": 0}}, "version": 12},
+    )
+    assert hoods[0].state.fan == 0
+    assert hoods[0].state.use_grease_filter_time == 642
+    assert hoods[0]._pending_writes == []
+
+
 async def test_a_missed_echo_on_automatic_reconnect_does_not_hide_the_get(wired):
     """Tests that paho's own reconnect drops the dead session's commands.
 
@@ -1849,10 +1894,9 @@ async def test_a_document_that_fails_to_parse_does_not_advance_the_version(wired
 async def test_a_non_object_state_block_does_not_advance_the_version(wired):
     """Tests that a non-object state block does not commit an empty snapshot.
 
-    ``{"state": []}`` is falsy. Coercing it to ``{}`` clears the cached
-    fields and moves both version cursors, so a later valid version-11 GET
-    is ignored. A missing state block is still an empty document. A list
-    is not.
+    ``{"state": []}`` is not a document. Coercing it to ``{}`` clears the
+    cached fields and moves both version cursors, so a later valid
+    version-11 GET is ignored. A list does not.
     """
     client = _client()
     hoods = await client.async_setup()
@@ -1875,6 +1919,59 @@ async def test_a_non_object_state_block_does_not_advance_the_version(wired):
         f"$aws/things/{THING}/shadow/update/accepted",
         {"state": [], "version": 13},
     )
+
+    assert hoods[0].state.light == 1
+    assert hoods[0].state.use_grease_filter_time == 642
+    assert hoods[0]._shadow_version == 10
+    assert hoods[0]._snapshot_version is None
+
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/get/accepted",
+        {
+            "state": {"reported": {"light": 4, "usegreasefiltertime": 700}},
+            "version": 11,
+        },
+    )
+    assert hoods[0].state.light == 4
+    assert hoods[0].state.use_grease_filter_time == 700
+    assert hoods[0]._shadow_version == 11
+
+
+async def test_a_null_or_missing_state_block_does_not_advance_the_version(wired):
+    """Tests that null or missing state does not commit an empty snapshot.
+
+    JSON null and a missing key both look like ``None`` to ``dict.get``.
+    Treating either as ``{}`` clears the cached fields, turns the omitted
+    usage counters into 0, and sticks both version cursors. A null
+    reported block is the same failure one level down. A later valid
+    version-11 GET has to apply.
+    """
+    client = _client()
+    hoods = await client.async_setup()
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/update/accepted",
+        {
+            "state": {"reported": {"light": 1, "usegreasefiltertime": 642}},
+            "version": 10,
+        },
+    )
+
+    bad_payloads = (
+        {"state": None},
+        {},
+        {"state": {"reported": None}},
+    )
+    version = 12
+    for payload in bad_payloads:
+        for leaf in ("get/accepted", "update/accepted"):
+            client._handle_message(
+                hoods[0],
+                f"$aws/things/{THING}/shadow/{leaf}",
+                {**payload, "version": version},
+            )
+            version += 1
 
     assert hoods[0].state.light == 1
     assert hoods[0].state.use_grease_filter_time == 642

@@ -564,24 +564,30 @@ class ZephyrClient:
                 version = payload.get("version")
                 if not is_update and not self._version_is_current(hood, topic, payload):
                     return
-                # Only a missing or null state block is an empty object.
-                # ``or {}`` also catches ``[]``, ``""``, and ``0``. Those
-                # are not documents. Treating them as ``{}`` commits an
-                # empty snapshot and moves both version cursors, so a
-                # later valid older GET is ignored. Reject before parsing
-                # and before either cursor moves. The handler below logs
-                # the topic leaf and swallows the error.
-                state_block = payload.get("state")
-                if state_block is None:
-                    state_block = {}
-                elif not isinstance(state_block, dict):
+                # ``payload.get`` cannot tell a missing key from JSON null,
+                # and ``is None`` then treats both as ``{}``. That commits
+                # an empty snapshot, ``as_counter`` turns the omitted usage
+                # counters into 0, and both version cursors stick, so a
+                # later valid older GET is ignored. A present non-dict,
+                # including null, is the same failure as ``[]``. A missing
+                # ``state`` is too: there is no reported document to apply.
+                # Reject before parsing and before either cursor moves.
+                # The handler below logs the topic leaf and swallows the
+                # error.
+                if "state" not in payload or not isinstance(payload["state"], dict):
                     raise TypeError("shadow state block was not an object")
-                # Same rule one level down: an absent or null reported
-                # block is empty. Any other non-object still has to reach
-                # from_reported and raise before the cursors move.
-                reported = state_block.get("reported")
-                if reported is None:
+                state_block = payload["state"]
+                # A null reported block is not an empty object either. An
+                # omitted reported key still is: this document named a
+                # state object and did not replace the reported section.
+                # ``[]``, ``""``, and ``0`` raise here so they never reach
+                # from_reported after a cursor has moved.
+                if "reported" not in state_block:
                     reported = {}
+                elif not isinstance(state_block["reported"], dict):
+                    raise TypeError("shadow reported block was not an object")
+                else:
+                    reported = state_block["reported"]
                 # Filtering is only meaningful for a dict.
                 if is_update and isinstance(reported, dict):
                     applied = hood.reported_fields_to_apply(version, reported)

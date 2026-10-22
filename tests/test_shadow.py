@@ -869,6 +869,82 @@ async def test_a_refused_rebuild_get_blocks_recovery_until_loop_stop(
     assert made[1]._client is None
 
 
+async def test_a_second_cancel_during_disconnect_waits_out_loop_stop(
+    fake_paho, monkeypatch
+):
+    """Tests that a second cancel cannot overlap the disconnect join.
+
+    One cancellation is absorbed and the join still finishes. A second
+    cancellation during the follow-up wait used to cancel the ``to_thread``
+    task, mark that future done, and let ``async_ensure_running`` open the
+    same client ID while ``loop_stop`` was still running. The recovery
+    connect has to follow the join. ``async_stop`` would clear the intent
+    to run, so this uses ``async_reconnect``, which leaves it set.
+    """
+    caps = HoodCapabilities.from_discover(
+        json.loads((FIXTURES / "discoverdevice.json").read_text())
+    )
+    made: list[ShadowClient] = []
+
+    def factory(_hood):
+        """Shadow factory that records every client it builds."""
+        made.append(_shadow())
+        return made[-1]
+
+    hood = Hood(caps, factory, AsyncMock(), AsyncMock())
+    await hood.async_start()
+
+    order: list[str] = []
+    entered = asyncio.Event()
+    gate = asyncio.get_running_loop().create_future()
+    real_to_thread = shadow_module.asyncio.to_thread
+
+    async def to_thread(fn, *args, **kwargs):
+        """Hold loop_stop. Let TLS context work through."""
+        if getattr(fn, "__name__", "") != "_teardown":
+            return await real_to_thread(fn, *args, **kwargs)
+        entered.set()
+        await gate
+        fn(*args, **kwargs)
+        order.append("teardown-done")
+        return None
+
+    def connect_async(*args, **kwargs):
+        """Record a new session opening relative to the blocked join."""
+        order.append("connect")
+        return fire(*args, **kwargs)
+
+    fire = fake_paho.connect_async.side_effect
+    fake_paho.connect_async.side_effect = connect_async
+    monkeypatch.setattr(shadow_module.asyncio, "to_thread", to_thread)
+
+    reconnect = asyncio.create_task(hood.async_reconnect())
+    await entered.wait()
+    # The first cancel lands in the shielded wait. Yield so the follow-up
+    # wait is the one that receives the second cancel.
+    reconnect.cancel()
+    await asyncio.sleep(0)
+    assert not reconnect.done()
+    reconnect.cancel()
+    await asyncio.sleep(0)
+    assert not reconnect.done()
+    assert "connect" not in order
+
+    ensure = asyncio.create_task(hood.async_ensure_running())
+    await asyncio.sleep(0)
+    assert "connect" not in order
+    assert not ensure.done()
+
+    gate.set_result(None)
+    with pytest.raises(asyncio.CancelledError):
+        await reconnect
+    await ensure
+
+    assert order.index("teardown-done") < order.index("connect")
+    assert hood._shadow is made[-1]
+    assert made[0]._client is None
+
+
 async def test_a_refused_write_tears_the_connection_down_so_it_cannot_fire_later(
     fake_paho,
 ):
