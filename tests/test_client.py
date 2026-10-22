@@ -2011,6 +2011,280 @@ async def test_one_echo_retires_every_queued_command_it_carries(wired):
     assert hoods[0]._pending_writes == []
 
 
+def _echo(client, hood, version, reported, *, snapshot=False):
+    """Delivers one shadow document to ``hood``.
+
+    Args:
+        client: The client whose handler folds the document.
+        hood: The hood the document belongs to.
+        version: The document's shadow version.
+        reported: The reported object.
+        snapshot: True for a full GET. Otherwise ``update/accepted``.
+    """
+    leaf = "get/accepted" if snapshot else "update/accepted"
+    client._handle_message(
+        hood,
+        f"$aws/things/{THING}/shadow/{leaf}",
+        {"state": {"reported": reported}, "version": version},
+    )
+
+
+async def test_a_noncontiguous_echo_does_not_hide_the_later_get(wired):
+    """Tests that a version nobody owns is not spent on the oldest write.
+
+    Two ``light=1`` commands and a document that is not the older one's
+    expected version used to retire the older write. The newer repeat
+    stayed in the overlay and a GET of light 0 stayed covered. The GET
+    has to show light 0 with nothing queued. The three inputs are: no
+    versioned document yet, a gap after an unrelated field, and a
+    reconnect that used to keep the old baseline counts.
+    """
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+    assert hoods[0]._shadow_version is None
+
+    await hoods[0].async_set_light(1)
+    await hoods[0].async_set_light(1)
+    _echo(client, hoods[0], 2, {"light": 1})
+    assert len(hoods[0]._pending_writes) == 1
+    assert hoods[0]._pending_writes[0].ordinal == 0
+    _echo(
+        client,
+        hoods[0],
+        3,
+        {"light": 0, "usegreasefiltertime": 700},
+        snapshot=True,
+    )
+    assert hoods[0].state.light == 0
+    assert hoods[0].state.use_grease_filter_time == 700
+    assert hoods[0]._pending_writes == []
+
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+    _echo(
+        client,
+        hoods[0],
+        10,
+        {"light": 0, "fan": 0, "usegreasefiltertime": 642},
+        snapshot=True,
+    )
+    await hoods[0].async_set_light(1)
+    await hoods[0].async_set_light(1)
+    _echo(client, hoods[0], 11, {"fan": 3})
+    assert len(hoods[0]._pending_writes) == 2
+    _echo(client, hoods[0], 13, {"light": 1})
+    assert len(hoods[0]._pending_writes) == 1
+    assert hoods[0]._pending_writes[0].ordinal == 0
+    _echo(
+        client,
+        hoods[0],
+        14,
+        {"light": 0, "fan": 0, "usegreasefiltertime": 700},
+        snapshot=True,
+    )
+    assert hoods[0].state.light == 0
+    assert hoods[0].state.fan == 0
+    assert hoods[0].state.use_grease_filter_time == 700
+    assert hoods[0]._pending_writes == []
+
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+    _echo(
+        client,
+        hoods[0],
+        10,
+        {"light": 0, "fan": 0, "usegreasefiltertime": 642},
+        snapshot=True,
+    )
+    await hoods[0].async_set_light(1)
+    await hoods[0].async_set_light(1)
+    hoods[0].handle_connection_change(False)
+    assert hoods[0]._pending_writes == []
+    assert hoods[0]._baseline_counts == {}
+    assert hoods[0]._confirmed_seq == {}
+    assert hoods[0]._consumed_echo_versions == set()
+    await hoods[0].async_set_light(1)
+    await hoods[0].async_set_light(1)
+    assert [pending.ordinal for pending in hoods[0]._pending_writes] == [0, 1]
+    _echo(client, hoods[0], 12, {"light": 1})
+    assert len(hoods[0]._pending_writes) == 1
+    assert hoods[0]._pending_writes[0].ordinal == 0
+    _echo(
+        client,
+        hoods[0],
+        13,
+        {"light": 0, "usegreasefiltertime": 700},
+        snapshot=True,
+    )
+    assert hoods[0].state.light == 0
+    assert hoods[0].state.use_grease_filter_time == 700
+    assert hoods[0]._pending_writes == []
+
+
+async def test_split_echoes_of_one_command_retire_it_before_the_get(wired):
+    """Tests that partial echoes of one multi-key command retire it.
+
+    Version 11 carrying only light, then version 12 carrying only fan,
+    used to leave ``{light: 1, fan: 2}`` pending, and the GET stayed
+    covered. Either order has to retire the command. A redelivery of the
+    light partial must not fill a new key or retire anything else.
+    """
+    orders = (
+        ((11, {"light": 1}), (12, {"fan": 2})),
+        ((12, {"fan": 2}), (11, {"light": 1})),
+    )
+    for first, second in orders:
+        client = _client()
+        hoods = await client.async_setup()
+        await hoods[0].async_start()
+        _echo(
+            client,
+            hoods[0],
+            10,
+            {"light": 0, "fan": 0, "usegreasefiltertime": 642},
+            snapshot=True,
+        )
+        await hoods[0].async_set_fields({"light": 1, "fan": 2})
+        version, reported = first
+        _echo(client, hoods[0], version, reported)
+        assert len(hoods[0]._pending_writes) == 1
+        _echo(client, hoods[0], version, reported)
+        assert len(hoods[0]._pending_writes) == 1
+        version, reported = second
+        _echo(client, hoods[0], version, reported)
+        assert hoods[0]._pending_writes == []
+        _echo(
+            client,
+            hoods[0],
+            13,
+            {"light": 0, "fan": 0, "usegreasefiltertime": 700},
+            snapshot=True,
+        )
+        assert hoods[0].state.light == 0
+        assert hoods[0].state.fan == 0
+        assert hoods[0].state.use_grease_filter_time == 700
+        assert hoods[0]._pending_writes == []
+
+
+async def test_a_partial_expected_echo_is_not_spent_on_the_older_subset(wired):
+    """Tests that a partial of the later command does not retire the earlier one.
+
+    ``light=1`` then ``{light: 1, fan: 2}``. Version 12 carrying only
+    light belongs to the superset. Spending it on the older ``light=1``
+    consumes 12, and the superset then never sees fan. The older command
+    has to wait for version 11. Version 13 carrying fan retires the
+    superset, and the GET shows both fields off.
+    """
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+    _echo(
+        client,
+        hoods[0],
+        10,
+        {"light": 0, "fan": 0, "usegreasefiltertime": 642},
+        snapshot=True,
+    )
+    await hoods[0].async_set_light(1)
+    await hoods[0].async_set_fields({"light": 1, "fan": 2})
+    _echo(client, hoods[0], 12, {"light": 1})
+    assert [pending.fields for pending in hoods[0]._pending_writes] == [
+        {"light": 1},
+        {"light": 1, "fan": 2},
+    ]
+    assert hoods[0]._pending_writes[1].seen == {"light": 12}
+    _echo(client, hoods[0], 12, {"light": 1})
+    assert len(hoods[0]._pending_writes) == 2
+    assert hoods[0]._pending_writes[1].seen == {"light": 12}
+
+    _echo(client, hoods[0], 11, {"light": 1})
+    assert [pending.fields for pending in hoods[0]._pending_writes] == [
+        {"light": 1, "fan": 2}
+    ]
+    _echo(client, hoods[0], 13, {"fan": 2})
+    assert hoods[0]._pending_writes == []
+    _echo(
+        client,
+        hoods[0],
+        14,
+        {"light": 0, "fan": 0, "usegreasefiltertime": 700},
+        snapshot=True,
+    )
+    assert hoods[0].state.light == 0
+    assert hoods[0].state.fan == 0
+    assert hoods[0].state.use_grease_filter_time == 700
+    assert hoods[0]._pending_writes == []
+
+
+async def test_one_document_retires_a_later_command_that_adds_a_key(wired):
+    """Tests that a document which contains a later superset retires it.
+
+    ``light=1`` then ``{light: 1, fan: 2}``, and version 11 carries both
+    plus power. Retiring only the subset leaves the superset pending over
+    the version-12 GET. The same two commands still clear when the full
+    document is version 12 and the light echo is version 11. One
+    ``{light: 1}`` still must not retire two ``light=1`` writes; that
+    case is ``test_a_redelivered_echo_does_not_retire_the_next_same_value``.
+    """
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+    _echo(
+        client,
+        hoods[0],
+        10,
+        {"light": 0, "fan": 0, "usegreasefiltertime": 642},
+        snapshot=True,
+    )
+    await hoods[0].async_set_light(1)
+    await hoods[0].async_set_fields({"light": 1, "fan": 2})
+    _echo(client, hoods[0], 11, {"light": 1, "fan": 2, "power": 1})
+    assert hoods[0]._pending_writes == []
+    assert hoods[0].state.light == 1
+    assert hoods[0].state.fan == 2
+    _echo(
+        client,
+        hoods[0],
+        12,
+        {"light": 0, "fan": 0, "usegreasefiltertime": 700},
+        snapshot=True,
+    )
+    assert hoods[0].state.light == 0
+    assert hoods[0].state.fan == 0
+    assert hoods[0].state.use_grease_filter_time == 700
+    assert hoods[0]._pending_writes == []
+
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+    _echo(
+        client,
+        hoods[0],
+        10,
+        {"light": 0, "fan": 0, "usegreasefiltertime": 642},
+        snapshot=True,
+    )
+    await hoods[0].async_set_light(1)
+    await hoods[0].async_set_fields({"light": 1, "fan": 2})
+    _echo(client, hoods[0], 12, {"light": 1, "fan": 2, "power": 1})
+    assert [pending.fields for pending in hoods[0]._pending_writes] == [{"light": 1}]
+    _echo(client, hoods[0], 11, {"light": 1})
+    assert hoods[0]._pending_writes == []
+    _echo(
+        client,
+        hoods[0],
+        13,
+        {"light": 0, "fan": 0, "usegreasefiltertime": 700},
+        snapshot=True,
+    )
+    assert hoods[0].state.light == 0
+    assert hoods[0].state.fan == 0
+    assert hoods[0].state.use_grease_filter_time == 700
+
+
 async def test_a_missed_echo_on_automatic_reconnect_does_not_hide_the_get(wired):
     """Tests that paho's own reconnect drops the dead session's commands.
 

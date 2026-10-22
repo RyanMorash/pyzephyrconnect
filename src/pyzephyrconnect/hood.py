@@ -33,9 +33,13 @@ class _PendingWrite:
     that was in flight before the command, is not its echo. ``ordinal`` is
     this command's place among writes that share that baseline: the echo
     AWS assigns it is ``baseline + ordinal + 1``, and a later version can
-    arrive before an earlier one. ``seq`` is the publish order across
+    arrive before an earlier one.     ``seq`` is the publish order across
     every baseline, which is what keeps an older command from covering a
-    newer one that has already been confirmed.
+    newer one that has already been confirmed. ``seen`` records each key
+    a newer ``update/accepted`` has already carried at this command's
+    value, and the version that carried it. One multi-key command is
+    often echoed as several partial documents. A repeated version for a
+    key already recorded fills nothing new.
     """
 
     def __init__(
@@ -59,6 +63,7 @@ class _PendingWrite:
         self.fields = fields
         self.seq = seq
         self.ordinal = ordinal
+        self.seen: dict[str, int] = {}
 
 
 def _echo_matches(pending: _PendingWrite, reported: dict[str, Any]) -> bool:
@@ -104,6 +109,151 @@ def _version_confirms(version: object, baseline: int | None) -> bool:
     if baseline is None:
         return True
     return version > baseline
+
+
+def _expected_version(pending: _PendingWrite) -> int | None:
+    """Returns the shadow version that belongs to this command.
+
+    Args:
+        pending: The command being considered.
+
+    Returns:
+        ``baseline + ordinal + 1``, or None when this command was
+        published before any versioned document had been applied.
+    """
+    if pending.baseline is None:
+        return None
+    return pending.baseline + pending.ordinal + 1
+
+
+def _echo_conflicts(pending: _PendingWrite, reported: dict[str, Any]) -> bool:
+    """Reports whether this document contradicts the command.
+
+    A key the document omits is not a contradiction. A different value
+    for a key the command published is: noting the keys that do match
+    would let a later partial complete a command this document refused.
+
+    Args:
+        pending: The command being considered.
+        reported: The reported object from ``update/accepted``.
+
+    Returns:
+        True when some published key is present and not equal.
+    """
+    return any(
+        key in reported and reported[key] != value
+        for key, value in pending.fields.items()
+    )
+
+
+def _echo_has_value(pending: _PendingWrite, reported: dict[str, Any]) -> bool:
+    """Reports whether this document carries any of the command's values.
+
+    Args:
+        pending: The command being considered.
+        reported: The reported object from ``update/accepted``.
+
+    Returns:
+        True when at least one published key is present and equal.
+    """
+    return any(
+        key in reported and reported[key] == value
+        for key, value in pending.fields.items()
+    )
+
+
+def _note_echo_keys(
+    pending: _PendingWrite, version: int, reported: dict[str, Any]
+) -> bool:
+    """Records keys this document carries at the command's values.
+
+    A key already recorded is left alone, including when this is the
+    same version again. The command is complete once every key it
+    published has been seen on some newer echo.
+
+    Args:
+        pending: The command being updated.
+        version: The document version. Callers pass one newer than the
+            command's baseline.
+        reported: The reported object from ``update/accepted``.
+
+    Returns:
+        True when every field the command published has been seen.
+    """
+    if not _version_confirms(version, pending.baseline):
+        return False
+    for key, value in pending.fields.items():
+        if key in pending.seen:
+            continue
+        if key in reported and reported[key] == value:
+            pending.seen[key] = version
+    return set(pending.fields) <= set(pending.seen)
+
+
+def _record_echo(
+    pending: _PendingWrite,
+    version: int,
+    reported: dict[str, Any],
+    retired: list[_PendingWrite],
+    retired_sets: list[frozenset[str]],
+) -> bool:
+    """Retires ``pending`` or remembers the keys this document confirmed.
+
+    A full match retires immediately. A partial match remembers the
+    keys and retires only once every key has been seen, including on
+    an earlier echo. A document that adds nothing new records nothing:
+    a QoS 1 redelivery must not retire the next command.
+
+    Args:
+        pending: The command this document may confirm.
+        version: The document version.
+        reported: The reported object from ``update/accepted``.
+        retired: Commands this pass has retired. Appended to.
+        retired_sets: Field sets of those commands. Appended to.
+
+    Returns:
+        True when this document newly recorded or retired the command.
+    """
+    if pending in retired or _echo_conflicts(pending, reported):
+        return False
+    if _echo_matches(pending, reported):
+        retired.append(pending)
+        retired_sets.append(frozenset(pending.fields))
+        return True
+    before = len(pending.seen)
+    complete = _note_echo_keys(pending, version, reported)
+    if len(pending.seen) == before:
+        return False
+    if complete:
+        retired.append(pending)
+        retired_sets.append(frozenset(pending.fields))
+    return True
+
+
+def _later_command_fits(pending: _PendingWrite, claimed: list[frozenset[str]]) -> bool:
+    """Reports whether a later command may retire from this same document.
+
+    One ``{light: 1}`` must not acknowledge two ``light=1`` writes.
+    A later command that publishes the same fields is skipped. A later
+    command that only overlaps those fields is skipped too, unless it
+    adds a key: ``{light: 1, fan: 2}`` is in the document that echoed
+    ``{light: 1}``, and leaving it pending paints both values over the
+    next GET. A command on a different key is independent and may
+    retire from the same document.
+
+    Args:
+        pending: A command published after the one this version names.
+        claimed: Field sets already taken by this document, including
+            the version's own command.
+
+    Returns:
+        True when ``pending`` adds a key or shares no key with
+        ``claimed``.
+    """
+    fields = frozenset(pending.fields)
+    if any(fields == existing for existing in claimed):
+        return False
+    return all(not (fields & existing) or fields > existing for existing in claimed)
 
 
 def _prepares_offline(shadow: object) -> bool:
@@ -175,24 +325,31 @@ class Hood:
         # Commands whose echo has not arrived, oldest first. The echo that
         # belongs to a command is the shadow version ``baseline + ordinal +
         # 1``: two writes at version 10 are accepted as 11 and 12, and 12
-        # can arrive before 11. Raising the later command's baseline to 12
-        # makes 11 unable to retire it, and the pending value then hides
-        # every newer report of that key. A version is consumed once, so a
-        # QoS 1 redelivery cannot retire the next write of the same value.
-        # One document can still carry two different keys. PROTOCOL.md
-        # records the echo as ``state.reported``; it does not echo a
-        # clientToken, so none is sent. The queue is dropped when the
-        # session that published it is gone; a later GET must be able to
-        # show what the device or the phone did during the outage.
-        # Dangerous fields are never entered here.
+        # can arrive before 11. Spending 12 on the older write leaves the
+        # newer one in the overlay, and a later GET stays covered. A
+        # version no command expects retires nothing older than the newest
+        # command that is still pending for every key it carries. A
+        # version is consumed once, so a QoS 1 redelivery cannot retire
+        # the next write of the same value. One document can still carry
+        # two different keys, and one multi-key command can be retired by
+        # several partial echoes. PROTOCOL.md records the echo as
+        # ``state.reported``; it does not echo a clientToken, so none is
+        # sent. The queue is dropped when the session that published it is
+        # gone; a later GET must be able to show what the device or the
+        # phone did during the outage. Dangerous fields are never entered
+        # here.
         self._pending_writes: list[_PendingWrite] = []
         self._next_pending_seq = 1
         # How many commands have been published at each baseline. The
         # ordinal is stable after an earlier command retires, so a late
-        # echo still names the command it belongs to.
+        # echo still names the command it belongs to. Cleared with the
+        # queue when the session that published those commands is gone:
+        # leaving the count makes the next session's first write expect
+        # the version that belonged to a command already dropped.
         self._baseline_counts: dict[int | None, int] = {}
-        # Versions already used to retire a command. A redelivery of one
-        # of them must not retire whatever is still queued.
+        # Versions already applied to a queued command, including a
+        # partial echo that recorded some of its keys. A redelivery must
+        # not record those keys again or retire whatever is still queued.
         self._consumed_echo_versions: set[int] = set()
         # Publish sequence of the newest command retired for this key.
         # An older command stays queued so its own echo can still match
@@ -765,7 +922,8 @@ class Hood:
             ZephyrWriteError: If fields is empty or names a field outside
                 const.WRITABLE_FIELDS.
         """
-        if self._shadow is None:
+        shadow = self._shadow
+        if shadow is None:
             # No thing name in the message: it identifies a home, and
             # exception text ends up in logs users paste publicly.
             raise ZephyrNotConnectedError(
@@ -785,26 +943,24 @@ class Hood:
                 ", ".join(sorted(destructive)),
             )
         try:
-            await self._shadow.publish_state(dict(fields))
-        except ZephyrNotConnectedError:
+            await shadow.publish_state(dict(fields))
+        except (ZephyrNotConnectedError, asyncio.CancelledError):
             # The shadow refused the write and destroyed its own connection
             # to do it (a message paho had already queued can only be
-            # un-scheduled by discarding the client object it lives in). The
-            # ShadowClient survives that with no paho client inside it, and
-            # _shadow staying set is the shape nothing recovers from:
-            # async_ensure_running declines to rebuild while _shadow is not
-            # None, and needs_represign sees a generation that still matches,
-            # so push would stay dark until the next credential rotation.
-            # Put it back in the no-socket shape the supervisor knows how to
-            # recover from - the same move _start makes when its own initial
-            # request_state fails - and let the next tick rebuild.
+            # un-scheduled by discarding the client object it lives in).
+            # CancelledError is the same teardown: disconnect waits out
+            # loop_stop and then raises, and that is not a
+            # ZephyrNotConnectedError. The ShadowClient survives either
+            # one with no paho client inside it. _shadow staying set is
+            # the shape nothing recovers from: async_ensure_running
+            # declines to rebuild while _shadow is not None, and
+            # needs_represign sees a generation that still matches, so
+            # push would stay dark until the next credential rotation.
             #
-            # Cleared here rather than awaited away: the connection is
-            # already gone, and reporting connected=True with no socket
-            # misleads the derived client.connected.
-            self._shadow = None
-            self._connected = False
-            self.discard_unconfirmed_writes()
+            # After the await, not before. The join is inside
+            # publish_state. Clearing first would let the next session
+            # open while loop_stop is still running.
+            self._forget_dead_shadow(shadow)
             raise
         # Only after the publish was accepted into paho's queue. The
         # NO_CONN path above tears the client down so a qos>0 message
@@ -905,11 +1061,20 @@ class Hood:
         A write that lands after this drop belongs to the new session and
         stays pending over that GET. The visible cache is rebuilt from
         reported state, so the dropped values do not linger until that GET.
+
+        The baseline counts, consumed echo versions, and per-key
+        confirmations belong to the dropped commands. Leaving the counts
+        makes the next write at this baseline expect a version that was
+        already assigned, and a non-contiguous echo of the new value is
+        then spent on the wrong command.
         """
-        if not self._pending_writes:
-            return
+        pending = bool(self._pending_writes)
         self._pending_writes.clear()
-        self._publish_visible()
+        self._baseline_counts.clear()
+        self._consumed_echo_versions.clear()
+        self._confirmed_seq.clear()
+        if pending:
+            self._publish_visible()
 
     def reported_fields_to_apply(
         self, version: object, reported: dict[str, Any]
@@ -1048,7 +1213,10 @@ class Hood:
         The returned state is authoritative. ``handle_state`` lays the
         commands that are still ahead of a newer confirmation of their
         key over it. An older command kept for echo matching is not part
-        of that layer.
+        of that layer. A GET does not retire, but it does drop a command
+        a newer echo has already superseded once this snapshot is past
+        the version that command was waiting for. Otherwise that command
+        stays queued after the GET that should have replaced it.
 
         Args:
             state: The state parsed from the document, without optimistic
@@ -1065,7 +1233,107 @@ class Hood:
         """
         if echoed:
             self._retire_echo(version, reported)
+        else:
+            self._drop_superseded_commands(version)
         return state
+
+    def _assign_unversioned_baselines(self, version: int) -> None:
+        """Gives baseline-None commands an expected version.
+
+        Writes sent before any numbered document have no baseline, so
+        every integer used to look like an echo and the oldest matching
+        value took it. The first numbered document is the end of that
+        run: two such writes and version 2 belong to versions 1 and 2.
+        Mixed with commands that already have a baseline, those
+        baselines stay put. Reassigning them would make two commands
+        expect the same version.
+
+        Args:
+            version: The document version that just arrived.
+        """
+        if any(pending.baseline is not None for pending in self._pending_writes):
+            return
+        span = max(pending.ordinal for pending in self._pending_writes) + 1
+        baseline = version - span
+        for pending in self._pending_writes:
+            pending.baseline = baseline
+        self._baseline_counts.pop(None, None)
+        counted = self._baseline_counts.get(baseline, 0)
+        self._baseline_counts[baseline] = max(counted, span)
+
+    def _command_is_newest_for_its_keys(self, pending: _PendingWrite) -> bool:
+        """Reports whether no newer command still shares one of these keys.
+
+        A document that matches no expected version may retire only this
+        command. Retiring an older equal value leaves the newer repeat
+        in the overlay, which is what hides the next GET.
+
+        Args:
+            pending: The command being considered.
+
+        Returns:
+            True when ``pending`` is the newest queued command for every
+            key it published.
+        """
+        keys = set(pending.fields)
+        return all(
+            other.seq <= pending.seq or not keys & set(other.fields)
+            for other in self._pending_writes
+        )
+
+    def _forget_dead_shadow(self, shadow: ShadowClient) -> None:
+        """Drops a session whose disconnect has already finished.
+
+        ``publish_state`` and ``request_state`` tear the paho client down
+        before they raise. ``CancelledError`` is that teardown finishing
+        after the caller was cancelled, the same hollow client as
+        ``ZephyrNotConnectedError``: ``_shadow`` still set, nothing inside
+        it, and ``async_ensure_running`` will not open another session.
+        ``needs_represign`` does not either while the generation still
+        matches. A session that has already replaced this one is left
+        alone. Pending commands published on it are dropped with it.
+
+        Args:
+            shadow: The session the failed publish or reread was using.
+        """
+        if self._shadow is not shadow:
+            return
+        self._shadow = None
+        self._connected = False
+        self.discard_unconfirmed_writes()
+
+    def _drop_superseded_commands(self, version: object) -> None:
+        """Drops commands a newer snapshot has already replaced.
+
+        An older repeated write stays queued so its own echo can still
+        match it, and it does not paint once a newer command for that
+        key has been confirmed. A GET newer than the version that older
+        command was waiting for is not going to be followed by that
+        echo as a document this client still has to apply. Leaving the
+        command queued makes the next equal echo look like it still has
+        work to do. A command that is still the newest for its key is
+        kept: this GET must not confirm a write that has not been echoed.
+
+        Args:
+            version: The GET's ``version``, or None when it had none.
+        """
+        if isinstance(version, bool) or not isinstance(version, int):
+            return
+        kept: list[_PendingWrite] = []
+        for pending in self._pending_writes:
+            expected = _expected_version(pending)
+            if expected is None or expected >= version or not pending.fields:
+                kept.append(pending)
+                continue
+            superseded = True
+            for key in pending.fields:
+                confirmed = self._confirmed_seq.get(key)
+                if confirmed is None or pending.seq >= confirmed:
+                    superseded = False
+                    break
+            if not superseded:
+                kept.append(pending)
+        self._pending_writes = kept
 
     def _retire_echo(self, version: object, reported: object) -> None:
         """Retires the commands this version echoes.
@@ -1078,17 +1346,22 @@ class Hood:
         12 to the first write and leaves the second pending over a later
         ``light=0``.
 
-        A repeated delivery of a version already consumed retires nothing.
-        Raising the survivor's baseline to the consumed version was the
-        previous guard, and it is what made the older echo miss. The
-        baseline stays where the command was published.
+        A document that is not the expected version of any queued command
+        does not fall through to that oldest value. It retires a command
+        only when that command is the newest one still pending for every
+        key it carries, which is how a gap between two light echoes still
+        clears the later write. An unrelated field at the version a light
+        command expected leaves the queue alone.
 
-        A document can also carry a key that belongs to a different
-        ordinal, which is the combined ``light`` and ``fan`` echo. At
-        most one command per key: the second ``light=1`` stays queued for
-        its own version. Commands that do not match keep their place,
-        including ones queued ahead of a match, so a fan echo can still
-        arrive before the light echo.
+        A partial document records the keys it carries and does not hand
+        the version to an older command. The command retires when every
+        key has been seen. One document can still retire a later command
+        that adds a key, or a command on a different key, when every
+        field of that command is in the document. It cannot retire a
+        second command that published the same fields.
+
+        A repeated delivery of a version already consumed retires nothing.
+        The baseline stays where the command was published.
 
         Args:
             version: The document's ``version``, or None.
@@ -1100,36 +1373,58 @@ class Hood:
             return
         if version in self._consumed_echo_versions:
             return
+        self._assign_unversioned_baselines(version)
         retired: list[_PendingWrite] = []
-        retired_keys: set[str] = set()
-        for pending in self._pending_writes:
-            if pending.baseline is None:
-                continue
-            if version != pending.baseline + pending.ordinal + 1:
-                continue
-            if not _version_confirms(version, pending.baseline):
-                continue
-            if not _echo_matches(pending, reported):
-                break
-            retired.append(pending)
-            retired_keys.update(pending.fields)
-            break
-        for pending in self._pending_writes:
-            if pending in retired:
-                continue
-            if not _version_confirms(version, pending.baseline):
-                continue
-            if set(pending.fields) & retired_keys:
-                continue
-            if not _echo_matches(pending, reported):
-                continue
-            retired.append(pending)
-            retired_keys.update(pending.fields)
-        if not retired:
+        retired_sets: list[frozenset[str]] = []
+        recorded = False
+        owner = next(
+            (
+                pending
+                for pending in self._pending_writes
+                if _expected_version(pending) == version
+            ),
+            None,
+        )
+        if owner is not None:
+            # The version belongs to this command. A contradiction or a
+            # total miss must not be spent on an older command that
+            # happens to carry the same values.
+            if _echo_conflicts(owner, reported):
+                return
+            if not _echo_matches(owner, reported) and not _echo_has_value(
+                owner, reported
+            ):
+                return
+            recorded = _record_echo(owner, version, reported, retired, retired_sets)
+            claimed = [frozenset(owner.fields), *retired_sets]
+            for pending in self._pending_writes:
+                if pending.seq <= owner.seq or pending in retired:
+                    continue
+                if not _later_command_fits(pending, claimed):
+                    continue
+                if _record_echo(pending, version, reported, retired, retired_sets):
+                    recorded = True
+                    claimed.append(frozenset(pending.fields))
+        else:
+            for pending in self._pending_writes:
+                if not self._command_is_newest_for_its_keys(pending):
+                    continue
+                if not _version_confirms(version, pending.baseline):
+                    continue
+                if any(
+                    frozenset(pending.fields) == existing for existing in retired_sets
+                ):
+                    continue
+                if _record_echo(pending, version, reported, retired, retired_sets):
+                    recorded = True
+        if not recorded:
             return
         # Consumed before the queue changes, so a re-entrant delivery of
-        # this same version cannot retire the command that is still there.
+        # this same version cannot retire the command that is still there
+        # or fill a key a partial echo already recorded.
         self._consumed_echo_versions.add(version)
+        if not retired:
+            return
         retire_ids = {id(pending) for pending in retired}
         self._pending_writes = [
             pending for pending in self._pending_writes if id(pending) not in retire_ids
@@ -1207,21 +1502,24 @@ class Hood:
             ZephyrNotConnectedError: The GET was refused and, when
                 ``shadow`` was still the live session, the hood was
                 returned to the no-socket shape the supervisor rebuilds.
+            asyncio.CancelledError: The caller was cancelled. The join
+                finishes first, and the same no-socket shape is left
+                behind when ``shadow`` was still the live session.
         """
         async with self._lock:
             if self._shadow is not shadow:
                 return
             try:
                 await shadow.request_state()
-            except ZephyrNotConnectedError:
-                # request_state already disconnected. Clear only the matching
-                # reference, still inside this lock, so a supervisor tick
-                # cannot observe a hollow client and also cannot open the
-                # next session until that disconnect has finished.
-                if self._shadow is shadow:
-                    self._shadow = None
-                    self._connected = False
-                    self.discard_unconfirmed_writes()
+            except (ZephyrNotConnectedError, asyncio.CancelledError):
+                # request_state already disconnected, including when this
+                # task was cancelled: the join finishes before
+                # CancelledError propagates. Clear only the matching
+                # reference, still inside this lock, and only now, so a
+                # supervisor tick cannot observe a hollow client and also
+                # cannot open the next session until that disconnect has
+                # finished.
+                self._forget_dead_shadow(shadow)
                 raise
 
     def _consume_reread(self, task: asyncio.Task[None]) -> None:

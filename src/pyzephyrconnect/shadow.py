@@ -398,8 +398,8 @@ class ShadowClient:
         Uses the URL and context from ``prepare_transport`` when they are
         already built, so a caller can presign before tearing the previous
         session down. Two live sessions that share a client ID evict each
-        other, so this must not run until that previous ``disconnect`` has
-        finished. This method does not overlap them.
+        other. ``disconnect`` clears the paho client before ``loop_stop``
+        joins, so this waits out that join before building the next client.
 
         Args:
             timeout: Seconds to wait for the CONNACK before giving up.
@@ -408,6 +408,7 @@ class ShadowClient:
             ZephyrTransportError: The CONNACK did not arrive in time.
         """
         self._loop = asyncio.get_running_loop()
+        await self._wait_for_in_flight_disconnect()
         if self._client is not None:
             # Same object reconnecting. A second paho client would leak the
             # first network thread and reuse stale readiness events.
@@ -518,7 +519,9 @@ class ShadowClient:
         returns to callers at CONNACK so a command is not stuck behind the
         subscription wait. First start and direct callers still wait here,
         so a ``connect()`` that returns has a session that can both publish
-        and receive.
+        and receive. An in-flight ``loop_stop`` on this object is finished
+        before the next paho client is built. Two sessions must not share
+        the client ID.
 
         Args:
             timeout: Seconds to wait for the CONNACK, and again for the
@@ -532,12 +535,30 @@ class ShadowClient:
                 identity.
         """
         self._loop = asyncio.get_running_loop()
+        await self._wait_for_in_flight_disconnect()
         if self._client is not None:
             # Connecting over a live client would leak its network thread.
             await self.disconnect()
         await self.prepare_transport()
         await self.open_until_connack(timeout)
         await self.finish_subscriptions(timeout)
+
+    async def _wait_for_in_flight_disconnect(self) -> None:
+        """Waits out ``loop_stop`` when this object is already closing.
+
+        ``disconnect`` clears the paho client before the first await, and
+        until now it was the only method that waited on ``_closing`` in
+        that window. ``connect`` and ``open_until_connack`` saw no client
+        and called ``connect_async`` while ``loop_stop`` was still
+        joining, so two sessions shared this client ID.
+
+        Raises:
+            asyncio.CancelledError: This caller was cancelled. The join
+                has finished first, and no new client has been built.
+        """
+        closing = self._closing
+        if closing is not None:
+            await self._await_closing(closing)
 
     async def disconnect(self) -> None:
         """Tears down the paho client and joins its network thread.
