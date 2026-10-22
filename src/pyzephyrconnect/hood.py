@@ -126,22 +126,37 @@ def _expected_version(pending: _PendingWrite) -> int | None:
     return pending.baseline + pending.ordinal + 1
 
 
-def _echo_conflicts(pending: _PendingWrite, reported: dict[str, Any]) -> bool:
+def _echo_conflicts(
+    pending: _PendingWrite,
+    reported: dict[str, Any],
+    only_keys: frozenset[str] | None = None,
+) -> bool:
     """Reports whether this document contradicts the command.
 
     A key the document omits is not a contradiction. A different value
     for a key the command published is: noting the keys that do match
     would let a later partial complete a command this document refused.
+    A key already recorded in ``pending.seen`` is not part of that check.
+    The device can change it while the remaining keys are still arriving,
+    and treating the new value as a refusal drops the key this document
+    did confirm. ``only_keys`` is the same limit ``_note_echo_keys``
+    uses: a superseded key, one a later command published, must not
+    refuse the independent key this document is allowed to record.
 
     Args:
         pending: The command being considered.
         reported: The reported object from ``update/accepted``.
+        only_keys: When set, only these keys can contradict. None
+            considers every key the command published.
 
     Returns:
-        True when some published key is present and not equal.
+        True when some still-unconfirmed key is present and not equal.
     """
     return any(
-        key in reported and reported[key] != value
+        key not in pending.seen
+        and (only_keys is None or key in only_keys)
+        and key in reported
+        and reported[key] != value
         for key, value in pending.fields.items()
     )
 
@@ -234,7 +249,7 @@ def _record_echo(
     Returns:
         True when this document newly recorded or retired the command.
     """
-    if pending in retired or _echo_conflicts(pending, reported):
+    if pending in retired or _echo_conflicts(pending, reported, only_keys):
         return False
     if _echo_matches(pending, reported):
         # This return never reaches ``_note_echo_keys``. The partial
@@ -261,10 +276,13 @@ def _later_command_fits(pending: _PendingWrite, claimed: list[frozenset[str]]) -
     One ``{light: 1}`` must not acknowledge two ``light=1`` writes.
     A later command that publishes the same fields is skipped. A later
     command that only overlaps those fields is skipped too, unless it
-    adds a key: ``{light: 1, fan: 2}`` is in the document that echoed
-    ``{light: 1}``, and leaving it pending paints both values over the
-    next GET. A command on a different key is independent and may
-    retire from the same document.
+    adds a key. A command on a different key is independent. Callers
+    that are only noting a partial still have to reject an overlap:
+    a superset may reuse a claimed field only when this same document
+    carries every key the superset published. Collecting ``light`` from
+    version 11 and ``fan`` from version 13 retires ``{light: 1, fan: 2}``
+    before its own echo, and the visible light falls back to the earlier
+    command.
 
     Args:
         pending: A command published after the one this version names.
@@ -279,6 +297,20 @@ def _later_command_fits(pending: _PendingWrite, claimed: list[frozenset[str]]) -
     if any(fields == existing for existing in claimed):
         return False
     return all(not (fields & existing) or fields > existing for existing in claimed)
+
+
+def _overlaps_claimed(pending: _PendingWrite, claimed: list[frozenset[str]]) -> bool:
+    """Reports whether ``pending`` shares a key with a field set already taken.
+
+    Args:
+        pending: A command this document may also confirm.
+        claimed: Field sets already taken by this document.
+
+    Returns:
+        True when any published key is already claimed.
+    """
+    fields = frozenset(pending.fields)
+    return any(fields & existing for existing in claimed)
 
 
 def _prepares_offline(shadow: object) -> bool:
@@ -355,7 +387,11 @@ class Hood:
         # version no command expects retires nothing older than the newest
         # command that is still pending for every key it carries. A
         # version is consumed once, so a QoS 1 redelivery cannot retire
-        # the next write of the same value. One document can still carry
+        # the next write of the same value. That expected version is not
+        # exclusive: an unrelated update can take it, and the echo then
+        # arrives later. A version already seen as that kind of miss is
+        # remembered so the late echo is not handed to whichever command
+        # the arithmetic now points at. One document can still carry
         # two different keys, and one multi-key command can be retired by
         # several partial echoes. PROTOCOL.md records the echo as
         # ``state.reported``; it does not echo a clientToken, so none is
@@ -376,6 +412,15 @@ class Hood:
         # partial echo that recorded some of its keys. A redelivery must
         # not record those keys again or retire whatever is still queued.
         self._consumed_echo_versions: set[int] = set()
+        # Expected versions that arrived as something else: an unrelated
+        # update, or a document that contradicted the command the
+        # arithmetic named. The echo of that command shows up later, and
+        # treating ``baseline + ordinal + 1`` as exclusive ownership
+        # retires the newest repeat instead. Cleared with the queue.
+        # Leaving a miss behind makes the next session's first
+        # non-contiguous echo look like the delayed command from the
+        # session that already died.
+        self._missed_echo_versions: set[int] = set()
         # Publish sequence of the newest command retired for this key.
         # An older command stays queued so its own echo can still match
         # it, and is left out of the visible cache. A newer command is
@@ -1087,16 +1132,20 @@ class Hood:
         stays pending over that GET. The visible cache is rebuilt from
         reported state, so the dropped values do not linger until that GET.
 
-        The baseline counts, consumed echo versions, and per-key
-        confirmations belong to the dropped commands. Leaving the counts
-        makes the next write at this baseline expect a version that was
-        already assigned, and a non-contiguous echo of the new value is
-        then spent on the wrong command.
+        The baseline counts, consumed echo versions, missed expected
+        versions, and per-key confirmations belong to the dropped
+        commands. Leaving the counts makes the next write at this
+        baseline expect a version that was already assigned, and a
+        non-contiguous echo of the new value is then spent on the wrong
+        command. Leaving a missed version does the same: the new
+        session's echo is treated as the delayed command from the
+        session that just died.
         """
         pending = bool(self._pending_writes)
         self._pending_writes.clear()
         self._baseline_counts.clear()
         self._consumed_echo_versions.clear()
+        self._missed_echo_versions.clear()
         self._confirmed_seq.clear()
         if pending:
             self._publish_visible()
@@ -1287,10 +1336,14 @@ class Hood:
         then shows ``light=2`` with nothing left to cover it. Several
         commands that share the value retire oldest first. A unique
         match retires that command even when a different value was
-        published before it. A partial notes only the oldest command
+        published before it.         A partial notes only the oldest command
         it fits, so the two halves of one multi-key write still meet.
-        Survivors stay unnumbered: assigning a baseline here would make
-        the next echo look like a back-calculated expected version.
+        A partial that overlaps a field set this document already claimed
+        is skipped. The full-match pass above is what may reuse a claimed
+        field, and only when the later command is entirely in this
+        document. Survivors stay unnumbered: assigning a baseline here
+        would make the next echo look like a back-calculated expected
+        version.
         ``claimed`` already holds field sets this document has taken,
         including a versioned command this version actually belongs to,
         so one ``{light: 1}`` does not also retire an unnumbered repeat.
@@ -1340,6 +1393,12 @@ class Hood:
         partials.sort(key=lambda pending: pending.seq)
         for pending in partials:
             if not _later_command_fits(pending, claimed):
+                continue
+            # Overlap is the full-match pass's job. Noting light from the
+            # first command's echo and fan from the third retires the
+            # later ``{light, fan}`` before the document that actually
+            # carries both, and the visible light falls back.
+            if _overlaps_claimed(pending, claimed):
                 continue
             if _record_echo(pending, version, reported, retired, retired_sets):
                 recorded = True
@@ -1512,6 +1571,239 @@ class Hood:
                 kept.append(pending)
         self._pending_writes = kept
 
+    def _oldest_same_fields_missed(self, owner: _PendingWrite) -> _PendingWrite | None:
+        """Returns an older repeat whose expected version already missed.
+
+        ``owner`` is the command ``baseline + ordinal + 1`` names, and
+        this document matches it. An unrelated update already took the
+        version an older command with the same fields was waiting for, so
+        this document is that older echo arriving late. Handing it to
+        ``owner`` retires the newest ``light=1`` of ``1 → 2 → 1`` and the
+        next document shows light 2.
+
+        Args:
+            owner: The command whose expected version is this document.
+
+        Returns:
+            The oldest queued command with the same fields whose expected
+            version is in ``_missed_echo_versions``, or None when this
+            document still belongs to ``owner``.
+        """
+        for pending in self._pending_writes:
+            if pending.seq >= owner.seq:
+                return None
+            if pending.fields != owner.fields:
+                continue
+            expected = _expected_version(pending)
+            if expected is not None and expected in self._missed_echo_versions:
+                return pending
+        return None
+
+    def _oldest_conflict_match(
+        self, owner: _PendingWrite, reported: dict[str, Any]
+    ) -> _PendingWrite | None:
+        """Returns the delayed echo this document carries when ``owner`` conflicts.
+
+        The arithmetic named ``owner``, and the document contradicts it.
+        An older command whose expected version was already a miss can
+        still be fully present. That is the first ``light=1`` arriving at
+        the version ``light=2`` was assigned. Only the oldest match is
+        taken. A newer repeat of the same fields stays queued for its own
+        document. A total miss, where ``owner``'s keys are absent, is not
+        this case: reconcile retires the newest independent key there,
+        and retiring the oldest as well would clear both copies.
+
+        Args:
+            owner: The command whose expected version is this document.
+            reported: The reported object from ``update/accepted``.
+
+        Returns:
+            The oldest older command this document fully matches whose
+            expected version was missed, or None.
+        """
+        for pending in self._pending_writes:
+            if pending.seq >= owner.seq:
+                return None
+            expected = _expected_version(pending)
+            if expected is None or expected not in self._missed_echo_versions:
+                continue
+            if _echo_matches(pending, reported):
+                return pending
+        return None
+
+    def _note_later_commands(
+        self,
+        after: _PendingWrite,
+        version: int,
+        reported: dict[str, Any],
+        retired: list[_PendingWrite],
+        retired_sets: list[frozenset[str]],
+        claimed: list[frozenset[str]],
+    ) -> bool:
+        """Records later commands this same document fully carries.
+
+        A later command that overlaps a field set already claimed may
+        retire only when every key it published is in this document. A
+        partial overlap would collect light from one command and fan from
+        another and finish ``{light: 1, fan: 2}`` before its own echo. A
+        command on keys nobody has claimed still notes a partial.
+
+        Args:
+            after: The command this version has already been given to.
+            version: The document version.
+            reported: The reported object from ``update/accepted``.
+            retired: Commands this pass has retired. Appended to.
+            retired_sets: Field sets of those commands. Appended to.
+            claimed: Field sets already taken. Appended to.
+
+        Returns:
+            True when this document newly recorded or retired a command.
+        """
+        recorded = False
+        for pending in self._pending_writes:
+            if pending.seq <= after.seq or pending in retired:
+                continue
+            if not _later_command_fits(pending, claimed):
+                continue
+            if _overlaps_claimed(pending, claimed) and not _echo_matches(
+                pending, reported
+            ):
+                continue
+            if _record_echo(pending, version, reported, retired, retired_sets):
+                recorded = True
+                claimed.append(frozenset(pending.fields))
+        return recorded
+
+    def _correlate_missed_versions(
+        self,
+        version: int,
+        reported: dict[str, Any],
+        retired: list[_PendingWrite],
+        retired_sets: list[frozenset[str]],
+    ) -> bool:
+        """Retires a command whose expected version was taken by something else.
+
+        No queued command expects ``version``. The document can still be
+        the echo that was pushed back when an unrelated update took its
+        slot. A newer command that published the same fields is left
+        alone: the gap path retires that newest repeat, and retiring the
+        older one here as well would clear both on one ``{light: 1}``.
+
+        Args:
+            version: The document version that just arrived.
+            reported: The reported object from ``update/accepted``.
+            retired: Commands this pass has retired. Appended to.
+            retired_sets: Field sets of those commands. Appended to.
+
+        Returns:
+            True when this document newly recorded or retired a command.
+        """
+        recorded = False
+        claimed = [frozenset(pending.fields) for pending in retired]
+        for pending in self._pending_writes:
+            if pending in retired or pending.baseline is None:
+                continue
+            expected = _expected_version(pending)
+            if expected is None or expected not in self._missed_echo_versions:
+                continue
+            if not _version_confirms(version, pending.baseline):
+                continue
+            if not _echo_matches(pending, reported):
+                continue
+            if any(
+                other.seq > pending.seq
+                and other not in retired
+                and other.fields == pending.fields
+                for other in self._pending_writes
+            ):
+                continue
+            if not _later_command_fits(pending, claimed):
+                continue
+            if _record_echo(pending, version, reported, retired, retired_sets):
+                recorded = True
+                claimed.append(frozenset(pending.fields))
+        return recorded
+
+    def _independent_keys(
+        self, pending: _PendingWrite, retired: list[_PendingWrite]
+    ) -> set[str]:
+        """Returns keys no newer command still publishes.
+
+        A later ``light=2`` supersedes ``light`` inside
+        ``{light: 1, fan: 2}``. Fan is still this command's to confirm.
+        Skipping the whole command because of the shared light leaves fan
+        pending over a GET of fan 0. A command already retired by this
+        document counts too: its keys stay taken.
+
+        Args:
+            pending: The command being considered.
+            retired: Commands this pass has already retired.
+
+        Returns:
+            Published keys no newer queued or just-retired command publishes.
+        """
+        later: set[str] = set()
+        for other in self._pending_writes:
+            if other is pending or other in retired:
+                continue
+            if other.seq > pending.seq:
+                later |= set(other.fields)
+        for done in retired:
+            if done.seq > pending.seq:
+                later |= set(done.fields)
+        return {key for key in pending.fields if key not in later}
+
+    def _retire_independent_keys(
+        self,
+        pending: _PendingWrite,
+        version: int,
+        reported: dict[str, Any],
+        retired: list[_PendingWrite],
+        retired_sets: list[frozenset[str]],
+    ) -> bool:
+        """Confirms keys a later command did not supersede.
+
+        The command is retired once every such key has been seen, even
+        when a superseded key is not in ``seen``. Requiring the shared
+        light as well skips the fan confirmation. An empty set means
+        every key is shared with a later command, which is the older of
+        two ``light=1`` writes, and that one must stay queued.
+
+        Args:
+            pending: The command being considered. Not the newest for
+                every key it published.
+            version: The document version.
+            reported: The reported object from ``update/accepted``.
+            retired: Commands this pass has retired. Appended to.
+            retired_sets: Field sets of those commands. Appended to.
+
+        Returns:
+            True when this document newly recorded or retired the command.
+        """
+        independent = self._independent_keys(pending, retired)
+        if not independent or not self._is_newest_for_keys(
+            pending, independent, retired
+        ):
+            return False
+        if any(
+            key in reported and reported[key] != pending.fields[key]
+            for key in independent
+        ):
+            return False
+        recorded = _record_echo(
+            pending,
+            version,
+            reported,
+            retired,
+            retired_sets,
+            frozenset(independent),
+        )
+        if pending not in retired and independent <= set(pending.seen):
+            retired.append(pending)
+            retired_sets.append(frozenset(pending.fields))
+            recorded = True
+        return recorded
+
     def _retire_echo(self, version: object, reported: object) -> None:
         """Retires the commands this version echoes.
 
@@ -1521,13 +1813,22 @@ class Hood:
         second even when it arrives first, and version 11 can still
         retire the first. Matching the oldest equal value instead gives
         12 to the first write and leaves the second pending over a later
-        ``light=0``.
+        ``light=0``. That version is not exclusive. An unrelated update
+        can take it, and the echo arrives later. When an older command
+        published the same fields and its expected version was already
+        that kind of miss, the document retires the older command. Giving
+        it to the calculated owner retires the last ``light=1`` of
+        ``1 → 2 → 1`` and the next document shows light 2.
 
         A document that is not the expected version of any queued command
-        does not fall through to that oldest value. It retires a numbered
-        command only when that command is the newest one still pending
-        for every key it carries, which is how a gap between two light
-        echoes still clears the later write. An unrelated field at the
+        does not fall through to the oldest equal value. It can retire a
+        numbered command whose expected version was already missed, when
+        no newer command published the same fields. Otherwise it retires
+        a numbered command when that command is the newest one still
+        pending for every key it carries, which is how a gap between two
+        light echoes still clears the later write. A command that is not
+        newest can still confirm the keys no later command publishes, so
+        a shared light does not throw away fan. An unrelated field at the
         version a light command expected leaves that light alone, and
         still retires a different key the document does carry. Returning
         before that key is considered leaves the earlier command pending
@@ -1541,11 +1842,15 @@ class Hood:
 
         A partial document records the keys it carries and does not hand
         the version to an older command that published the same keys.
-        The command retires when every key has been seen. One document
-        can still retire a later command that adds a key, or a command
-        on a different key, when every field of that command is in the
+        The command retires when every key has been seen. A key already
+        seen is not a conflict when a later partial brings the rest: the
+        device may have changed it, and refusing the document leaves the
+        optimistic value over the newer one. One document can still
+        retire a later command that adds a key, or a command on a
+        different key, when every field of that command is in the
         document. It cannot retire a second command that published the
-        same fields.
+        same fields, and it cannot hand a later overlapping command the
+        partial echoes of the earlier ones.
 
         A repeated delivery of a version already consumed retires nothing.
         The baseline stays where the command was published.
@@ -1576,30 +1881,47 @@ class Hood:
         # not publish are still reconciled below: returning here used to
         # strand fan when an unrelated update had already taken fan's
         # version, and the second key of a multi-key command when that
-        # key arrived on the later command's version.
+        # key arrived on the later command's version. A full match is
+        # still not enough when an older command published the same
+        # fields and its expected version was already a miss: this
+        # document is that older echo, and the calculated owner stays
+        # pending.
         owner_hit = False
         if (
             owner is not None
             and not _echo_conflicts(owner, reported)
             and (_echo_matches(owner, reported) or _echo_has_value(owner, reported))
         ):
-            owner_hit = True
-            if _record_echo(owner, version, reported, retired, retired_sets):
+            delayed = (
+                self._oldest_same_fields_missed(owner)
+                if _echo_matches(owner, reported)
+                else None
+            )
+            target = delayed if delayed is not None else owner
+            owner_hit = delayed is None
+            if _record_echo(target, version, reported, retired, retired_sets):
                 recorded = True
-            claimed = [frozenset(owner.fields), *retired_sets]
-            for pending in self._pending_writes:
-                if pending.seq <= owner.seq or pending in retired:
-                    continue
-                if not _later_command_fits(pending, claimed):
-                    continue
-                if _record_echo(pending, version, reported, retired, retired_sets):
-                    recorded = True
-                    claimed.append(frozenset(pending.fields))
+            claimed = [frozenset(target.fields), *retired_sets]
+            if self._note_later_commands(
+                target, version, reported, retired, retired_sets, claimed
+            ):
+                recorded = True
             if self._correlate_unversioned(
                 version, reported, retired, retired_sets, claimed
             ):
                 recorded = True
         else:
+            if owner is not None and _echo_conflicts(owner, reported):
+                delayed = self._oldest_conflict_match(owner, reported)
+                if delayed is not None and _record_echo(
+                    delayed, version, reported, retired, retired_sets
+                ):
+                    recorded = True
+            # The version the arithmetic named was not this command's
+            # echo. Remember it so a later document is not handed to
+            # whichever command that arithmetic points at next.
+            if owner is not None:
+                self._missed_echo_versions.add(version)
             claimed = list(retired_sets)
             if self._correlate_unversioned(
                 version, reported, retired, retired_sets, claimed
@@ -1610,13 +1932,15 @@ class Hood:
         ):
             recorded = True
         if not owner_hit and owner is None:
+            if self._correlate_missed_versions(
+                version, reported, retired, retired_sets
+            ):
+                recorded = True
             for pending in self._pending_writes:
                 # Unnumbered commands were correlated above. The newest
                 # of them must not also take this version: that is the
                 # end-anchor, reached by a different path.
                 if pending.baseline is None or pending in retired:
-                    continue
-                if not self._command_is_newest_for_its_keys(pending):
                     continue
                 if not _version_confirms(version, pending.baseline):
                     continue
@@ -1624,7 +1948,13 @@ class Hood:
                     frozenset(pending.fields) == existing for existing in retired_sets
                 ):
                     continue
-                if _record_echo(pending, version, reported, retired, retired_sets):
+                if self._command_is_newest_for_its_keys(pending):
+                    if _record_echo(pending, version, reported, retired, retired_sets):
+                        recorded = True
+                    continue
+                if self._retire_independent_keys(
+                    pending, version, reported, retired, retired_sets
+                ):
                     recorded = True
         if not recorded:
             return

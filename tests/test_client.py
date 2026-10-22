@@ -4163,3 +4163,410 @@ async def test_the_supervisor_interval_defaults_to_the_constant(wired):
     from pyzephyrconnect import const
 
     assert _client()._supervisor_interval == const.SUPERVISOR_INTERVAL_SECONDS
+
+
+async def test_a_later_overlap_does_not_collect_an_earlier_partial(wired):
+    """Tests that a later command does not finish on earlier partial echoes.
+
+    At baseline 10, ``light=1``, ``light=2``, ``fan=2``, then
+    ``{light: 1, fan: 2}``. Echoes 11, 12, and 13 used to note light on
+    the last command and then fan, so the queue went empty and visible
+    light fell back to 2. The last command has to stay pending, and light
+    has to stay 1, until its own echo. The same sequence with no numbered
+    document yet takes the unversioned partial pass. A disjoint command
+    still collects a partial, in both of those baselines.
+    """
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+    _echo(
+        client,
+        hoods[0],
+        10,
+        {"light": 0, "fan": 0, "usegreasefiltertime": 642},
+        snapshot=True,
+    )
+    await hoods[0].async_set_light(1)
+    await hoods[0].async_set_light(2)
+    await hoods[0].async_set_fan(2)
+    await hoods[0].async_set_fields({"light": 1, "fan": 2})
+    _echo(client, hoods[0], 11, {"light": 1})
+    _echo(client, hoods[0], 11, {"light": 1})
+    _echo(client, hoods[0], 12, {"light": 2})
+    _echo(client, hoods[0], 13, {"fan": 2})
+    assert [pending.fields for pending in hoods[0]._pending_writes] == [
+        {"light": 1, "fan": 2}
+    ]
+    assert hoods[0]._pending_writes[0].seen == {}
+    assert hoods[0].state.light == 1
+    assert hoods[0].state.fan == 2
+    _echo(client, hoods[0], 14, {"light": 1, "fan": 2})
+    assert hoods[0]._pending_writes == []
+    assert hoods[0].state.light == 1
+    _echo(
+        client,
+        hoods[0],
+        15,
+        {"light": 0, "fan": 0, "usegreasefiltertime": 700},
+        snapshot=True,
+    )
+    assert hoods[0].state.light == 0
+    assert hoods[0].state.fan == 0
+    assert hoods[0].state.use_grease_filter_time == 700
+    assert hoods[0]._pending_writes == []
+
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+    assert hoods[0]._shadow_version is None
+    await hoods[0].async_set_light(1)
+    await hoods[0].async_set_light(2)
+    await hoods[0].async_set_fan(2)
+    await hoods[0].async_set_fields({"light": 1, "fan": 2})
+    _echo(client, hoods[0], 11, {"light": 1})
+    _echo(client, hoods[0], 12, {"light": 2})
+    _echo(client, hoods[0], 13, {"fan": 2})
+    assert [pending.fields for pending in hoods[0]._pending_writes] == [
+        {"light": 1, "fan": 2}
+    ]
+    assert hoods[0]._pending_writes[0].seen == {}
+    assert hoods[0]._pending_writes[0].baseline is None
+    assert hoods[0].state.light == 1
+    _echo(client, hoods[0], 14, {"light": 1, "fan": 2})
+    assert hoods[0]._pending_writes == []
+    assert hoods[0].state.light == 1
+    _echo(
+        client,
+        hoods[0],
+        15,
+        {"light": 0, "fan": 0, "usegreasefiltertime": 700},
+        snapshot=True,
+    )
+    assert hoods[0].state.light == 0
+    assert hoods[0].state.fan == 0
+    assert hoods[0].state.use_grease_filter_time == 700
+
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+    _echo(
+        client,
+        hoods[0],
+        10,
+        {"light": 0, "fan": 0, "power": 0, "usegreasefiltertime": 642},
+        snapshot=True,
+    )
+    await hoods[0].async_set_light(1)
+    await hoods[0].async_set_fields({"fan": 2, "power": 1})
+    _echo(client, hoods[0], 11, {"light": 1, "fan": 2})
+    assert [pending.fields for pending in hoods[0]._pending_writes] == [
+        {"fan": 2, "power": 1}
+    ]
+    assert hoods[0]._pending_writes[0].seen == {"fan": 11}
+    _echo(client, hoods[0], 12, {"power": 1})
+    assert hoods[0]._pending_writes == []
+    assert hoods[0].state.fan == 2
+    assert hoods[0].state.power == 1
+
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+    assert hoods[0]._shadow_version is None
+    await hoods[0].async_set_light(1)
+    await hoods[0].async_set_fields({"fan": 2, "power": 1})
+    _echo(client, hoods[0], 11, {"light": 1, "fan": 2})
+    assert [pending.fields for pending in hoods[0]._pending_writes] == [
+        {"fan": 2, "power": 1}
+    ]
+    assert hoods[0]._pending_writes[0].seen == {"fan": 11}
+    assert hoods[0]._pending_writes[0].baseline is None
+    _echo(client, hoods[0], 12, {"power": 1})
+    assert hoods[0]._pending_writes == []
+    assert hoods[0].state.light == 1
+    assert hoods[0].state.fan == 2
+    assert hoods[0].state.power == 1
+
+
+async def test_intervening_updates_do_not_give_the_last_repeat_the_first_echo(wired):
+    """Tests that a shifted repeated echo does not retire the last command.
+
+    ``light=1 → 2 → 1`` at baseline 10, then unrelated updates at 11 and
+    12. Version 13 of ``{light: 1}`` used to retire the last command, and
+    version 14 of ``{light: 2}`` then showed light 2 while that last
+    request was still waiting. Light has to stay 1 through version 14,
+    and the last command has to still be queued. One unrelated update,
+    with the three echoes moved up by one, is the neighbor: version 12
+    retires the first light, and light 2 never shows while the last
+    light 1 is pending. Disconnect drops the remembered miss with the
+    queue.
+    """
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+    _echo(
+        client,
+        hoods[0],
+        10,
+        {"light": 0, "fan": 0, "usegreasefiltertime": 642},
+        snapshot=True,
+    )
+    await hoods[0].async_set_light(1)
+    await hoods[0].async_set_light(2)
+    await hoods[0].async_set_light(1)
+    _echo(client, hoods[0], 11, {"power": 1})
+    _echo(client, hoods[0], 12, {"power": 1})
+    assert len(hoods[0]._pending_writes) == 3
+    _echo(client, hoods[0], 13, {"light": 1})
+    _echo(client, hoods[0], 13, {"light": 1})
+    assert [pending.ordinal for pending in hoods[0]._pending_writes] == [1, 2]
+    assert hoods[0].state.light == 1
+    _echo(client, hoods[0], 14, {"light": 2})
+    assert [pending.ordinal for pending in hoods[0]._pending_writes] == [2]
+    assert hoods[0].state.light == 1
+    _echo(client, hoods[0], 15, {"light": 1})
+    assert hoods[0]._pending_writes == []
+    assert hoods[0].state.light == 1
+    _echo(
+        client,
+        hoods[0],
+        16,
+        {"light": 0, "usegreasefiltertime": 700},
+        snapshot=True,
+    )
+    assert hoods[0].state.light == 0
+    assert hoods[0].state.use_grease_filter_time == 700
+    assert hoods[0]._pending_writes == []
+
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+    _echo(
+        client,
+        hoods[0],
+        10,
+        {"light": 0, "usegreasefiltertime": 642},
+        snapshot=True,
+    )
+    await hoods[0].async_set_light(1)
+    await hoods[0].async_set_light(2)
+    await hoods[0].async_set_light(1)
+    _echo(client, hoods[0], 11, {"power": 1})
+    _echo(client, hoods[0], 12, {"light": 1})
+    assert [pending.ordinal for pending in hoods[0]._pending_writes] == [1, 2]
+    assert hoods[0].state.light == 1
+    _echo(client, hoods[0], 13, {"light": 2})
+    assert [pending.ordinal for pending in hoods[0]._pending_writes] == [2]
+    assert hoods[0].state.light == 1
+    _echo(client, hoods[0], 14, {"light": 1})
+    assert hoods[0]._pending_writes == []
+    assert hoods[0].state.light == 1
+    _echo(
+        client,
+        hoods[0],
+        15,
+        {"light": 0, "usegreasefiltertime": 700},
+        snapshot=True,
+    )
+    assert hoods[0].state.light == 0
+    assert hoods[0].state.use_grease_filter_time == 700
+
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+    _echo(
+        client,
+        hoods[0],
+        10,
+        {"light": 0, "fan": 0, "usegreasefiltertime": 642},
+        snapshot=True,
+    )
+    await hoods[0].async_set_light(1)
+    _echo(client, hoods[0], 11, {"fan": 3})
+    assert 11 in hoods[0]._missed_echo_versions
+    hoods[0].handle_connection_change(False)
+    assert hoods[0]._missed_echo_versions == set()
+    assert hoods[0]._pending_writes == []
+    assert hoods[0]._baseline_counts == {}
+
+
+async def test_a_shared_key_does_not_drop_an_independent_confirmation(wired):
+    """Tests that a later shared key does not throw away the other field.
+
+    At baseline 10, ``{light: 1, fan: 2}`` then ``{light: 2}``. Unrelated
+    updates take 11 and 12, so the complete echoes are 13 and 14. Version
+    13 used to skip the whole first command because light was shared, and
+    the version-15 GET of fan 0 stayed covered by pending fan 2. Fan's
+    confirmation has to stick at 13. One of several independent keys is
+    not enough to retire the command.
+    """
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+    _echo(
+        client,
+        hoods[0],
+        10,
+        {"light": 0, "fan": 0, "usegreasefiltertime": 642},
+        snapshot=True,
+    )
+    await hoods[0].async_set_fields({"light": 1, "fan": 2})
+    await hoods[0].async_set_light(2)
+    _echo(client, hoods[0], 11, {"power": 1})
+    _echo(client, hoods[0], 12, {"power": 1})
+    _echo(client, hoods[0], 13, {"light": 1, "fan": 2})
+    assert [pending.fields for pending in hoods[0]._pending_writes] == [{"light": 2}]
+    assert hoods[0].state.light == 2
+    assert hoods[0].state.fan == 2
+    _echo(client, hoods[0], 14, {"light": 2})
+    assert hoods[0]._pending_writes == []
+    assert hoods[0].state.light == 2
+    _echo(
+        client,
+        hoods[0],
+        15,
+        {"fan": 0, "light": 0, "usegreasefiltertime": 700},
+        snapshot=True,
+    )
+    assert hoods[0].state.fan == 0
+    assert hoods[0].state.light == 0
+    assert hoods[0].state.use_grease_filter_time == 700
+    assert hoods[0]._pending_writes == []
+
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+    _echo(
+        client,
+        hoods[0],
+        10,
+        {"light": 0, "fan": 0, "power": 0, "usegreasefiltertime": 642},
+        snapshot=True,
+    )
+    await hoods[0].async_set_fields({"light": 1, "fan": 2, "power": 1})
+    await hoods[0].async_set_light(2)
+    _echo(client, hoods[0], 11, {"setdelaytimer": 1})
+    _echo(client, hoods[0], 12, {"setdelaytimer": 1})
+    _echo(client, hoods[0], 13, {"fan": 2})
+    assert [pending.fields for pending in hoods[0]._pending_writes] == [
+        {"light": 1, "fan": 2, "power": 1},
+        {"light": 2},
+    ]
+    assert hoods[0]._pending_writes[0].seen == {"fan": 13}
+    _echo(client, hoods[0], 14, {"power": 1})
+    assert [pending.fields for pending in hoods[0]._pending_writes] == [{"light": 2}]
+    assert hoods[0].state.fan == 2
+    assert hoods[0].state.power == 1
+    assert hoods[0].state.light == 2
+    _echo(
+        client,
+        hoods[0],
+        15,
+        {"fan": 0, "power": 0, "light": 0, "usegreasefiltertime": 700},
+        snapshot=True,
+    )
+    assert hoods[0].state.fan == 0
+    assert hoods[0].state.power == 0
+    assert hoods[0].state.light == 2
+    assert hoods[0].state.use_grease_filter_time == 700
+    assert [pending.fields for pending in hoods[0]._pending_writes] == [{"light": 2}]
+
+
+async def test_a_confirmed_key_does_not_block_the_remaining_partial(wired):
+    """Tests that a key already seen does not refuse the rest of the echo.
+
+    Baseline-10 ``{light: 1, fan: 2}``, version 11 ``{light: 1}``, then
+    version 12 ``{light: 0, fan: 2}``. The conflict check used to refuse
+    the whole document, so fan was never recorded and optimistic light 1
+    masked the newer light 0. A conflict on a key that has not been seen
+    still blocks. A document that only changes the seen key does not
+    finish a command that still owes another key. A redelivery of the
+    completing document does not retire a later command.
+    """
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+    _echo(
+        client,
+        hoods[0],
+        10,
+        {"light": 0, "fan": 0, "usegreasefiltertime": 642},
+        snapshot=True,
+    )
+    await hoods[0].async_set_fields({"light": 1, "fan": 2})
+    _echo(client, hoods[0], 11, {"light": 1})
+    assert len(hoods[0]._pending_writes) == 1
+    assert hoods[0]._pending_writes[0].seen == {"light": 11}
+    _echo(client, hoods[0], 12, {"light": 0, "fan": 2})
+    assert hoods[0]._pending_writes == []
+    assert hoods[0].state.light == 0
+    assert hoods[0].state.fan == 2
+    _echo(client, hoods[0], 12, {"light": 0, "fan": 2})
+    await hoods[0].async_set_fields({"light": 1, "fan": 2})
+    _echo(client, hoods[0], 12, {"light": 0, "fan": 2})
+    assert [pending.fields for pending in hoods[0]._pending_writes] == [
+        {"light": 1, "fan": 2}
+    ]
+    assert hoods[0]._pending_writes[0].seen == {}
+    _echo(
+        client,
+        hoods[0],
+        13,
+        {"light": 0, "fan": 0, "usegreasefiltertime": 700},
+        snapshot=True,
+    )
+    assert hoods[0].state.light == 1
+    assert hoods[0].state.fan == 2
+    assert hoods[0].state.use_grease_filter_time == 700
+    assert len(hoods[0]._pending_writes) == 1
+
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+    _echo(
+        client,
+        hoods[0],
+        10,
+        {"light": 0, "fan": 0, "usegreasefiltertime": 642},
+        snapshot=True,
+    )
+    await hoods[0].async_set_fields({"light": 1, "fan": 2})
+    _echo(client, hoods[0], 11, {"light": 0, "fan": 2})
+    assert len(hoods[0]._pending_writes) == 1
+    assert hoods[0]._pending_writes[0].seen == {}
+    _echo(client, hoods[0], 12, {"light": 1})
+    assert hoods[0]._pending_writes[0].seen == {"light": 12}
+    _echo(client, hoods[0], 13, {"fan": 2})
+    assert hoods[0]._pending_writes == []
+    assert hoods[0].state.fan == 2
+    assert hoods[0].state.light == 1
+    _echo(
+        client,
+        hoods[0],
+        14,
+        {"light": 0, "fan": 0, "usegreasefiltertime": 700},
+        snapshot=True,
+    )
+    assert hoods[0].state.light == 0
+    assert hoods[0].state.fan == 0
+    assert hoods[0].state.use_grease_filter_time == 700
+
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+    _echo(
+        client,
+        hoods[0],
+        10,
+        {"light": 0, "fan": 0, "usegreasefiltertime": 642},
+        snapshot=True,
+    )
+    await hoods[0].async_set_fields({"light": 1, "fan": 2})
+    _echo(client, hoods[0], 11, {"light": 1})
+    _echo(client, hoods[0], 12, {"light": 0})
+    assert len(hoods[0]._pending_writes) == 1
+    assert hoods[0]._pending_writes[0].seen == {"light": 11}
+    assert hoods[0].state.light == 1
+    _echo(client, hoods[0], 13, {"light": 0, "fan": 2})
+    assert hoods[0]._pending_writes == []
+    assert hoods[0].state.light == 0
+    assert hoods[0].state.fan == 2
