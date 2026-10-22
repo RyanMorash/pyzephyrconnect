@@ -30,19 +30,54 @@ class _PendingWrite:
     Confirmation is this command, not a later one that happens to publish
     the same level. ``baseline`` is the shadow version already applied when
     the command was sent. A document at that version, including the GET
-    that was in flight before the command, is not its echo.
+    that was in flight before the command, is not its echo. ``ordinal`` is
+    this command's place among writes that share that baseline: the echo
+    AWS assigns it is ``baseline + ordinal + 1``, and a later version can
+    arrive before an earlier one. ``seq`` is the publish order across
+    every baseline, which is what keeps an older command from covering a
+    newer one that has already been confirmed.
     """
 
-    def __init__(self, baseline: int | None, fields: dict[str, int]) -> None:
+    def __init__(
+        self,
+        baseline: int | None,
+        fields: dict[str, int],
+        seq: int,
+        ordinal: int,
+    ) -> None:
         """Stores the version baseline and the fields this command set.
 
         Args:
             baseline: Shadow version already applied, or None when no
                 versioned document has been applied yet.
             fields: Reported keys this command published.
+            seq: Monotonic publish order for this hood.
+            ordinal: Zero-based place among commands that share
+                ``baseline``.
         """
         self.baseline = baseline
         self.fields = fields
+        self.seq = seq
+        self.ordinal = ordinal
+
+
+def _echo_matches(pending: _PendingWrite, reported: dict[str, Any]) -> bool:
+    """Reports whether this document carries this command's values.
+
+    A missing key is not a match. Extra keys are: the device raises
+    ``power`` itself, so an echo of a light write can carry ``power`` too.
+
+    Args:
+        pending: The command being considered.
+        reported: The reported object from ``update/accepted``.
+
+    Returns:
+        True when every field the command published is present and equal.
+    """
+    return all(
+        key in reported and reported[key] == value
+        for key, value in pending.fields.items()
+    )
 
 
 def _version_confirms(version: object, baseline: int | None) -> bool:
@@ -51,10 +86,10 @@ def _version_confirms(version: object, baseline: int | None) -> bool:
     A missing version is not an echo: the rejection reread and an in-flight
     GET often arrive without moving the cursor, or at the same version the
     command was published against. A version equal to the baseline is that
-    in-flight document, or a QoS 1 redelivery of an echo that already
-    retired an earlier command. Greater-than is not by itself the
-    acknowledgement. The caller still has to match one command's values,
-    or a repeated level acks the wrong write.
+    in-flight document. Greater-than is not by itself the acknowledgement.
+    The caller still has to match the command this version belongs to, or
+    a repeated level acks the wrong write. A QoS 1 redelivery repeats the
+    version; the caller records versions it has already consumed.
 
     Args:
         version: The document's ``version`` field.
@@ -137,27 +172,35 @@ class Hood:
         # a versioned document arrives; a document with no version keeps
         # today's apply-anyway behaviour and does not move this cursor.
         self._shadow_version: int | None = None
-        # Commands whose echo has not arrived, oldest first. One document
-        # retires every command whose values it carries, oldest first, and
-        # only when it is newer than that command's baseline. At most one
-        # command per key: a later command for a key this document already
-        # retired stays queued, with its baseline raised to this version,
-        # so a redelivery cannot ack the next write of the same value. A
-        # different key in the same document is retired in that same pass,
-        # before the baseline bump. Bumping first would make that command
-        # equal to this version, and it would stay pending over every newer
-        # reported value for the key. A partial echo of a later command
-        # must not wait behind an older command it does not mention.
-        # Matching the value alone acks the wrong write when the same level
-        # is published twice. The queue is dropped when the session that
-        # published it is gone; a later GET must be able to show what the
-        # device or the phone did during the outage. Dangerous fields are
-        # never entered here.
+        # Commands whose echo has not arrived, oldest first. The echo that
+        # belongs to a command is the shadow version ``baseline + ordinal +
+        # 1``: two writes at version 10 are accepted as 11 and 12, and 12
+        # can arrive before 11. Raising the later command's baseline to 12
+        # makes 11 unable to retire it, and the pending value then hides
+        # every newer report of that key. A version is consumed once, so a
+        # QoS 1 redelivery cannot retire the next write of the same value.
+        # One document can still carry two different keys. PROTOCOL.md
+        # records the echo as ``state.reported``; it does not echo a
+        # clientToken, so none is sent. The queue is dropped when the
+        # session that published it is gone; a later GET must be able to
+        # show what the device or the phone did during the outage.
+        # Dangerous fields are never entered here.
         self._pending_writes: list[_PendingWrite] = []
-        # Shadow version of the newest echo that retired a command for this
-        # key. A pending command published against an older baseline is
-        # kept for echo matching and left out of the visible cache.
-        self._confirmed_versions: dict[str, int] = {}
+        self._next_pending_seq = 1
+        # How many commands have been published at each baseline. The
+        # ordinal is stable after an earlier command retires, so a late
+        # echo still names the command it belongs to.
+        self._baseline_counts: dict[int | None, int] = {}
+        # Versions already used to retire a command. A redelivery of one
+        # of them must not retire whatever is still queued.
+        self._consumed_echo_versions: set[int] = set()
+        # Publish sequence of the newest command retired for this key.
+        # An older command stays queued so its own echo can still match
+        # it, and is left out of the visible cache. A newer command is
+        # not: retiring the first of two ``light=1`` writes must not hide
+        # the second, or a reordered older echo can never clear it and
+        # the pending value covers a later GET.
+        self._confirmed_seq: dict[str, int] = {}
         # Shadow version at which each reported key was last merged.
         # update/accepted is partial, so a newer document does not contain
         # the keys an older one changed. The global cursor cannot decide
@@ -793,14 +836,13 @@ class Hood:
         # command published. ``<=`` on the version cursor would also drop
         # the rejection reread, which comes back at the same version.
         baseline = self._shadow_version
-        self._pending_writes.append(
-            _PendingWrite(
-                baseline
-                if isinstance(baseline, int) and not isinstance(baseline, bool)
-                else None,
-                dict(fields),
-            )
-        )
+        if isinstance(baseline, bool) or not isinstance(baseline, int):
+            baseline = None
+        ordinal = self._baseline_counts.get(baseline, 0)
+        self._baseline_counts[baseline] = ordinal + 1
+        seq = self._next_pending_seq
+        self._next_pending_seq = seq + 1
+        self._pending_writes.append(_PendingWrite(baseline, dict(fields), seq, ordinal))
         # Laid over reported state, not merged into it. The next document
         # has to be able to reveal a newer device value once this command
         # retires. With no reported state yet, the visible cache is just
@@ -987,29 +1029,26 @@ class Hood:
         version: object,
         echoed: bool,
     ) -> HoodState:
-        """Retires every command this document echoes.
+        """Retires the commands this document echoes.
 
         A GET, including one at the current version, does not confirm a
-        command. ``update/accepted`` retires each command whose values the
-        document actually carries, oldest first, and only when the document
-        is newer than that command's baseline. One document can carry two
-        queued commands. Retiring only the oldest and then raising every
-        later baseline leaves the other pending forever: equal does not
-        confirm, and a later document will not repeat the value the hood
-        has already left. A fan echo that arrives before the light echo
-        can still retire the fan command without consuming the light one.
-        A later command for a key this document already retired stays
-        queued and has its baseline raised to this version, so a QoS 1
-        redelivery of the same echo cannot retire the next write of the
-        same value. Value equality alone will not do: after ``1`` then
-        ``0``, an in-flight document that still says ``0`` matches the
-        latest write, and after ``1 → 2 → 1`` the first echo matches the
-        last write.
+        command. ``update/accepted`` retires the command whose echo this
+        version is: the first write published at baseline 10 is version
+        11, the next is version 12, whether or not 12 arrives first.
+        Retiring the oldest matching value and then raising every later
+        baseline strands the command the older echo belonged to, and that
+        pending value hides a newer GET. A QoS 1 redelivery repeats the
+        version and retires nothing else. One document can still carry a
+        second key the version does not name, which is how a hood reports
+        ``light`` and ``fan`` together. Value equality alone will not do:
+        after ``1`` then ``0``, an in-flight document that still says
+        ``0`` matches the latest write, and after ``1 → 2 → 1`` the first
+        echo matches the last write.
 
         The returned state is authoritative. ``handle_state`` lays the
-        commands that are still ahead of their key's last confirmation
-        over it. An older command kept for echo matching is not part of
-        that layer.
+        commands that are still ahead of a newer confirmation of their
+        key over it. An older command kept for echo matching is not part
+        of that layer.
 
         Args:
             state: The state parsed from the document, without optimistic
@@ -1029,21 +1068,27 @@ class Hood:
         return state
 
     def _retire_echo(self, version: object, reported: object) -> None:
-        """Retires every command this document echoes.
+        """Retires the commands this version echoes.
 
-        Oldest match wins for a key, so a document that carries the oldest
-        command still acks that one and not a later command with the same
-        level. A partial that only carries a later command acks that later
-        one. Commands that do not match keep their baselines, including
-        ones queued ahead of a match: the light echo can still be older
-        than the fan echo that already arrived.
+        The command published as ordinal N at a baseline belongs to
+        version ``baseline + N + 1``. Two ``light=1`` writes at version
+        10 therefore belong to versions 11 and 12. Version 12 retires the
+        second even when it arrives first, and version 11 can still
+        retire the first. Matching the oldest equal value instead gives
+        12 to the first write and leaves the second pending over a later
+        ``light=0``.
 
-        A later command whose key this pass already retired is not a
-        second confirmation. Its baseline moves up to this version. A
-        replay is then equal to that baseline, and equal does not confirm.
-        The bump happens after a different key in this same document has
-        had its chance to retire. Doing it to every later command first
-        strands that other command.
+        A repeated delivery of a version already consumed retires nothing.
+        Raising the survivor's baseline to the consumed version was the
+        previous guard, and it is what made the older echo miss. The
+        baseline stays where the command was published.
+
+        A document can also carry a key that belongs to a different
+        ordinal, which is the combined ``light`` and ``fan`` echo. At
+        most one command per key: the second ``light=1`` stays queued for
+        its own version. Commands that do not match keep their place,
+        including ones queued ahead of a match, so a fan echo can still
+        arrive before the light echo.
 
         Args:
             version: The document's ``version``, or None.
@@ -1053,55 +1098,68 @@ class Hood:
             return
         if isinstance(version, bool) or not isinstance(version, int):
             return
-        index = 0
+        if version in self._consumed_echo_versions:
+            return
+        retired: list[_PendingWrite] = []
         retired_keys: set[str] = set()
-        while index < len(self._pending_writes):
-            pending = self._pending_writes[index]
-            keys = set(pending.fields)
-            # This document already confirmed this key. The later command
-            # stays queued so its own newer echo can match it, and a
-            # redelivery of this version cannot.
-            if keys & retired_keys:
-                if pending.baseline is None or pending.baseline < version:
-                    pending.baseline = version
-                index += 1
+        for pending in self._pending_writes:
+            if pending.baseline is None:
                 continue
-            if not _version_confirms(version, pending.baseline) or any(
-                key not in reported or reported[key] != value
-                for key, value in pending.fields.items()
-            ):
-                index += 1
+            if version != pending.baseline + pending.ordinal + 1:
                 continue
-            del self._pending_writes[index]
-            retired_keys |= keys
-            # This version confirmed these keys. An older command for the
-            # same key stays queued so a reordered echo can still match
-            # it, and is left out of the overlay.
+            if not _version_confirms(version, pending.baseline):
+                continue
+            if not _echo_matches(pending, reported):
+                break
+            retired.append(pending)
+            retired_keys.update(pending.fields)
+            break
+        for pending in self._pending_writes:
+            if pending in retired:
+                continue
+            if not _version_confirms(version, pending.baseline):
+                continue
+            if set(pending.fields) & retired_keys:
+                continue
+            if not _echo_matches(pending, reported):
+                continue
+            retired.append(pending)
+            retired_keys.update(pending.fields)
+        if not retired:
+            return
+        # Consumed before the queue changes, so a re-entrant delivery of
+        # this same version cannot retire the command that is still there.
+        self._consumed_echo_versions.add(version)
+        retire_ids = {id(pending) for pending in retired}
+        self._pending_writes = [
+            pending for pending in self._pending_writes if id(pending) not in retire_ids
+        ]
+        for pending in retired:
             for key in pending.fields:
-                seen = self._confirmed_versions.get(key)
-                if seen is None or version > seen:
-                    self._confirmed_versions[key] = version
+                seen = self._confirmed_seq.get(key)
+                if seen is None or pending.seq > seen:
+                    self._confirmed_seq[key] = pending.seq
 
     def _pending_overlay(self) -> dict[str, int]:
-        """Returns pending keys that are still ahead of a confirmation.
+        """Returns pending keys that are still ahead of a newer confirmation.
 
-        Later commands win among those that qualify. A command published
-        against a baseline older than the version that already confirmed
-        the key does not qualify: ``light=1`` then ``light=2``, with the
-        echo of ``2`` first, must not put ``1`` back over the reported
-        ``2``. The older command stays in the queue for its own echo.
+        Later commands win among those that qualify. A command older than
+        one already confirmed for that key does not qualify: ``light=1``
+        then ``light=2``, with the echo of ``2`` first, must not put ``1``
+        back over the reported ``2``. The older command stays in the queue
+        for its own echo. A newer command still qualifies when only an
+        older one has been confirmed, so the second ``light=1`` stays
+        visible until the echo that belongs to it arrives.
 
         Returns:
             Reported keys still waiting on a command that outranks the
-            last confirmation of that key.
+            newest confirmation of that key.
         """
         overlay: dict[str, int] = {}
         for pending in self._pending_writes:
             for key, value in pending.fields.items():
-                confirmed = self._confirmed_versions.get(key)
-                if confirmed is not None and (
-                    pending.baseline is None or pending.baseline < confirmed
-                ):
+                confirmed = self._confirmed_seq.get(key)
+                if confirmed is not None and pending.seq < confirmed:
                     continue
                 overlay[key] = value
         return overlay

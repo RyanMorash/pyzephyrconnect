@@ -7,6 +7,7 @@ minute is a test nobody runs.
 
 import asyncio
 import contextlib
+import itertools
 import json
 import logging
 import time
@@ -1691,6 +1692,280 @@ async def test_a_redelivered_echo_does_not_retire_the_next_same_value(wired):
     assert hoods[0]._pending_writes == []
 
 
+async def test_a_reordered_same_value_echo_does_not_hide_a_later_get(wired):
+    """Tests that echoes of two light=1 writes retire the command they belong to.
+
+    Both writes share baseline 10, so they belong to versions 11 and 12.
+    Version 12 arriving first used to retire the older write and raise the
+    newer one's baseline to 12, and version 11 could not retire it. The
+    pending light then covered a version-13 GET of light 0. A redelivery
+    of version 12 must still leave that older write queued.
+    """
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/get/accepted",
+        {
+            "state": {"reported": {"light": 0, "usegreasefiltertime": 642}},
+            "version": 10,
+        },
+    )
+
+    await hoods[0].async_set_light(1)
+    await hoods[0].async_set_light(1)
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/update/accepted",
+        {"state": {"reported": {"light": 1}}, "version": 12},
+    )
+    assert hoods[0].state.light == 1
+    assert len(hoods[0]._pending_writes) == 1
+    assert hoods[0]._pending_writes[0].ordinal == 0
+
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/update/accepted",
+        {"state": {"reported": {"light": 1}}, "version": 12},
+    )
+    assert len(hoods[0]._pending_writes) == 1
+
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/update/accepted",
+        {"state": {"reported": {"light": 1}}, "version": 11},
+    )
+    assert hoods[0].state.light == 1
+    assert hoods[0]._pending_writes == []
+
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/get/accepted",
+        {
+            "state": {"reported": {"light": 0, "usegreasefiltertime": 642}},
+            "version": 13,
+        },
+    )
+    assert hoods[0].state.light == 0
+    assert hoods[0].state.use_grease_filter_time == 642
+    assert hoods[0]._pending_writes == []
+
+
+async def test_a_reordered_final_repeated_echo_does_not_hide_a_later_get(wired):
+    """Tests that 1 then 2 then 1 retires each write when the last echo is first.
+
+    The version-13 echo is the third write. Treating it as the oldest
+    ``light=1`` and raising the other baselines leaves those commands
+    pending, and a later GET stays covered. A redelivery of version 13
+    must not retire the first write. The middle echo must not leave the
+    cache at 2 once the final echo has been seen.
+    """
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/get/accepted",
+        {
+            "state": {"reported": {"light": 0, "usegreasefiltertime": 642}},
+            "version": 10,
+        },
+    )
+
+    await hoods[0].async_set_light(1)
+    await hoods[0].async_set_light(2)
+    await hoods[0].async_set_light(1)
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/update/accepted",
+        {"state": {"reported": {"light": 1}}, "version": 13},
+    )
+    assert hoods[0].state.light == 1
+    assert len(hoods[0]._pending_writes) == 2
+
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/update/accepted",
+        {"state": {"reported": {"light": 1}}, "version": 13},
+    )
+    assert len(hoods[0]._pending_writes) == 2
+    assert {pending.ordinal for pending in hoods[0]._pending_writes} == {0, 1}
+
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/update/accepted",
+        {"state": {"reported": {"light": 2}}, "version": 12},
+    )
+    assert hoods[0].state.light == 1
+    assert len(hoods[0]._pending_writes) == 1
+
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/update/accepted",
+        {"state": {"reported": {"light": 1}}, "version": 11},
+    )
+    assert hoods[0].state.light == 1
+    assert hoods[0]._pending_writes == []
+
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/get/accepted",
+        {
+            "state": {"reported": {"light": 0, "usegreasefiltertime": 700}},
+            "version": 14,
+        },
+    )
+    assert hoods[0].state.light == 0
+    assert hoods[0].state.use_grease_filter_time == 700
+    assert hoods[0]._pending_writes == []
+
+
+async def test_repeated_value_echoes_retire_in_every_arrival_order(wired):
+    """Tests that every arrival order of repeated writes ends at the later GET.
+
+    ``1 → 2 → 1`` and three ``light=1`` writes each have echoes at 11, 12,
+    and 13. Whichever order those documents arrive, the queue has to be
+    empty afterwards and a version-14 GET of light 0 has to show. The
+    in-order and one-reordered cases above stay, and so does the QoS 1
+    redelivery test.
+    """
+    sequences = (
+        ((11, 1), (12, 2), (13, 1)),
+        ((11, 1), (12, 1), (13, 1)),
+    )
+    for echoes in sequences:
+        for order in itertools.permutations(echoes):
+            client = _client()
+            hoods = await client.async_setup()
+            await hoods[0].async_start()
+            client._handle_message(
+                hoods[0],
+                f"$aws/things/{THING}/shadow/get/accepted",
+                {
+                    "state": {"reported": {"light": 0, "usegreasefiltertime": 642}},
+                    "version": 10,
+                },
+            )
+            for _version, level in echoes:
+                await hoods[0].async_set_light(level)
+            for version, level in order:
+                client._handle_message(
+                    hoods[0],
+                    f"$aws/things/{THING}/shadow/update/accepted",
+                    {"state": {"reported": {"light": level}}, "version": version},
+                )
+            assert hoods[0]._pending_writes == []
+            assert hoods[0].state.light == 1
+            client._handle_message(
+                hoods[0],
+                f"$aws/things/{THING}/shadow/get/accepted",
+                {
+                    "state": {"reported": {"light": 0, "usegreasefiltertime": 700}},
+                    "version": 14,
+                },
+            )
+            assert hoods[0].state.light == 0
+            assert hoods[0].state.use_grease_filter_time == 700
+
+
+async def test_a_reordered_one_then_zero_echo_does_not_hide_a_later_get(wired):
+    """Tests that 1 then 0 still clears when the echo of 0 arrives first.
+
+    Version 12 belongs to the second write. It must not be spent on the
+    first, or version 11 cannot retire what is left and the pending 0
+    covers a newer light.
+    """
+    client = _client()
+    hoods = await client.async_setup()
+    await hoods[0].async_start()
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/get/accepted",
+        {
+            "state": {"reported": {"light": 0, "usegreasefiltertime": 642}},
+            "version": 10,
+        },
+    )
+
+    await hoods[0].async_set_light(1)
+    await hoods[0].async_set_light(0)
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/update/accepted",
+        {"state": {"reported": {"light": 0}}, "version": 12},
+    )
+    assert hoods[0].state.light == 0
+    assert len(hoods[0]._pending_writes) == 1
+
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/update/accepted",
+        {"state": {"reported": {"light": 1}}, "version": 11},
+    )
+    assert hoods[0].state.light == 0
+    assert hoods[0]._pending_writes == []
+
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/get/accepted",
+        {
+            "state": {"reported": {"light": 4, "usegreasefiltertime": 642}},
+            "version": 13,
+        },
+    )
+    assert hoods[0].state.light == 4
+    assert hoods[0].state.use_grease_filter_time == 642
+
+
+async def test_a_gapped_repeated_echo_still_clears_before_the_later_get(wired):
+    """Tests that an unrelated version between two light=1 echoes still clears.
+
+    Version 11 belonging to another field must not consume either light
+    write. Versions 12 and 13 are the two echoes, in that order or
+    reversed, and a version-14 GET of light 0 has to show.
+    """
+    for order in ((12, 13), (13, 12)):
+        client = _client()
+        hoods = await client.async_setup()
+        await hoods[0].async_start()
+        client._handle_message(
+            hoods[0],
+            f"$aws/things/{THING}/shadow/get/accepted",
+            {
+                "state": {
+                    "reported": {"light": 0, "fan": 0, "usegreasefiltertime": 642}
+                },
+                "version": 10,
+            },
+        )
+        await hoods[0].async_set_light(1)
+        await hoods[0].async_set_light(1)
+        client._handle_message(
+            hoods[0],
+            f"$aws/things/{THING}/shadow/update/accepted",
+            {"state": {"reported": {"fan": 3}}, "version": 11},
+        )
+        assert len(hoods[0]._pending_writes) == 2
+        for version in order:
+            client._handle_message(
+                hoods[0],
+                f"$aws/things/{THING}/shadow/update/accepted",
+                {"state": {"reported": {"light": 1}}, "version": version},
+            )
+        assert hoods[0]._pending_writes == []
+        client._handle_message(
+            hoods[0],
+            f"$aws/things/{THING}/shadow/get/accepted",
+            {
+                "state": {"reported": {"light": 0, "usegreasefiltertime": 642}},
+                "version": 14,
+            },
+        )
+        assert hoods[0].state.light == 0
+        assert hoods[0].state.use_grease_filter_time == 642
+
+
 async def test_one_echo_retires_every_queued_command_it_carries(wired):
     """Tests that one document can retire two queued commands.
 
@@ -1944,7 +2219,8 @@ async def test_a_null_or_missing_state_block_does_not_advance_the_version(wired)
     JSON null and a missing key both look like ``None`` to ``dict.get``.
     Treating either as ``{}`` clears the cached fields, turns the omitted
     usage counters into 0, and sticks both version cursors. A null
-    reported block is the same failure one level down. A later valid
+    reported block is the same failure one level down, and so are the
+    other non-objects ``false``, ``0``, and ``""``. A later valid
     version-11 GET has to apply.
     """
     client = _client()
@@ -1962,6 +2238,12 @@ async def test_a_null_or_missing_state_block_does_not_advance_the_version(wired)
         {"state": None},
         {},
         {"state": {"reported": None}},
+        {"state": False},
+        {"state": 0},
+        {"state": ""},
+        {"state": {"reported": False}},
+        {"state": {"reported": 0}},
+        {"state": {"reported": ""}},
     )
     version = 12
     for payload in bad_payloads:

@@ -710,8 +710,9 @@ async def test_an_in_flight_disconnect_blocks_a_writer_before_recovery(
     the hood lock is taken. A write in that window must not treat the
     second disconnect as finished: it would drop ``Hood._shadow`` and
     ``async_ensure_running`` would open another session on this client ID
-    while ``loop_stop`` is still running. ``finish_subscriptions`` aborts
-    through the same ``disconnect``.
+    while ``loop_stop`` is still running. A second and a third
+    cancellation during that join must not finish it early either.
+    ``finish_subscriptions`` aborts through the same ``disconnect``.
     """
     caps = HoodCapabilities.from_discover(
         json.loads((FIXTURES / "discoverdevice.json").read_text())
@@ -765,10 +766,18 @@ async def test_an_in_flight_disconnect_blocks_a_writer_before_recovery(
     await asyncio.sleep(0)
     assert "connect" not in order
     assert not ensure.done()
+    # A second and a third cancel during the follow-up wait. One cancel is
+    # not the case that drops the join and lets the writer clear _shadow.
+    for _ in range(3):
+        reading.cancel()
+        await asyncio.sleep(0)
+        assert not reading.done()
+    assert hood._shadow is made[0]
+    assert "connect" not in order
 
     fake_paho.is_connected.return_value = True
     gate.set_result(None)
-    with pytest.raises(ZephyrNotConnectedError):
+    with pytest.raises(asyncio.CancelledError):
         await reading
     with pytest.raises(ZephyrNotConnectedError):
         await write
@@ -789,7 +798,8 @@ async def test_a_refused_rebuild_get_blocks_recovery_until_loop_stop(
     paho client before ``loop_stop`` joins. A write in that window used to
     treat the second disconnect as finished, drop ``Hood._shadow``, and let
     ``async_ensure_running`` open the same client ID while the join was
-    still running. The recovery connect has to follow ``loop_stop``.
+    still running. A second and a third cancellation during that join is
+    the same hole. The recovery connect has to follow ``loop_stop``.
     """
     caps = HoodCapabilities.from_discover(
         json.loads((FIXTURES / "discoverdevice.json").read_text())
@@ -853,10 +863,121 @@ async def test_a_refused_rebuild_get_blocks_recovery_until_loop_stop(
     assert order.count("connect") == 1  # the replacement, not recovery
     assert "teardown-done" not in order
     assert not ensure.done()
+    # request_state's disconnect is the join outside the hood lock. A
+    # second and a third cancel have to keep waiting on it. The writer
+    # must not clear the hood's socket while that join is still blocked.
+    for _ in range(3):
+        reconnect.cancel()
+        await asyncio.sleep(0)
+        assert not reconnect.done()
+    assert hood._shadow is made[1]
+    assert order.count("connect") == 1
 
     fake_paho.is_connected.return_value = True
     gate.set_result(None)
+    with pytest.raises(asyncio.CancelledError):
+        await reconnect
     with pytest.raises(ZephyrNotConnectedError):
+        await write
+    await ensure
+
+    assert order.index("teardown-done") < order.index(
+        "connect", order.index("teardown-done")
+    )
+    assert hood._shadow is made[2]
+    assert made[1]._client is None
+
+
+async def test_a_refused_subscription_disconnect_blocks_recovery_through_three_cancels(
+    fake_paho, monkeypatch
+):
+    """Tests that finish_subscriptions' disconnect outlives three cancels.
+
+    The refusal happens after the hood lock is released. ``disconnect``
+    clears the paho client and then joins ``loop_stop``. A writer in that
+    window, and a second and third cancellation of the reconnect, must not
+    drop ``Hood._shadow`` or let ``async_ensure_running`` open the same
+    client ID before the join returns.
+    """
+    caps = HoodCapabilities.from_discover(
+        json.loads((FIXTURES / "discoverdevice.json").read_text())
+    )
+    made: list[ShadowClient] = []
+
+    def factory(_hood):
+        """Shadow factory that records every client it builds."""
+        made.append(_shadow())
+        return made[-1]
+
+    hood = Hood(caps, factory, AsyncMock(), AsyncMock())
+    await hood.async_start()
+
+    order: list[str] = []
+    entered = asyncio.Event()
+    gate = asyncio.get_running_loop().create_future()
+    real_to_thread = shadow_module.asyncio.to_thread
+    teardowns = 0
+    denied = MagicMock()
+    denied.is_failure = True
+
+    async def to_thread(fn, *args, **kwargs):
+        """Let the old session stop. Hold the subscription refusal's join."""
+        if getattr(fn, "__name__", "") != "_teardown":
+            return await real_to_thread(fn, *args, **kwargs)
+        nonlocal teardowns
+        teardowns += 1
+        if teardowns == 1:
+            fn(*args, **kwargs)
+            order.append("old-stopped")
+            return None
+        entered.set()
+        await gate
+        fn(*args, **kwargs)
+        order.append("teardown-done")
+        return None
+
+    fire = fake_paho.connect_async.side_effect
+    replacement = True
+
+    def connect_async(*args, **kwargs):
+        """Deny the replacement's subscriptions. Let recovery connect."""
+        nonlocal replacement
+        order.append("connect")
+        if not replacement:
+            return fire(*args, **kwargs)
+        replacement = False
+        fake_paho.on_connect(fake_paho, None, {}, 0, None)
+        for _ in range(len(ShadowTopics(THING).subscriptions)):
+            fake_paho.on_subscribe(fake_paho, None, 1, [denied], None)
+        return None
+
+    fake_paho.connect_async.side_effect = connect_async
+    monkeypatch.setattr(shadow_module.asyncio, "to_thread", to_thread)
+
+    reconnect = asyncio.create_task(hood.async_reconnect())
+    await entered.wait()
+    write = asyncio.create_task(hood.async_set_light(1))
+    for _ in range(50):
+        await asyncio.sleep(0)
+        if hood._lock.locked() and not write.done():
+            break
+    else:  # pragma: no cover - the assertion message is the failure
+        raise AssertionError("write did not block on the in-flight disconnect")
+
+    ensure = asyncio.create_task(hood.async_ensure_running())
+    await asyncio.sleep(0)
+    for _ in range(3):
+        reconnect.cancel()
+        await asyncio.sleep(0)
+        assert not reconnect.done()
+        assert not write.done()
+    assert hood._shadow is made[1]
+    assert order.count("connect") == 1
+    assert "teardown-done" not in order
+    assert not ensure.done()
+
+    gate.set_result(None)
+    with pytest.raises(asyncio.CancelledError):
         await reconnect
     with pytest.raises(ZephyrNotConnectedError):
         await write
@@ -872,9 +993,9 @@ async def test_a_refused_rebuild_get_blocks_recovery_until_loop_stop(
 async def test_a_second_cancel_during_disconnect_waits_out_loop_stop(
     fake_paho, monkeypatch
 ):
-    """Tests that a second cancel cannot overlap the disconnect join.
+    """Tests that a second and third cancel cannot overlap the disconnect join.
 
-    One cancellation is absorbed and the join still finishes. A second
+    One cancellation is absorbed and the join still finishes. Another
     cancellation during the follow-up wait used to cancel the ``to_thread``
     task, mark that future done, and let ``async_ensure_running`` open the
     same client ID while ``loop_stop`` was still running. The recovery
@@ -922,12 +1043,10 @@ async def test_a_second_cancel_during_disconnect_waits_out_loop_stop(
     await entered.wait()
     # The first cancel lands in the shielded wait. Yield so the follow-up
     # wait is the one that receives the second cancel.
-    reconnect.cancel()
-    await asyncio.sleep(0)
-    assert not reconnect.done()
-    reconnect.cancel()
-    await asyncio.sleep(0)
-    assert not reconnect.done()
+    for _ in range(3):
+        reconnect.cancel()
+        await asyncio.sleep(0)
+        assert not reconnect.done()
     assert "connect" not in order
 
     ensure = asyncio.create_task(hood.async_ensure_running())
