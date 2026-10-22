@@ -565,9 +565,16 @@ class ZephyrClient:
                 if not is_update and not self._version_is_current(hood, topic, payload):
                     return
                 state_block = payload.get("state") or {}
-                reported = state_block.get("reported") or {}
-                # A list still has to reach from_reported and raise before
-                # the cursor moves. Filtering is only meaningful for a dict.
+                # Only an absent or null reported block is an empty object.
+                # ``or {}`` also catches ``[]``, ``""``, and ``0``. Those
+                # are malformed, and treating them as ``{}`` commits an
+                # empty snapshot and moves the version cursors, so a later
+                # valid older document is dropped. from_reported has to see
+                # the bad value and raise before either cursor moves.
+                reported = state_block.get("reported")
+                if reported is None:
+                    reported = {}
+                # Filtering is only meaningful for a dict.
                 if is_update and isinstance(reported, dict):
                     applied = hood.reported_fields_to_apply(version, reported)
                 else:

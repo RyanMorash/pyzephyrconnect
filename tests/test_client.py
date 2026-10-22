@@ -1792,7 +1792,9 @@ async def test_a_document_that_fails_to_parse_does_not_advance_the_version(wired
     get/accepted and update/accepted both have to parse before recording
     the version. A list where reported should be an object raises, the
     handler swallows it, and a later valid document with a lower version
-    must still apply.
+    must still apply. An empty list is falsy, so it must not be coerced
+    into an empty object either: that would commit a snapshot and move
+    both version cursors.
     """
     client = _client()
     hoods = await client.async_setup()
@@ -1815,10 +1817,21 @@ async def test_a_document_that_fails_to_parse_does_not_advance_the_version(wired
         f"$aws/things/{THING}/shadow/update/accepted",
         {"state": {"reported": [1]}, "version": 13},
     )
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/get/accepted",
+        {"state": {"reported": []}, "version": 14},
+    )
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/update/accepted",
+        {"state": {"reported": []}, "version": 15},
+    )
 
     assert hoods[0].state.light == 1
     assert hoods[0].state.use_grease_filter_time == 642
     assert hoods[0]._shadow_version == 10
+    assert hoods[0]._snapshot_version is None
 
     client._handle_message(
         hoods[0],
