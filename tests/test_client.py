@@ -1846,6 +1846,54 @@ async def test_a_document_that_fails_to_parse_does_not_advance_the_version(wired
     assert hoods[0]._shadow_version == 11
 
 
+async def test_a_non_object_state_block_does_not_advance_the_version(wired):
+    """Tests that a non-object state block does not commit an empty snapshot.
+
+    ``{"state": []}`` is falsy. Coercing it to ``{}`` clears the cached
+    fields and moves both version cursors, so a later valid version-11 GET
+    is ignored. A missing state block is still an empty document. A list
+    is not.
+    """
+    client = _client()
+    hoods = await client.async_setup()
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/update/accepted",
+        {
+            "state": {"reported": {"light": 1, "usegreasefiltertime": 642}},
+            "version": 10,
+        },
+    )
+
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/get/accepted",
+        {"state": [], "version": 12},
+    )
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/update/accepted",
+        {"state": [], "version": 13},
+    )
+
+    assert hoods[0].state.light == 1
+    assert hoods[0].state.use_grease_filter_time == 642
+    assert hoods[0]._shadow_version == 10
+    assert hoods[0]._snapshot_version is None
+
+    client._handle_message(
+        hoods[0],
+        f"$aws/things/{THING}/shadow/get/accepted",
+        {
+            "state": {"reported": {"light": 4, "usegreasefiltertime": 700}},
+            "version": 11,
+        },
+    )
+    assert hoods[0].state.light == 4
+    assert hoods[0].state.use_grease_filter_time == 700
+    assert hoods[0]._shadow_version == 11
+
+
 async def test_a_rejected_update_rereads_state_without_logging_the_thing(wired, caplog):
     """Tests that update/rejected schedules a GET and get/rejected does not.
 

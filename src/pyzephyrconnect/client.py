@@ -564,13 +564,21 @@ class ZephyrClient:
                 version = payload.get("version")
                 if not is_update and not self._version_is_current(hood, topic, payload):
                     return
-                state_block = payload.get("state") or {}
-                # Only an absent or null reported block is an empty object.
+                # Only a missing or null state block is an empty object.
                 # ``or {}`` also catches ``[]``, ``""``, and ``0``. Those
-                # are malformed, and treating them as ``{}`` commits an
-                # empty snapshot and moves the version cursors, so a later
-                # valid older document is dropped. from_reported has to see
-                # the bad value and raise before either cursor moves.
+                # are not documents. Treating them as ``{}`` commits an
+                # empty snapshot and moves both version cursors, so a
+                # later valid older GET is ignored. Reject before parsing
+                # and before either cursor moves. The handler below logs
+                # the topic leaf and swallows the error.
+                state_block = payload.get("state")
+                if state_block is None:
+                    state_block = {}
+                elif not isinstance(state_block, dict):
+                    raise TypeError("shadow state block was not an object")
+                # Same rule one level down: an absent or null reported
+                # block is empty. Any other non-object still has to reach
+                # from_reported and raise before the cursors move.
                 reported = state_block.get("reported")
                 if reported is None:
                     reported = {}
