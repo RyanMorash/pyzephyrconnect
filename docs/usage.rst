@@ -293,9 +293,14 @@ attach stay on the base class, because
 
    client = ZephyrClient(StoredAuth(session, client_id_suffix="-ha"))
 
-``client_id_suffix`` is keyword-only. An empty suffix raises
-:class:`ValueError` at construction: it would make the MQTT client ID
-the bare identity, which is what the vendor phone app connects as.
+``client_id_suffix`` is keyword-only.
+:class:`~pyzephyrconnect.auth.AbstractAuth` raises :class:`ValueError`
+at construction when the value is not a non-empty string. That includes
+an empty string, ``None``, a number, and any other non-string. An empty
+string would make the MQTT client ID the bare identity, which is what
+the vendor phone app connects as. A non-string would be interpolated
+into that ID (``None`` becomes the literal ``"None"``), and AWS IoT
+would drop every message under a client ID the policy does not cover.
 
 .. _mqtt-client-id:
 
@@ -397,8 +402,8 @@ Endpoints
 ---------
 
 :class:`~pyzephyrconnect.const.Endpoints` defaults to the production
-Zephyr / Gemtek cloud. Override it to point REST and MQTT at a staging
-host, or to aim tests at a fake, without patching module globals:
+Zephyr / Gemtek cloud. Each field overrides on its own, which is how
+tests aim at a fake host without patching module globals:
 
 .. code-block:: python
 
@@ -411,8 +416,15 @@ host, or to aim tests at a fake, without patching module globals:
        endpoints=Endpoints(device_api_base="https://staging.example/prod"),
    )
 
-The auth object carries the endpoints. REST and MQTT cannot be aimed at
-different clouds by accident.
+That call changes only the REST base URL used by ``getowndevices`` and
+``discoverdevice``. ``iot_endpoint`` and the Cognito fields (``region``,
+``user_pool``, ``client_id``, ``client_secret``, ``identity_pool``) keep
+their production defaults, so MQTT and authentication still use
+production. Pass those fields as well when they should leave production.
+
+ZephyrClient reads this single ``Endpoints`` value from the auth object
+and does not take a second set of its own. REST and MQTT share whichever
+fields that value holds.
 
 Logging
 -------

@@ -3,9 +3,10 @@ pyzephyrconnect
 
 Python client for Zephyr / Gemtek range hoods. Version |release|.
 
-These hoods expose no local API. Every read and write is a cloud
-round-trip through AWS IoT Core device shadows, over a SigV4-presigned
-WebSocket. The protocol was reverse-engineered from the vendor iOS app.
+These hoods expose no local API. Live state updates and writes use AWS
+IoT Core device shadows over a SigV4-presigned WebSocket. Discovery and
+polling read state over HTTPS. The protocol was reverse-engineered from
+the vendor iOS app.
 :doc:`protocol` is the record of that work, and the reference for what
 the hardware actually does.
 
@@ -56,10 +57,12 @@ Five layers, each readable on its own. Consumers normally stay on
   made structural.
 
 Reads are hybrid on purpose. ``discoverdevice`` supplies capabilities
-and an initial state over HTTPS before MQTT exists, MQTT then carries
-live push, and ``discoverdevice`` stays available through
-:meth:`~pyzephyrconnect.hood.Hood.async_poll` so a consumer degrades to
-slower updates instead of going unavailable.
+and an initial state over HTTPS before MQTT exists. Live updates and
+writes then use the device shadow over the presigned WebSocket.
+``discoverdevice`` stays available through
+:meth:`~pyzephyrconnect.hood.Hood.async_poll`, which reads state over
+HTTPS, so a consumer degrades to slower updates instead of going
+unavailable.
 
 Building these docs
 -------------------
