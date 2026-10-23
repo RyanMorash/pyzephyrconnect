@@ -101,6 +101,16 @@ Filter counters are in minutes, run-time counters in hours - see
 Still unestablished: the `act` mode strings and the delay-timer ceiling.
 See [PROTOCOL.md](PROTOCOL.md) §7.
 
+## Documentation
+
+Guides, the API reference, and the protocol notes are published at
+<https://pyzephyrconnect.readthedocs.io/>.
+
+```bash
+pip install -e ".[docs]"
+sphinx-build -W --keep-going -b html docs docs/_build/html
+```
+
 ## License
 
 GPL-3.0-or-later

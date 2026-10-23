@@ -37,10 +37,18 @@ dev = [
     # so local runs and CI can never disagree. Bump both together.
     "ruff==0.14.14",
 ]
+# Sphinx site published on Read the Docs. Not a runtime dependency.
+# .readthedocs.yaml and the docs job in CI install this extra.
+docs = [
+    "myst-parser>=4",
+    "sphinx>=8.1",
+    "sphinx-rtd-theme>=3",
+]
 
 [project.urls]
 github = "https://github.com/RyanMorash/pyzephyrconnect"
 issues = "https://github.com/RyanMorash/pyzephyrconnect/issues"
+Documentation = "https://pyzephyrconnect.readthedocs.io/"
 
 [tool.hatch.build.targets.wheel]
 # packages already walks the whole src/pyzephyrconnect tree, including
