@@ -60,12 +60,26 @@ def test_writable_fields_cover_the_validation_sequence():
         "setcleanairfunction",
         "setrecirculating",
         "resetgreasefilter",
+        "resetcharcoalfilter",
     ):
         assert field in const.WRITABLE_FIELDS
     # delaytimer is device-managed: writing setdelaytimer=300 alone caused the
     # device to set delaytimer to 300 and count it down in 60-second intervals,
     # so delaytimer must not be in the write allowlist.
     assert "delaytimer" not in const.WRITABLE_FIELDS
+
+
+def test_charcoal_filter_reset_is_gated_like_the_grease_reset():
+    """Tests that resetcharcoalfilter is writable and dangerous.
+
+    Android 1.1.16 publishes resetcharcoalfilter=1 from the My Hood
+    screen. It zeroes usecharcoalfiltertime, the same unrecoverable
+    counter as resetgreasefilter, so the allowlist and the extra
+    confirmation set both have to name it.
+    """
+    assert "resetcharcoalfilter" in const.WRITABLE_FIELDS
+    assert "resetcharcoalfilter" in const.DANGEROUS_FIELDS
+    assert const.DANGEROUS_FIELDS <= const.WRITABLE_FIELDS
 
 
 def test_defaults_reproduce_the_current_constants():

@@ -1046,9 +1046,9 @@ class Hood:
         ``update/accepted`` makes every consumer one cloud round trip
         behind that. Device-derived keys (``power`` rising after a fan
         write, ``delaytimer`` counted down from ``setdelaytimer``) are
-        left for the echo to merge. Destructive fields are skipped: showing
-        a zeroed grease counter, or a recirculating change, before the
-        device confirms it would lie about a change that cannot be undone.
+        left for the echo to merge.         Destructive fields are skipped: showing a zeroed grease or
+        charcoal counter, or a recirculating change, before the device
+        confirms it would lie about a change that cannot be undone.
 
         Args:
             fields: The fields just published to ``state.reported``.
@@ -2182,3 +2182,17 @@ class Hood:
                 started, stopped, or a rebuild failed.
         """
         await self.async_set_fields({"resetgreasefilter": 1})
+
+    async def async_reset_charcoal_filter(self) -> None:
+        """Resets the charcoal filter usage counter - DESTRUCTIVE.
+
+        Zeroes a usage counter that cannot be reconstructed. The vendor
+        Android app publishes `resetcharcoalfilter` = 1 to
+        `state.reported`, the same shape as the grease-filter reset, and
+        the previous counter cannot be put back.
+
+        Raises:
+            ZephyrNotConnectedError: If this hood is not connected - never
+                started, stopped, or a rebuild failed.
+        """
+        await self.async_set_fields({"resetcharcoalfilter": 1})

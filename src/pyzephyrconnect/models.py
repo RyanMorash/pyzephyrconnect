@@ -163,15 +163,18 @@ class HoodCapabilities:
 class HoodState:
     """Current shadow state.
 
-    Field semantics are documented where known. `act` and the exact units
-    of the use*time counters are unverified - see PROTOCOL.md section 7.
+    Field semantics are documented where known. Filter and run-time
+    counter units are in PROTOCOL.md section 5. `act` is Airflow Control
+    Technology, a free-form installer status string. `"Disabled"` is the
+    factory default; no other value is enumerated (section 7).
 
     Attributes:
         power: Power state, or None when unknown.
         light: Light level, or None when unknown.
         fan: Fan speed, or None when unknown.
-        act: `act` value as a string, or None when unknown; semantics
-            unverified.
+        act: Airflow Control Technology status, or None when unknown.
+            `"Disabled"` is the factory default. The device reports it;
+            the vendor apps display the raw string and do not write it.
         delay_timer: `delaytimer` value, or None when unknown.
         set_delay_timer: `setdelaytimer` value, or None when unknown.
         set_recirculating: `setrecirculating` value, or None when
