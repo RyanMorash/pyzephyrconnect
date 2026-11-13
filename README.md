@@ -86,20 +86,27 @@ python -m pyzephyrconnect --watch
 python -m pyzephyrconnect --set light=1 --confirm
 ```
 
-Destructive writes need `--force` as well. `resetgreasefilter` zeroes a usage
-counter that cannot be reconstructed.
+Destructive writes need `--force` as well. `resetgreasefilter` and
+`resetcharcoalfilter` each zero a usage counter that cannot be
+reconstructed.
 
 ## Status
 
 Read and write paths both verified against a Zephyr AK7400AS. `power`,
 `light`, `fan`, `setdelaytimer` (seconds) and `setcleanairfunction` have
-established semantics; `resetgreasefilter` ships untested by design.
+established semantics. `resetgreasefilter` and `resetcharcoalfilter` ship
+untested by design: each publishes `1` to `state.reported`, and neither
+has been watched zeroing its counter.
 
 Filter counters are in minutes, run-time counters in hours - see
 [PROTOCOL.md](PROTOCOL.md) §5 before deriving anything from them.
 
-Still unestablished: the `act` mode strings and the delay-timer ceiling.
-See [PROTOCOL.md](PROTOCOL.md) §7.
+`act` is Airflow Control Technology. `"Disabled"` is the factory default;
+any other value is still unenumerated. The delay-timer ceiling above 3600
+seconds is still unprobed, and so is the difference between the shadow
+integers `fanwarning` and `alarmfan`. See [PROTOCOL.md](PROTOCOL.md) §7.
+The Android 1.1.16 static-analysis report is
+[docs/android-findings.md](docs/android-findings.md).
 
 ## Documentation
 

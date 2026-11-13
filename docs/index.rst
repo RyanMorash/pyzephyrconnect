@@ -6,16 +6,18 @@ Python client for Zephyr / Gemtek range hoods. Version |release|.
 These hoods expose no local API. Live state updates and writes use AWS
 IoT Core device shadows over a SigV4-presigned WebSocket. Discovery and
 polling read state over HTTPS. The protocol was reverse-engineered from
-the vendor iOS app.
+the vendor iOS app, then checked against a static decompilation of the
+Android app (:doc:`android-findings`).
 :doc:`protocol` is the record of that work, and the reference for what
 the hardware actually does.
 
 .. warning::
 
    A write actuates a physical fan and light.
-   :meth:`~pyzephyrconnect.hood.Hood.async_reset_grease_filter` zeroes a
-   usage counter that cannot be reconstructed, and ships untested by
-   design.
+   :meth:`~pyzephyrconnect.hood.Hood.async_reset_grease_filter` and
+   :meth:`~pyzephyrconnect.hood.Hood.async_reset_charcoal_filter` each
+   zero a usage counter that cannot be reconstructed, and ship untested
+   by design.
 
 The library is licensed under the `GNU GPL v3 or later <https://www.gnu.org/licenses/gpl-3.0.html>`_.
 
@@ -34,6 +36,7 @@ The library is licensed under the `GNU GPL v3 or later <https://www.gnu.org/lice
    api/index
    Protocol notes <protocol>
    Hardware validation <validation>
+   Android static analysis <android-findings>
 
 How a call is put together
 --------------------------

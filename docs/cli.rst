@@ -49,12 +49,13 @@ Exit status is 0 on success, 1 when the account has no devices, 2 for a
 refused or invalid argument, and 130 on Ctrl-C.
 
 Writable fields are ``power``, ``light``, ``fan``, ``setdelaytimer``,
-``setcleanairfunction``, ``setrecirculating``, and
-``resetgreasefilter``. ``resetgreasefilter`` and ``setrecirculating``
-are the destructive pair: the first zeroes a counter that cannot be
-reconstructed, and the second changes filter accounting.
-``resetgreasefilter`` has not been run against hardware. The attended
-sequence for trying fields one at a time is :doc:`validation`.
+``setcleanairfunction``, ``setrecirculating``, ``resetgreasefilter``,
+and ``resetcharcoalfilter``. ``resetgreasefilter``,
+``resetcharcoalfilter``, and ``setrecirculating`` are the destructive
+set: the filter resets zero a counter that cannot be reconstructed, and
+``setrecirculating`` changes filter accounting. Neither filter reset
+has been run against hardware. The attended sequence for trying fields
+one at a time is :doc:`validation`.
 
 The CLI uses the default MQTT client-ID suffix, ``-py``. Close other
 Python clients that also use the default before a long ``--watch``, or

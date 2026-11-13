@@ -61,5 +61,6 @@ Notes:
 
 - `PROTOCOL.md`: protocol and observed behavior reference.
 - `VALIDATION.md`: attended hardware validation notes.
+- `docs/android-findings.md`: Android 1.1.16 static analysis. Evidence for PROTOCOL.md; not a client implementation.
 - `docs/api-notes.md`: API shape and rationale.
 - `CLAUDE.md`: detailed implementation and maintenance guidance used to derive this file.

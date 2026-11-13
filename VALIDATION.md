@@ -133,14 +133,19 @@ setting** — enabling it starts the fan at speed 1.
 
 Still open (and see `PROTOCOL.md` §7 for the rest):
 
-- **`act`** currently reads `"Disabled"`. Does it ever change? Watch it
-  during steps 3-7 and record any other value you see.
-- **Charcoal filter reset:** there is no `resetcharcoalfilter` field in
-  the shadow. If your hood has a charcoal reset in the vendor app, watch
-  `update/accepted` while pressing it there — it may reuse
-  `resetgreasefilter`, or be app-side only.
-- **`fanwarning` vs `alarmfan`:** if either ever trips, note what
-  distinguishes them.
+- **`act`** is Airflow Control Technology, an installer make-up-air mode.
+  `"Disabled"` is the factory default. The vendor apps display the raw
+  string and never write it. Watch it during steps 3-7 and record any
+  other value you see. None is enumerated.
+- **Charcoal filter reset:** the Android app writes
+  `resetcharcoalfilter=1` to `state.reported`. It is the same class of
+  unrecoverable counter as step 9. Do not run
+  `--set resetcharcoalfilter=1 --confirm --force` until the charcoal
+  filter is actually being replaced. The live effect is untested.
+- **`fanwarning` vs `alarmfan`:** if either shadow integer ever trips,
+  note what distinguishes them. Android reads neither integer.
+  `"fanwarning"` is also a push-notification type that opens the Home
+  screen, which does not say what a non-zero shadow value means.
 
 ## Troubleshooting
 
