@@ -57,10 +57,11 @@ def test_unknown_fields_are_refused():
 def test_dangerous_fields_need_force_as_well_as_confirm():
     """Tests that dangerous fields need --force on top of --confirm.
 
-    resetgreasefilter zeroes an unrecoverable counter; setrecirculating
-    changes filter accounting. --confirm alone must not be enough.
+    resetgreasefilter and resetcharcoalfilter zero unrecoverable
+    counters; setrecirculating changes filter accounting. --confirm
+    alone must not be enough.
     """
-    for field in ("resetgreasefilter", "setrecirculating"):
+    for field in ("resetgreasefilter", "resetcharcoalfilter", "setrecirculating"):
         with pytest.raises(PermissionError, match="--force"):
             validate_write(field, confirmed=True, forced=False)
 
@@ -72,7 +73,9 @@ def test_ordinary_writes_pass_with_confirm_alone(field):
         validate_write(field, confirmed=True, forced=False)
 
 
-@pytest.mark.parametrize("field", ["resetgreasefilter", "setrecirculating"])
+@pytest.mark.parametrize(
+    "field", ["resetgreasefilter", "resetcharcoalfilter", "setrecirculating"]
+)
 def test_dangerous_writes_pass_with_both_flags(field):
     """Tests that dangerous fields validate with --confirm and --force."""
     with nullcontext():

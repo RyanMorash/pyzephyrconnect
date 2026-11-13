@@ -102,14 +102,19 @@ WRITABLE_FIELDS = frozenset(
         "setcleanairfunction",
         "setrecirculating",
         "resetgreasefilter",
+        "resetcharcoalfilter",
     }
 )
 
 # Writes that are destructive or change device configuration. The probe
-# requires an extra confirmation for these.
+# requires an extra confirmation for these. Both filter resets zero a
+# counter the device does not let a client reconstruct; Android 1.1.16
+# publishes resetcharcoalfilter=1 from the My Hood screen, the same shape
+# as resetgreasefilter.
 DANGEROUS_FIELDS = frozenset(
     {
         "resetgreasefilter",  # zeroes an unrecoverable usage counter
+        "resetcharcoalfilter",  # zeroes an unrecoverable usage counter
         "setrecirculating",  # changes filter accounting
     }
 )

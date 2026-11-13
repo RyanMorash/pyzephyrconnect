@@ -155,8 +155,8 @@ real, never flaky — preserve that.
 **The write path actuates a physical fan and light.** `const.WRITABLE_FIELDS` is
 the allowlist and `const.DANGEROUS_FIELDS` the extra speed bump; the probe CLI
 (`python -m pyzephyrconnect`) requires `--confirm`, and `--force` on top for
-destructive fields. `resetgreasefilter` zeroes a counter that cannot be
-reconstructed and ships untested by design.
+destructive fields. `resetgreasefilter` and `resetcharcoalfilter` each
+zero a counter that cannot be reconstructed and ship untested by design.
 
 **Version lives in two places** — `pyproject.toml` and
 `src/pyzephyrconnect/__init__.py` — and CI fails the build if they disagree, or
@@ -175,5 +175,12 @@ code rather than trimming it. Commits follow `type: summary`
   (§8, including the standing instruction to *not* probe other customers' things).
 - `VALIDATION.md` — the attended-hardware runbook, and the answers it established.
 - `docs/api-notes.md` — the 0.1.0 API shape and the rationale behind it.
-- Still unestablished: the `act` mode strings and the delay-timer ceiling above
-  3600s. Don't document either as known.
+- `docs/android-findings.md` — static analysis of Android 1.1.16. Source
+  for the REST candidates, BLE provisioning, hosts, and the constants
+  comparison. Those calls are not client methods.
+- Still open, and documented as open in PROTOCOL.md §7: `act` values other
+  than `"Disabled"`, the `setdelaytimer` ceiling above 3600s, and what the
+  shadow integers `fanwarning` and `alarmfan` mean. `act` itself is
+  Airflow Control Technology and `"Disabled"` is the factory default.
+  `resetcharcoalfilter` is a real write of `1`; its live effect is
+  deferred, same as `resetgreasefilter`.

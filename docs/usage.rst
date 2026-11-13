@@ -128,15 +128,19 @@ raise that exception.
    * - :meth:`~pyzephyrconnect.hood.Hood.async_reset_grease_filter`
      - Zeroes the grease-filter counter. The value cannot be
        reconstructed. Untested on hardware by design.
+   * - :meth:`~pyzephyrconnect.hood.Hood.async_reset_charcoal_filter`
+     - Zeroes the charcoal-filter counter. Same class of write as the
+       grease reset: the vendor app publishes ``1``. Untested on
+       hardware by design.
 
 :meth:`~pyzephyrconnect.hood.Hood.async_set_light` and
 :meth:`~pyzephyrconnect.hood.Hood.async_set_fan` reject a negative value,
 and reject a value above a positive advertised maximum, before anything
 is published. A hood that omits the maximum is not blanket-refused.
 :meth:`~pyzephyrconnect.hood.Hood.async_set_delay_timer` rejects
-negatives. Its argument is seconds. The vendor app shows two presets;
-the device accepts other non-negative values, proven up to 3600. Above
-that the device's own ceiling is unprobed (:doc:`protocol`, open
+negatives. Its argument is seconds. The Android app writes 0, 300, or
+600. The device accepts other non-negative values, proven up to 3600.
+Above that the device's own ceiling is unprobed (:doc:`protocol`, open
 items), so a larger value may be clamped or rejected by the hardware.
 A caller working in minutes multiplies by 60.
 
@@ -144,9 +148,9 @@ After a successful publish, listeners see the written fields
 immediately. The device's own follow-on changes, such as ``power``
 rising because the fan was written, or ``delaytimer`` counting down from
 ``setdelaytimer``, arrive with the echo. Destructive fields
-(recirculating mode and the grease-filter reset) are left out of that
-optimistic update. Showing them before the device confirms them would
-report a change that cannot be undone.
+(recirculating mode, and the grease- and charcoal-filter resets) are
+left out of that optimistic update. Showing them before the device
+confirms them would report a change that cannot be undone.
 
 :meth:`~pyzephyrconnect.hood.Hood.async_set_fields` writes an arbitrary
 allowlisted map. It exists for the probe CLI. Prefer the typed methods.
@@ -207,8 +211,10 @@ String capability fields default to ``""``. ``supports_recirculating``
 and ``supports_tru_hue`` default to ``False``, which means "not
 advertised".
 
-``act`` has been observed as ``"Disabled"`` and nothing else. Treat it
-as a free-form string. Do not build an enum on one sample.
+``act`` is Airflow Control Technology, an installer-configured make-up
+air status. The vendor apps display the raw string and do not write it.
+``"Disabled"`` is the factory default. Other values are unenumerated, so
+treat the field as free-form.
 
 .. _persisting-tokens:
 

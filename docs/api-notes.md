@@ -218,6 +218,7 @@ code.
 | `async_set_state(thing, {"setcleanairfunction": 0})` | `await hood.async_set_clean_air(False)` |
 | `async_set_state(thing, {"setdelaytimer": n})` | `await hood.async_set_delay_timer(n)` |
 | `async_set_state(thing, {"resetgreasefilter": 1})` | `await hood.async_reset_grease_filter()` |
+| `async_set_state(thing, {"resetcharcoalfilter": 1})` | `await hood.async_reset_charcoal_filter()` |
 | `async_set_state(thing, {"setrecirculating": n})` | `await hood.async_set_recirculating(bool)` |
 
 `async_set_delay_timer` passes its value straight through to `setdelaytimer`.
@@ -438,11 +439,18 @@ preset-snapped, the filter counters are minutes against a maximum in hours,
 and `usefantime` / `uselighttime` are hours. All of it is recorded in
 `PROTOCOL.md` §5.
 
-What is genuinely still unknown is listed in `PROTOCOL.md` §7 — the
-`setdelaytimer` ceiling, `act` values beyond `"Disabled"`, whether a
-charcoal-filter reset exists at all, and what distinguishes `fanwarning` from
-`alarmfan`. None of it changes the API described here, but each one bounds
-what a consumer can honestly present.
+What is genuinely still unknown is listed in `PROTOCOL.md` §7. Android
+1.1.16 static analysis (`docs/android-findings.md`) has since named
+`act` as Airflow Control Technology, with `"Disabled"` as the factory
+default, and shown that `resetcharcoalfilter=1` is a real
+`state.reported` write. Still open: the `setdelaytimer` ceiling above
+3600 seconds, `act` values other than `"Disabled"`, and what
+distinguishes the shadow integers `fanwarning` and `alarmfan`. The
+charcoal reset's live effect is deferred with `resetgreasefilter`. None
+of it changes the API described here, except that
+`hood.async_reset_charcoal_filter()` now exists and is gated like the
+grease reset.
 
-Writes actuate hardware throughout. `resetgreasefilter` in particular zeroes a
-counter that cannot be reconstructed, and ships untested by design.
+Writes actuate hardware throughout. `resetgreasefilter` and
+`resetcharcoalfilter` each zero a counter that cannot be reconstructed,
+and ship untested by design.

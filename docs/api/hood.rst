@@ -13,5 +13,5 @@ are omitted here.
    including the shadow factory, so it stays off this page.
 
 .. autoclass:: pyzephyrconnect.hood.Hood
-   :members: thing_name, capabilities, state, connected, async_start, async_stop, async_poll, add_listener, async_set_fields, async_set_power, async_set_light, async_set_fan, async_set_clean_air, async_set_delay_timer, async_set_recirculating, async_reset_grease_filter
+   :members: thing_name, capabilities, state, connected, async_start, async_stop, async_poll, add_listener, async_set_fields, async_set_power, async_set_light, async_set_fan, async_set_clean_air, async_set_delay_timer, async_set_recirculating, async_reset_grease_filter, async_reset_charcoal_filter
    :exclude-members: __init__

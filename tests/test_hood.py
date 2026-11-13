@@ -66,6 +66,9 @@ async def test_typed_methods_publish_the_vendor_field_names():
     await hood.async_reset_grease_filter()
     shadow.publish_state.assert_awaited_with({"resetgreasefilter": 1})
 
+    await hood.async_reset_charcoal_filter()
+    shadow.publish_state.assert_awaited_with({"resetcharcoalfilter": 1})
+
 
 async def test_out_of_range_is_refused_before_anything_is_published():
     """Tests that an out-of-range write is refused before publishing.
@@ -643,12 +646,34 @@ async def test_a_successful_write_updates_state_before_any_shadow_message():
     assert seen[0].light == 1
 
 
+async def test_charcoal_filter_reset_waits_for_the_device(caplog):
+    """Tests that the charcoal reset is published and not applied locally.
+
+    The Android app writes 1. The counter it zeroes cannot be
+    reconstructed, so the cache keeps the previous usecharcoalfiltertime
+    until the device echoes, and the write is logged as destructive.
+    """
+    hood, shadow = _hood()
+    await hood.async_start()
+    hood.handle_state(HoodState.from_reported({"usecharcoalfiltertime": 80}))
+
+    with caplog.at_level(logging.WARNING):
+        await hood.async_reset_charcoal_filter()
+
+    shadow.publish_state.assert_awaited_with({"resetcharcoalfilter": 1})
+    assert hood.state is not None
+    assert hood.state.use_charcoal_filter_time == 80
+    assert hood._pending_writes == []
+    assert "resetcharcoalfilter" in caplog.text
+
+
 async def test_a_destructive_write_does_not_change_cached_state():
     """Tests that a destructive write waits for the device to confirm it.
 
-    resetgreasefilter zeroes a counter that cannot be reconstructed, and
-    setrecirculating changes filter accounting. Showing either locally
-    before update/accepted would lie about a change the device may ignore.
+    resetgreasefilter and resetcharcoalfilter zero counters that cannot
+    be reconstructed, and setrecirculating changes filter accounting.
+    Showing any of them locally before update/accepted would lie about a
+    change the device may ignore.
     """
     hood, _shadow = _hood()
     await hood.async_start()
