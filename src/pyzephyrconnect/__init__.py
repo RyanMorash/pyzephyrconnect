@@ -16,7 +16,7 @@ from .exceptions import (
 from .hood import Hood
 from .models import HoodCapabilities, HoodState
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 __all__ = [
     "DEFAULT_ENDPOINTS",
